@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  isPrivateInstructionContentHttpRequest,
   isPrivateWebhookHttpRequest,
   isSecretSensitiveHttpRequest,
   shouldSilenceHttpSuccessLog,
@@ -56,6 +57,72 @@ describe("isPrivateWebhookHttpRequest", () => {
       isPrivateWebhookHttpRequest(undefined, "/api/chat-webhooks/id/slack"),
     ).toBe(false);
     expect(isPrivateWebhookHttpRequest("POST", undefined)).toBe(false);
+  });
+});
+
+describe("isPrivateInstructionContentHttpRequest", () => {
+  const file = "/api/agents/agent-1/instructions-bundle/file";
+  const resolve =
+    "/api/agents/agent-1/instructions-bundle/candidates/run-1/resolve";
+
+  it("matches only the content-bearing instruction writes", () => {
+    for (const suffix of ["", "/", "?companyId=c-1", "/?companyId=c-1&x=1"]) {
+      expect(isPrivateInstructionContentHttpRequest("PUT", file + suffix)).toBe(
+        true,
+      );
+      expect(
+        isPrivateInstructionContentHttpRequest("POST", resolve + suffix),
+      ).toBe(true);
+    }
+    expect(isPrivateInstructionContentHttpRequest("put", file)).toBe(true);
+    expect(
+      isPrivateInstructionContentHttpRequest(
+        "PUT",
+        "/API/AGENTS/agent-1/INSTRUCTIONS-BUNDLE/FILE",
+      ),
+    ).toBe(true);
+    expect(
+      isPrivateInstructionContentHttpRequest(
+        "PUT",
+        `http://host.invalid${file}?companyId=c-1`,
+      ),
+    ).toBe(true);
+  });
+
+  it("does not match other methods or adjacent instruction routes", () => {
+    for (const method of ["GET", "HEAD", "POST", "PATCH", "DELETE"]) {
+      expect(isPrivateInstructionContentHttpRequest(method, file)).toBe(false);
+    }
+    for (const method of ["GET", "PUT", "PATCH", "DELETE"]) {
+      expect(isPrivateInstructionContentHttpRequest(method, resolve)).toBe(
+        false,
+      );
+    }
+    for (const path of [
+      "/api/agents/agent-1/instructions-bundle",
+      "/api/agents/agent-1/instructions-bundle/restore",
+      "/api/agents/agent-1/instructions-bundle/files",
+      "/api/agents/agent-1/instructions-bundle/file/extra",
+      "/api/agents/agent-1/instructions-path",
+      "/api/agents/agent-1",
+      "/api/agents//instructions-bundle/file",
+      "/api/other/agent-1/instructions-bundle/file",
+      "/agents/agent-1/instructions-bundle/file",
+      "/api/agents/agent-1/instructions-bundle/candidates/run-1",
+      "/api/agents/agent-1/instructions-bundle/candidates/run-1/resolve/x",
+    ]) {
+      expect(isPrivateInstructionContentHttpRequest("PUT", path)).toBe(false);
+      expect(isPrivateInstructionContentHttpRequest("POST", path)).toBe(false);
+    }
+    expect(isPrivateInstructionContentHttpRequest(undefined, file)).toBe(false);
+    expect(isPrivateInstructionContentHttpRequest("PUT", undefined)).toBe(
+      false,
+    );
+  });
+
+  it("does not change the secret-sensitive classification", () => {
+    expect(isSecretSensitiveHttpRequest("PUT", file)).toBe(false);
+    expect(isSecretSensitiveHttpRequest("POST", resolve)).toBe(false);
   });
 });
 
