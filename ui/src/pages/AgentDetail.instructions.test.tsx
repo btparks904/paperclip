@@ -974,6 +974,25 @@ describe("PromptsTab raw instruction editor", () => {
     expect(buttonByText(container, "Verified installation").disabled).toBe(true);
   });
 
+  it("locks the Advanced bundle controls while a raw session is open", async () => {
+    await renderRaw(entryDetail(ORIGINAL));
+    await act(async () => { buttonByText(container, "Advanced").click(); });
+    await flushReact();
+    const entryInput = () => container.querySelector<HTMLInputElement>('input[value="AGENTS.md"]');
+    await waitFor(() => expect(entryInput()).not.toBeNull());
+    expect(entryInput()?.disabled).toBe(false);
+    await enter("Verified installation");
+    await typeDraft(PROPOSED);
+    await waitFor(() => expect(entryInput()?.disabled).toBe(true));
+    expect(buttonByText(container, "Managed").disabled).toBe(true);
+    expect(buttonByText(container, "External").disabled).toBe(true);
+    expect(rawEditor()?.value).toBe(PROPOSED);
+    await act(async () => { buttonByText(container, "Discard raw edit").click(); });
+    await flushReact();
+    expect(entryInput()?.disabled).toBe(false);
+    expect(buttonByText(container, "Managed").disabled).toBe(false);
+  });
+
   it("refuses ill-formed and oversized drafts", async () => {
     await renderRaw(entryDetail(ORIGINAL));
     await enter("Edit raw");

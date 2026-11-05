@@ -3094,6 +3094,7 @@ export function PromptsTab({
                     type="button"
                     size="sm"
                     variant={currentMode === "managed" ? "default" : "outline"}
+                    disabled={rawActive}
                     onClick={() => {
                       if (currentMode === "external") {
                         externalBundleRef.current = {
@@ -3117,6 +3118,7 @@ export function PromptsTab({
                     type="button"
                     size="sm"
                     variant={currentMode === "external" ? "default" : "outline"}
+                    disabled={rawActive}
                     onClick={() => {
                       const externalBundle = externalBundleRef.current;
                       const nextEntryFile = externalBundle?.entryFile ?? currentEntryFile ?? "AGENTS.md";
@@ -3157,6 +3159,7 @@ export function PromptsTab({
                   <div className="flex items-center gap-1.5">
                     <Input
                       value={currentRootPath}
+                      disabled={rawActive}
                       onChange={(event) => {
                         const nextRootPath = event.target.value;
                         externalBundleRef.current = {
@@ -3195,6 +3198,7 @@ export function PromptsTab({
                 </span>
                 <Input
                   value={currentEntryFile}
+                  disabled={rawActive}
                   onChange={(event) => {
                     const nextEntryFile = event.target.value || "AGENTS.md";
                     const nextSelectedFile = selectedOrEntryFile === currentEntryFile
