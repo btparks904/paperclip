@@ -6,8 +6,10 @@ import { createRoot, type Root } from "react-dom/client";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { Agent, AgentInstructionsBundle, AgentInstructionsFileDetail, AgentInstructionsFileSummary } from "@paperclipai/shared";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { createHash } from "node:crypto";
 import { AgentFileRunNotice, PromptsTab } from "./AgentDetail";
 import { queryKeys } from "../lib/queryKeys";
+import { ApiError } from "../api/client";
 
 const mockAgentsApi = vi.hoisted(() => ({
   instructionsBundle: vi.fn(),
@@ -635,5 +637,352 @@ describe("PromptsTab instruction editor", () => {
       expect(container.querySelector('[data-testid="markdown-editor"]')).toBeNull();
       expect(container.querySelector<HTMLTextAreaElement>('textarea[placeholder="File contents"]')?.value).toBe("raw instructions");
     });
+  });
+});
+
+describe("PromptsTab raw instruction editor", () => {
+  const sha = (text: string) => createHash("sha256").update(Buffer.from(text, "utf8")).digest("hex");
+  // Exact bytes the rich editor would normalize: BOM, leading newline, trailing
+  // spaces and tabs, NFD text and a final newline.
+  const ORIGINAL = "﻿\n# Sentinel original 9c1d  \n\tindented\tline\ncafé\n";
+  const PROPOSED = "﻿\n# Sentinel proposed 4b7e  \n\tindented\tline\ncafé\n\n";
+  let container: HTMLDivElement;
+  let root: Root | null;
+  let queryClient: QueryClient;
+  let parentSave: (() => void) | null;
+  let consoleSpies: Array<ReturnType<typeof vi.spyOn>>;
+
+  beforeEach(() => {
+    container = document.createElement("div");
+    document.body.appendChild(container);
+    root = null;
+    queryClient = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } });
+    parentSave = null;
+    markdownEditorRenderMock.mockClear();
+    Object.values(mockAgentsApi).forEach((mock) => mock.mockReset());
+    mockAgentsApi.instructionCandidates.mockResolvedValue([]);
+    consoleSpies = (["log", "info", "warn", "error", "debug"] as const).map((method) => vi.spyOn(console, method));
+  });
+
+  afterEach(async () => {
+    for (const spy of consoleSpies) {
+      const logged = JSON.stringify(spy.mock.calls);
+      // W: no instruction content or hashes reach the console.
+      expect(logged).not.toContain("Sentinel");
+      expect(logged).not.toContain(sha(ORIGINAL));
+      expect(logged).not.toContain(sha(PROPOSED));
+      spy.mockRestore();
+    }
+    if (root) await act(async () => { root?.unmount(); });
+    queryClient.clear();
+    container.remove();
+    document.body.innerHTML = "";
+    vi.unstubAllGlobals();
+    vi.clearAllMocks();
+  });
+
+  function entryDetail(content: string, overrides: Partial<AgentInstructionsFileDetail> = {}) {
+    const summary = makeSummary("AGENTS.md", "AGENTS.md", { contentHash: sha(content) });
+    return makeDetail(summary, content, { contentHash: sha(content), ...overrides });
+  }
+
+  async function renderRaw(detail: AgentInstructionsFileDetail, onDirtyChange = vi.fn()) {
+    const summary = makeSummary("AGENTS.md", "AGENTS.md", { contentHash: detail.contentHash });
+    mockAgentsApi.instructionsBundle.mockResolvedValue(makeBundle("AGENTS.md", [summary], { persistence: "agent_files" }));
+    mockAgentsApi.instructionsFile.mockResolvedValue(detail);
+    root = createRoot(container);
+    await act(async () => {
+      root?.render(
+        <QueryClientProvider client={queryClient}>
+          <PromptsTab agent={makeAgent()} companyId="company-1" onDirtyChange={onDirtyChange}
+            onSaveActionChange={(next) => { parentSave = next; }} onCancelActionChange={vi.fn()} onSavingChange={vi.fn()} />
+        </QueryClientProvider>,
+      );
+    });
+    await flushReact();
+    await waitFor(() => expect(container.textContent).toContain("Sentinel"));
+    await act(async () => { buttonByText(container, "raw").click(); });
+    await flushReact();
+  }
+
+  const rawEditor = () => container.querySelector<HTMLTextAreaElement>('[data-testid="instructions-raw-editor"]');
+  const expectedInput = () => container.querySelector<HTMLInputElement>('input[aria-label="Expected SHA-256"]');
+  const saveButton = (label: string) => buttonByText(container, label);
+
+  async function enter(label: "Edit raw" | "Verified installation") {
+    await waitFor(() => expect(buttonByText(container, label).disabled).toBe(false));
+    await act(async () => { buttonByText(container, label).click(); });
+    return waitFor(() => { expect(rawEditor()).not.toBeNull(); return rawEditor()!; });
+  }
+
+  async function typeDraft(value: string) {
+    await act(async () => { setNativeValue(rawEditor()!, value); });
+    await flushReact();
+  }
+
+  async function typeExpected(value: string) {
+    await act(async () => { setNativeValue(expectedInput()!, value); });
+    await flushReact();
+  }
+
+  it("A-C, U, X: enters raw edit explicitly from the unmodified server string without MDXEditor", async () => {
+    await renderRaw(entryDetail(ORIGINAL));
+    // A: Raw view starts read only; editing needs an explicit action.
+    expect(rawEditor()).toBeNull();
+    expect(container.querySelector('[data-testid="instructions-raw-source"]')?.textContent).toBe(ORIGINAL);
+    const editor = await enter("Edit raw");
+    // B: exact server string, including BOM, leading newline and trailing whitespace.
+    expect(editor.value).toBe(ORIGINAL);
+    expect(editor.getAttribute("spellcheck")).toBe("false");
+    expect(editor.getAttribute("autocorrect")).toBe("off");
+    expect(editor.getAttribute("autocapitalize")).toBe("off");
+    // C: MDXEditor is bypassed.
+    expect(markdownEditorRenderMock).not.toHaveBeenCalled();
+    expect(container.querySelector('[data-testid="markdown-editor"]')).toBeNull();
+    // Ordinary mode shows the pre-save SHA-256 of the exact draft.
+    await typeDraft(PROPOSED);
+    await waitFor(() => expect(container.querySelector('[data-testid="instructions-raw-draft-hash"]')?.textContent).toBe(sha(PROPOSED)));
+    // U: no autosave, and the parent Save stays disconnected from raw drafts.
+    for (let i = 0; i < 5; i++) await flushReact();
+    expect(mockAgentsApi.saveInstructionsFile).not.toHaveBeenCalled();
+    expect(parentSave).toBeNull();
+    // X: discarding returns to the unchanged rich editor, which never reuses the raw draft.
+    await act(async () => { buttonByText(container, "Discard raw edit").click(); });
+    await flushReact();
+    await act(async () => { buttonByText(container, "edit").click(); });
+    await flushReact();
+    const markdown = await waitFor(() => { const el = container.querySelector<HTMLTextAreaElement>('[data-testid="markdown-editor"]'); expect(el).not.toBeNull(); return el!; });
+    expect(markdown.value).toBe(ORIGINAL);
+  });
+
+  it("D: refuses raw editing when the loaded text does not hash to contentHash", async () => {
+    await renderRaw(entryDetail(ORIGINAL, { contentHash: sha("something else") }));
+    await waitFor(() => expect(container.querySelector('[data-testid="instructions-raw-ineligible"]')?.textContent).toContain("does not hash"));
+    expect(buttonByText(container, "Edit raw").disabled).toBe(true);
+    expect(buttonByText(container, "Verified installation").disabled).toBe(true);
+    expect(container.querySelector('[data-testid="instructions-raw-source"]')?.textContent).toBe(ORIGINAL);
+  });
+
+  it("E: refuses raw editing for CR and CRLF files and shows them unnormalized", async () => {
+    const crlf = "# Sentinel crlf\r\nline\rend\n";
+    await renderRaw(entryDetail(crlf));
+    await waitFor(() => expect(container.querySelector('[data-testid="instructions-raw-ineligible"]')?.textContent).toContain("carriage return"));
+    expect(buttonByText(container, "Edit raw").disabled).toBe(true);
+    expect(rawEditor()).toBeNull();
+    expect(container.querySelector('[data-testid="instructions-raw-source"]')?.textContent).toBe(crlf);
+  });
+
+  it("F: refuses raw editing and saving without browser SHA-256", async () => {
+    vi.stubGlobal("crypto", undefined);
+    await renderRaw(entryDetail(ORIGINAL));
+    await waitFor(() => expect(container.querySelector('[data-testid="instructions-raw-ineligible"]')?.textContent).toContain("SHA-256 is unavailable"));
+    expect(buttonByText(container, "Edit raw").disabled).toBe(true);
+    expect(buttonByText(container, "Verified installation").disabled).toBe(true);
+  });
+
+  it("F: disables Save when SHA-256 becomes unavailable during a raw edit", async () => {
+    await renderRaw(entryDetail(ORIGINAL));
+    await enter("Edit raw");
+    vi.stubGlobal("crypto", undefined);
+    await typeDraft(PROPOSED);
+    await waitFor(() => expect(container.querySelector('[data-testid="instructions-raw-block-reason"]')?.textContent).toContain("could not compute"));
+    expect(saveButton("Save raw edit").disabled).toBe(true);
+  });
+
+  it("G-J, O: verified installation needs an operator-entered matching hash before Save", async () => {
+    await renderRaw(entryDetail(ORIGINAL));
+    await enter("Verified installation");
+    await typeDraft(PROPOSED);
+    // G and H: an expected hash is required and is never prefilled or shown.
+    expect(expectedInput()?.value).toBe("");
+    await waitFor(() => expect(container.querySelector('[data-testid="instructions-raw-block-reason"]')?.textContent).toContain("Enter the expected SHA-256"));
+    expect(container.textContent).not.toContain(sha(PROPOSED));
+    expect(saveButton("Save verified installation").disabled).toBe(true);
+    // I: a mismatch blocks Save.
+    await typeExpected(sha(ORIGINAL));
+    await waitFor(() => expect(container.querySelector('[data-testid="instructions-raw-expected-status"]')?.textContent).toBe("Does not match the content to install."));
+    expect(saveButton("Save verified installation").disabled).toBe(true);
+    await typeExpected("not-a-hash");
+    expect(container.querySelector('[data-testid="instructions-raw-expected-status"]')?.textContent).toBe("Not a valid SHA-256.");
+    await typeExpected(` ${sha(PROPOSED)}`);
+    expect(saveButton("Save verified installation").disabled).toBe(true);
+    // J: the correct hash (either case) enables Save once every gate passes.
+    await typeExpected(sha(PROPOSED).toUpperCase());
+    await waitFor(() => expect(saveButton("Save verified installation").disabled).toBe(false));
+    mockAgentsApi.saveInstructionsFile.mockImplementation(async (_id, data) => entryDetail(data.content));
+    await act(async () => { saveButton("Save verified installation").click(); });
+    await waitFor(() => expect(mockAgentsApi.saveInstructionsFile).toHaveBeenCalledTimes(1));
+    // O: exactly path, content and the original baseHash.
+    const [agentId, body, companyId] = mockAgentsApi.saveInstructionsFile.mock.calls[0]!;
+    expect(agentId).toBe("agent-1");
+    expect(companyId).toBe("company-1");
+    expect(Object.keys(body).sort()).toEqual(["baseHash", "content", "path"]);
+    expect(body).toEqual({ path: "AGENTS.md", content: PROPOSED, baseHash: sha(ORIGINAL) });
+    await waitFor(() => expect(container.querySelector('[data-testid="instructions-raw-saved"]')?.textContent).toContain("Verified installation saved"));
+    expect(container.querySelector('[data-testid="instructions-raw-saved"]')?.textContent).toContain(sha(PROPOSED));
+  });
+
+  it("K: an edit after the hash matched invalidates the expected hash", async () => {
+    await renderRaw(entryDetail(ORIGINAL));
+    await enter("Verified installation");
+    await typeDraft(PROPOSED);
+    await typeExpected(sha(PROPOSED));
+    await waitFor(() => expect(saveButton("Save verified installation").disabled).toBe(false));
+    await typeDraft(`${PROPOSED}x`);
+    expect(expectedInput()?.value).toBe("");
+    expect(saveButton("Save verified installation").disabled).toBe(true);
+    // Restoring the draft does not restore the old binding.
+    await typeDraft(PROPOSED);
+    for (let i = 0; i < 3; i++) await flushReact();
+    expect(expectedInput()?.value).toBe("");
+    expect(saveButton("Save verified installation").disabled).toBe(true);
+    expect(mockAgentsApi.saveInstructionsFile).not.toHaveBeenCalled();
+  });
+
+  it("L, M: modes cannot be switched mid-session and cancel clears verified state", async () => {
+    await renderRaw(entryDetail(ORIGINAL));
+    await enter("Verified installation");
+    await typeDraft(PROPOSED);
+    await typeExpected(sha(PROPOSED));
+    await waitFor(() => expect(saveButton("Save verified installation").disabled).toBe(false));
+    // L: no in-session switch to ordinary mode or to the other views.
+    expect(Array.from(container.querySelectorAll("button")).some((b) => b.textContent?.trim() === "Edit raw")).toBe(false);
+    expect(buttonByText(container, "edit").disabled).toBe(true);
+    expect(buttonByText(container, "read").disabled).toBe(true);
+    // M: deliberate cancel clears the draft, the expected hash and the frozen state.
+    await act(async () => { buttonByText(container, "Discard raw edit").click(); });
+    await flushReact();
+    expect(rawEditor()).toBeNull();
+    expect(buttonByText(container, "edit").disabled).toBe(false);
+    // An ordinary session never inherits verified state.
+    await enter("Edit raw");
+    expect(rawEditor()?.value).toBe(ORIGINAL);
+    expect(expectedInput()).toBeNull();
+    expect(container.querySelector('[data-raw-mode]')?.getAttribute("data-raw-mode")).toBe("ordinary");
+    await act(async () => { buttonByText(container, "Discard raw edit").click(); });
+    await flushReact();
+    // Returning to verified mode requires fresh verification.
+    await enter("Verified installation");
+    expect(expectedInput()?.value).toBe("");
+    await typeDraft(PROPOSED);
+    expect(saveButton("Save verified installation").disabled).toBe(true);
+    expect(mockAgentsApi.saveInstructionsFile).not.toHaveBeenCalled();
+  });
+
+  it("N, T: a double click sends one PUT and a confirmed save updates only the edited file", async () => {
+    await renderRaw(entryDetail(ORIGINAL));
+    await enter("Edit raw");
+    await typeDraft(PROPOSED);
+    await waitFor(() => expect(saveButton("Save raw edit").disabled).toBe(false));
+    let resolveSave: (value: AgentInstructionsFileDetail) => void = () => {};
+    mockAgentsApi.saveInstructionsFile.mockImplementation(() => new Promise((resolve) => { resolveSave = resolve; }));
+    const invalidate = vi.spyOn(queryClient, "invalidateQueries");
+    const button = saveButton("Save raw edit");
+    await act(async () => { button.click(); button.click(); });
+    button.click();
+    await flushReact();
+    expect(mockAgentsApi.saveInstructionsFile).toHaveBeenCalledTimes(1);
+    expect(saveButton("Saving…").disabled).toBe(true);
+    expect(buttonByText(container, "Discard raw edit").disabled).toBe(true);
+    await act(async () => { resolveSave(entryDetail(PROPOSED)); });
+    await waitFor(() => expect(container.querySelector('[data-testid="instructions-raw-saved"]')?.textContent).toContain(sha(PROPOSED)));
+    expect(queryClient.getQueryData<AgentInstructionsFileDetail>(queryKeys.agents.instructionsFile("agent-1", "AGENTS.md"))?.content).toBe(PROPOSED);
+    expect(invalidate.mock.calls.map((call) => call[0])).toEqual([{ queryKey: queryKeys.agents.instructionsBundle("agent-1"), exact: true }]);
+    expect(mockAgentsApi.saveInstructionsFile).toHaveBeenCalledTimes(1);
+  });
+
+  it("P: a 409 keeps the draft and blocks an unsafe retry", async () => {
+    await renderRaw(entryDetail(ORIGINAL));
+    await enter("Edit raw");
+    await typeDraft(PROPOSED);
+    await waitFor(() => expect(saveButton("Save raw edit").disabled).toBe(false));
+    mockAgentsApi.saveInstructionsFile.mockRejectedValue(new ApiError("Instructions changed since the base revision.", 409, { code: "INSTRUCTION_REVISION_CONFLICT" }));
+    await act(async () => { saveButton("Save raw edit").click(); });
+    await waitFor(() => expect(container.querySelector('[role="alert"]')?.textContent).toContain("rejected and nothing was written"));
+    expect(rawEditor()?.value).toBe(PROPOSED);
+    expect(rawEditor()?.readOnly).toBe(true);
+    expect(saveButton("Save raw edit").disabled).toBe(true);
+    saveButton("Save raw edit").click();
+    await flushReact();
+    expect(mockAgentsApi.saveInstructionsFile).toHaveBeenCalledTimes(1);
+  });
+
+  it("Q, R, V: a lost response enters the unknown state, blocks Save, never retries and reconciles read only", async () => {
+    await renderRaw(entryDetail(ORIGINAL));
+    await enter("Edit raw");
+    await typeDraft(PROPOSED);
+    await waitFor(() => expect(saveButton("Save raw edit").disabled).toBe(false));
+    mockAgentsApi.saveInstructionsFile.mockRejectedValue(new TypeError("Failed to fetch"));
+    await act(async () => { saveButton("Save raw edit").click(); });
+    await waitFor(() => expect(container.textContent).toContain("The save outcome is unknown"));
+    // R: Save stays disabled and the draft is preserved.
+    expect(saveButton("Save raw edit").disabled).toBe(true);
+    expect(rawEditor()?.value).toBe(PROPOSED);
+    saveButton("Save raw edit").click();
+    for (let i = 0; i < 5; i++) await flushReact();
+    // V: no retry.
+    expect(mockAgentsApi.saveInstructionsFile).toHaveBeenCalledTimes(1);
+    // Read-only reconciliation classifies the current file without touching the draft.
+    const getsBefore = mockAgentsApi.instructionsFile.mock.calls.length;
+    mockAgentsApi.instructionsFile.mockResolvedValue(entryDetail(PROPOSED));
+    await act(async () => { buttonByText(container, "Check current saved file").click(); });
+    await waitFor(() => expect(container.querySelector('[data-testid="instructions-raw-reconcile"]')?.textContent).toContain("matches the submitted SHA-256"));
+    expect(container.querySelector('[data-testid="instructions-raw-reconcile"]')?.textContent).toContain("does not prove");
+    expect(mockAgentsApi.instructionsFile.mock.calls.length).toBe(getsBefore + 1);
+    expect(rawEditor()?.value).toBe(PROPOSED);
+    expect(saveButton("Save raw edit").disabled).toBe(true);
+    mockAgentsApi.instructionsFile.mockResolvedValue(entryDetail(ORIGINAL));
+    await act(async () => { buttonByText(container, "Check current saved file").click(); });
+    await waitFor(() => expect(container.querySelector('[data-testid="instructions-raw-reconcile"]')?.textContent).toContain("still matches the original"));
+    expect(mockAgentsApi.saveInstructionsFile).toHaveBeenCalledTimes(1);
+  });
+
+  it("S: a response hash mismatch is not reported as success", async () => {
+    await renderRaw(entryDetail(ORIGINAL));
+    await enter("Edit raw");
+    await typeDraft(PROPOSED);
+    await waitFor(() => expect(saveButton("Save raw edit").disabled).toBe(false));
+    mockAgentsApi.saveInstructionsFile.mockResolvedValue(entryDetail(`${PROPOSED}changed`));
+    await act(async () => { saveButton("Save raw edit").click(); });
+    await waitFor(() => expect(container.textContent).toContain("did not confirm the submitted SHA-256"));
+    expect(container.querySelector('[data-testid="instructions-raw-saved"]')).toBeNull();
+    expect(saveButton("Save raw edit").disabled).toBe(true);
+    expect(rawEditor()?.value).toBe(PROPOSED);
+    expect(queryClient.getQueryData<AgentInstructionsFileDetail>(queryKeys.agents.instructionsFile("agent-1", "AGENTS.md"))?.content).toBe(ORIGINAL);
+  });
+
+  it("blocks Save when the server file changes after raw editing starts", async () => {
+    await renderRaw(entryDetail(ORIGINAL));
+    await enter("Edit raw");
+    await typeDraft(PROPOSED);
+    await waitFor(() => expect(saveButton("Save raw edit").disabled).toBe(false));
+    await act(async () => { queryClient.setQueryData(queryKeys.agents.instructionsFile("agent-1", "AGENTS.md"), entryDetail("# Sentinel newer\n")); });
+    await waitFor(() => expect(container.querySelector('[data-testid="instructions-raw-block-reason"]')?.textContent).toContain("changed on the server"));
+    expect(saveButton("Save raw edit").disabled).toBe(true);
+    expect(rawEditor()?.value).toBe(PROPOSED);
+  });
+
+  it("G: refuses raw editing while a rich-editor draft is pending and marks raw sessions dirty", async () => {
+    const onDirtyChange = vi.fn();
+    await renderRaw(entryDetail(ORIGINAL), onDirtyChange);
+    await act(async () => { buttonByText(container, "edit").click(); });
+    const markdown = await waitFor(() => { const el = container.querySelector<HTMLTextAreaElement>('[data-testid="markdown-editor"]'); expect(el).not.toBeNull(); return el!; });
+    await act(async () => { markdown.dispatchEvent(new MouseEvent("pointerdown", { bubbles: true })); setNativeValue(markdown, "# Sentinel rich draft"); });
+    await act(async () => { buttonByText(container, "raw").click(); });
+    await waitFor(() => expect(container.querySelector('[data-testid="instructions-raw-ineligible"]')?.textContent).toContain("current editor draft"));
+    expect(buttonByText(container, "Edit raw").disabled).toBe(true);
+    expect(buttonByText(container, "Verified installation").disabled).toBe(true);
+  });
+
+  it("refuses ill-formed and oversized drafts", async () => {
+    await renderRaw(entryDetail(ORIGINAL));
+    await enter("Edit raw");
+    await typeDraft("Sentinel \uD800 lone");
+    await waitFor(() => expect(container.querySelector('[data-testid="instructions-raw-block-reason"]')?.textContent).toContain("not well-formed"));
+    expect(saveButton("Save raw edit").disabled).toBe(true);
+    await typeDraft("a".repeat(1024 * 1024 + 1));
+    await waitFor(() => expect(container.querySelector('[data-testid="instructions-raw-block-reason"]')?.textContent).toContain("limit"));
+    expect(saveButton("Save raw edit").disabled).toBe(true);
+    expect(mockAgentsApi.saveInstructionsFile).not.toHaveBeenCalled();
   });
 });
