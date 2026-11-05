@@ -211,9 +211,11 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
   async function checkpoint(row: Copy, target?: AdapterExecutionTarget | null, stopped = false): Promise<Copy> {
     if (!await owns(row) || row.state === "superseded") return row;
     // A rejected stale entry is terminal for this copy. Later checkpoints and
-    // stopped collection never re-evaluate or reapply it.
-    if (row.errorCode === AGENT_FILES_ENTRY_CONFLICT) {
-      return stopped ? patch(row, { state: "unavailable", processStoppedAt: row.processStoppedAt ?? new Date(), nextAttemptAt: null }) : row;
+    // stopped collection never re-evaluate or reapply it. The receipt marker
+    // survives recovery transitions that replace the error code.
+    if (row.errorCode === AGENT_FILES_ENTRY_CONFLICT || row.receipt?.checkpointState === "conflict") {
+      return stopped ? patch(row, { state: "unavailable", processStoppedAt: row.processStoppedAt ?? new Date(), nextAttemptAt: null,
+        errorCode: AGENT_FILES_ENTRY_CONFLICT, errorMessage: ENTRY_CONFLICT_MESSAGE }) : row;
     }
     let failure: unknown;
     for (let attempt = 0; attempt < 3; attempt++) {
@@ -248,7 +250,7 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
       // The provider may still be running. Record the rejection, keep the copy
       // out of warm reuse, and let the stopped boundary discard it.
       return patch(row, { errorCode: AGENT_FILES_ENTRY_CONFLICT, errorMessage: ENTRY_CONFLICT_MESSAGE, nextAttemptAt: null,
-        ...(stopped ? { state: "unavailable", processStoppedAt: new Date() } : { receipt: { ...row.receipt, checkpointState: "conflict" } }) });
+        receipt: { ...row.receipt, checkpointState: "conflict" }, ...(stopped ? { state: "unavailable", processStoppedAt: new Date() } : {}) });
     }
     if (!stopped) return patch(row, { errorCode: "AGENT_FILES_CHECKPOINT_UNSTABLE", errorMessage: "Incremental checkpoint could not be validated; collecting after provider stop.", nextAttemptAt: null });
     const storageLimit = failure instanceof AgentFileLimitError || String(failure).includes("LIMIT_EXCEEDED");

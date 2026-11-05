@@ -40,8 +40,13 @@ describe("stale instruction entry predicate", () => {
     expect(check(file(h("a")), file(h("b")), file(h("b")))).toBe(false); // convergent content
   });
 
-  it("uses SHA-256 content identity only, ignoring mode-only differences", () => {
-    expect(check(file(h("a"), 0o100644), file(h("a"), 0o100755), file(h("c")))).toBe(false);
+  it("compares content by SHA-256 and treats any entry change apply would write as a write", () => {
+    // A mode-only copy change still copies the whole file, so it must not
+    // replace newer canonical content.
+    expect(check(file(h("a"), 0o100644), file(h("a"), 0o100755), file(h("c")))).toBe(true);
+    expect(check(file(h("a"), 0o100644), file(h("a"), 0o100755), file(h("a"), 0o100644))).toBe(false);
+    expect(check(file(h("a"), 0o100644), file(h("a"), 0o100755), file(h("a"), 0o100600))).toBe(false);
+    // Mode differences never make convergent or unchanged canonical content stale.
     expect(check(file(h("a")), file(h("b"), 0o100755), file(h("b"), 0o100644))).toBe(false);
     expect(check(file(h("a")), file(h("b")), file(h("a"), 0o100755))).toBe(false);
   });
@@ -243,6 +248,53 @@ describe("stale instruction entry write-back", () => {
     await copies.collectStopped({ companyId, runId: orphan.runId });
     await expectRejected(orphan.runId);
     await expect(fs.stat(entryPath())).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("rejects a mode-only entry change that would replace newer canonical content", async () => {
+    const copy = await run();
+    await fs.chmod(path.join(copy.localRoot, entryFile), 0o755);
+    await fs.writeFile(path.join(copy.localRoot, "unrelated.txt"), UNRELATED);
+    await managedSave(NEWER);
+    await copies.collectStopped({ companyId, runId: copy.runId });
+    await expectRejected(copy.runId);
+    expect(await readEntry()).toBe(NEWER);
+    await expect(fs.stat(path.join(root, "unrelated.txt"))).rejects.toMatchObject({ code: "ENOENT" });
+
+    const warm = await run({ warm: true });
+    await fs.chmod(path.join(warm.localRoot, entryFile), 0o755);
+    await managedSave(ORIGINAL);
+    expect((await copies.checkpointWarm({ companyId, runId: warm.runId }))?.errorCode).toBe(AGENT_FILES_ENTRY_CONFLICT);
+    expect(await readEntry()).toBe(ORIGINAL);
+    await copies.collectStopped({ companyId, runId: warm.runId });
+    await expectRejected(warm.runId);
+
+    // With canonical content unchanged, a mode-only change still saves.
+    const unchanged = await run();
+    await fs.chmod(path.join(unchanged.localRoot, entryFile), 0o755);
+    expect((await copies.collectStopped({ companyId, runId: unchanged.runId }))?.state).toBe("saved");
+    expect(await readEntry()).toBe(ORIGINAL);
+  });
+
+  it("keeps a warm rejection terminal across unconfirmed-stop recovery", async () => {
+    const copy = await run({ warm: true });
+    await fs.writeFile(path.join(copy.localRoot, entryFile), STALE);
+    await fs.writeFile(path.join(copy.localRoot, "unrelated.txt"), UNRELATED);
+    await managedSave(NEWER);
+    expect((await copies.checkpointWarm({ companyId, runId: copy.runId }))?.state).toBe("prepared");
+    // A terminal run without process-stop proof moves the copy to pending
+    // collection and replaces its error code.
+    await db.update(heartbeatRuns).set({ status: "succeeded" }).where(eq(heartbeatRuns.id, copy.runId));
+    copies = agentInstructionWorkingCopyService(db);
+    await copies.recoverStopped();
+    expect((await copies.get(companyId, copy.runId))).toMatchObject({ state: "pending_collection", errorCode: "INSTRUCTION_STOP_UNCONFIRMED" });
+    // A rollback-like save restores the baseline. The rejected copy must still
+    // never be re-evaluated or applied.
+    await managedSave(ORIGINAL);
+    await copies.collectStopped({ companyId, runId: copy.runId });
+    await expectRejected(copy.runId);
+    expect(await readEntry()).toBe(ORIGINAL);
+    await expect(fs.stat(path.join(root, "unrelated.txt"))).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(fs.stat(path.dirname(copy.localRoot))).rejects.toMatchObject({ code: "ENOENT" });
   });
 
   it("G: rejects the same way for a cancelled run", async () => {

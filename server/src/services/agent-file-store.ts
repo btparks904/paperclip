@@ -43,15 +43,19 @@ function entryIdentity(entry: SnapshotEntry | undefined): string | null {
   return entry.kind === "symlink" ? `symlink:${entry.target}` : "dir";
 }
 
-/** A write-back is stale for the configured entry when the working copy changed
- * it, canonical storage also changed it after the copy's durable baseline, and
- * the two results differ. Applying it would replace newer entry content. */
+/** A write-back is stale for the configured entry when apply would write the
+ * copy's entry, canonical content also changed after the copy's durable
+ * baseline, and the copy's content differs from canonical content. Applying it
+ * would replace newer entry content. "Would write" mirrors apply's changed-path
+ * rule, so a mode-only change that copies the whole file is covered. */
 export function isStaleEntryWriteBack(entryPath: string, baseline: DirectorySnapshot,
   incoming: DirectorySnapshot, current: DirectorySnapshot): boolean {
-  const before = entryIdentity(baseline.entries.get(entryPath));
-  const next = entryIdentity(incoming.entries.get(entryPath));
+  const baselineEntry = baseline.entries.get(entryPath), incomingEntry = incoming.entries.get(entryPath);
+  const writes = JSON.stringify(baselineEntry) !== JSON.stringify(incomingEntry);
+  const before = entryIdentity(baselineEntry);
+  const next = entryIdentity(incomingEntry);
   const present = entryIdentity(current.entries.get(entryPath));
-  return next !== before && present !== before && next !== present;
+  return writes && present !== before && next !== present;
 }
 
 export function isAgentFileEntryConflict(error: unknown): boolean {
