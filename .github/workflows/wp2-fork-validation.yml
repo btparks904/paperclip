@@ -1,0 +1,287 @@
+name: WP2 fork validation
+
+# Fork-only validation of two pinned commits: the exact WP2 PR #2 head and the
+# exact merged WP1 integration base. It does not deploy, publish, release or
+# write to the repository, and it uses no secrets.
+on:
+  push:
+    branches:
+      - chore/wp2-fork-ci-validation
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Validate ${{ matrix.target }} (${{ matrix.sha }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: head
+            sha: 29433d468a597e54787b62d9f2ca21ae3fb1a825
+            # The WP2 test file exists only at the WP2 head.
+            wp2_file: src/__tests__/agent-files-stale-entry.test.ts
+          - target: base
+            sha: d3bf7a83a6abaf2ba857ec388e5d8d270f017251
+            wp2_file: ""
+    env:
+      EXPECTED_SHA: ${{ matrix.sha }}
+      TARGET: ${{ matrix.target }}
+      WP2_FILE: ${{ matrix.wp2_file }}
+      # The same 10 existing related files on both commits.
+      RELATED_FILES: >-
+        src/__tests__/agent-directory-working-copies.test.ts
+        src/__tests__/agent-file-checkpoints.test.ts
+        src/__tests__/agent-instruction-revisions.test.ts
+        src/__tests__/agent-instruction-working-copies.test.ts
+        src/__tests__/agent-instructions-routes.test.ts
+        src/__tests__/built-in-agents.test.ts
+        src/__tests__/plugin-managed-agents.test.ts
+        src/__tests__/rerun-survival.integration.test.ts
+        src/services/native-runtime/runtime-context.test.ts
+        src/services/native-runtime/native-session-executor.test.ts
+      # The merged WP1 focused HTTP logging tests, present on both commits.
+      LOGGING_FILES: >-
+        src/__tests__/http-log-instruction-content.test.ts
+        src/__tests__/http-log-policy.test.ts
+        src/__tests__/http-log-redaction.test.ts
+        src/__tests__/error-handler.test.ts
+        src/__tests__/sentry.test.ts
+    steps:
+      - name: Checkout pinned commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ matrix.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Verify exact commit
+        run: |
+          actual="$(git rev-parse HEAD)"
+          echo "target=$TARGET expected=$EXPECTED_SHA actual=$actual"
+          if [ "$actual" != "$EXPECTED_SHA" ]; then
+            echo "::error::Checked-out commit does not match the expected full SHA"
+            exit 1
+          fi
+          {
+            echo "## WP2 fork validation: $TARGET"
+            echo ""
+            echo "- Validated commit: \`$actual\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: 24.11.1
+          package-manager-cache: false
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6
+        with:
+          version: 9.15.4
+
+      - name: Record toolchain
+        run: |
+          echo "node=$(node --version) pnpm=$(pnpm --version) runner_user=$(id -un) uid=$(id -u)"
+          if [ "$(id -u)" = "0" ]; then
+            echo "::error::Tests must not run as root"
+            exit 1
+          fi
+          {
+            echo "- Node: \`$(node --version)\`"
+            echo "- pnpm: \`$(pnpm --version)\`"
+            echo "- Runner user: \`$(id -un)\` (uid $(id -u))"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Install dependencies (frozen lockfile)
+        run: pnpm install --frozen-lockfile
+
+      - name: Write result summarizer
+        run: |
+          cat > "$RUNNER_TEMP/summarize.mjs" <<'EOF'
+          import fs from "node:fs";
+          const [label, file] = process.argv.slice(2);
+          let line;
+          if (!fs.existsSync(file)) {
+            line = `- ${label}: no result file (run did not complete)`;
+          } else {
+            const r = JSON.parse(fs.readFileSync(file, "utf8"));
+            const skipped = (r.numPendingTests ?? 0) + (r.numTodoTests ?? 0);
+            const failedFiles = (r.testResults ?? [])
+              .filter((t) => t.status === "failed")
+              .map((t) => t.name.replace(/^.*\/server\//, ""));
+            line =
+              `- ${label}: files ${(r.testResults ?? []).length}, total ${r.numTotalTests}, ` +
+              `passed ${r.numPassedTests}, failed ${r.numFailedTests}, skipped ${skipped}, ` +
+              `success ${r.success}` +
+              (failedFiles.length ? `; failed files: ${failedFiles.join(", ")}` : "");
+          }
+          console.log(line);
+          fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, line + "\n");
+          EOF
+
+      - name: Focused WP2 tests (head only)
+        id: wp2
+        if: matrix.target == 'head'
+        continue-on-error: true
+        timeout-minutes: 20
+        working-directory: server
+        run: |
+          test -e "$WP2_FILE" || { echo "::error::WP2 test file missing at head"; exit 1; }
+          pnpm exec vitest run "$WP2_FILE" \
+            --reporter=default --reporter=json \
+            --outputFile.json="$RUNNER_TEMP/wp2.json"
+          node -e '
+            const r = require(process.env.RUNNER_TEMP + "/wp2.json");
+            const skipped = (r.numPendingTests ?? 0) + (r.numTodoTests ?? 0);
+            if (!(r.numTotalTests > 0) || r.numFailedTests !== 0 || skipped !== 0 || r.numPassedTests !== r.numTotalTests) {
+              console.error("::error::WP2 tests must all run and pass with none skipped");
+              process.exit(1);
+            }'
+
+      - name: Summarize WP2 tests
+        if: always() && matrix.target == 'head'
+        run: node "$RUNNER_TEMP/summarize.mjs" "WP2 stale-entry tests (outcome ${{ steps.wp2.outcome }})" "$RUNNER_TEMP/wp2.json"
+
+      - name: Record WP2 asymmetry (base only)
+        if: matrix.target == 'base'
+        run: |
+          if [ -e server/src/__tests__/agent-files-stale-entry.test.ts ]; then
+            echo "::error::Unexpected WP2 test file at the base"
+            exit 1
+          fi
+          echo "- WP2 stale-entry tests: not applicable, the file does not exist at the base" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: WP1 HTTP logging tests
+        id: logging
+        continue-on-error: true
+        timeout-minutes: 20
+        working-directory: server
+        run: |
+          for f in $LOGGING_FILES; do test -e "$f" || { echo "::error::Missing $f"; exit 1; }; done
+          pnpm exec vitest run $LOGGING_FILES \
+            --reporter=default --reporter=json \
+            --outputFile.json="$RUNNER_TEMP/logging.json"
+
+      - name: Summarize logging tests
+        if: always()
+        run: node "$RUNNER_TEMP/summarize.mjs" "WP1 HTTP logging tests (outcome ${{ steps.logging.outcome }})" "$RUNNER_TEMP/logging.json"
+
+      - name: Server typecheck
+        id: typecheck
+        continue-on-error: true
+        timeout-minutes: 30
+        run: pnpm --filter @paperclipai/server typecheck
+
+      - name: Server build
+        id: build
+        continue-on-error: true
+        timeout-minutes: 30
+        run: |
+          pnpm --filter @paperclipai/server build
+          changed="$(git status --porcelain --untracked-files=no)"
+          if [ -n "$changed" ]; then
+            echo "::error::Build changed tracked files"
+            echo "$changed"
+            exit 1
+          fi
+
+      - name: Related regression tests
+        id: related
+        continue-on-error: true
+        timeout-minutes: 40
+        working-directory: server
+        run: |
+          for f in $RELATED_FILES; do test -e "$f" || { echo "::error::Missing $f"; exit 1; }; done
+          echo "- Related population: $(echo $RELATED_FILES | wc -w) files, all present" >> "$GITHUB_STEP_SUMMARY"
+          set -o pipefail
+          timeout --kill-after=30s 2100 pnpm exec vitest run $RELATED_FILES \
+            --reporter=default --reporter=json \
+            --outputFile.json="$RUNNER_TEMP/related.json" \
+            2>&1 | tee "$RUNNER_TEMP/related.log"
+
+      - name: Summarize related tests
+        if: always()
+        run: |
+          node "$RUNNER_TEMP/summarize.mjs" "Related tests (outcome ${{ steps.related.outcome }})" "$RUNNER_TEMP/related.json"
+          pg_failures=0
+          if [ -f "$RUNNER_TEMP/related.log" ]; then
+            pg_failures=$(grep -c "Failed to start embedded PostgreSQL" "$RUNNER_TEMP/related.log" || true)
+          fi
+          echo "- Embedded PostgreSQL startup failures in related log: $pg_failures" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Install the optional Sentry SDK outside the workspace
+        id: sentry_sdk
+        continue-on-error: true
+        timeout-minutes: 10
+        # Same mechanism as the repository's sentry-contract.yml: the version
+        # comes from the pinned server peer dependency and stays out of the
+        # workspace lockfile.
+        run: |
+          sentry_version=$(node -p 'require("./server/package.json").peerDependencies["@sentry/node"]')
+          echo "sentry_version=$sentry_version"
+          npm install --prefix "$RUNNER_TEMP/sentry-contract-sdk" --ignore-scripts --no-audit --no-fund --package-lock=false "@sentry/node@$sentry_version"
+
+      - name: Sentry tests with the real SDK
+        id: sentry
+        continue-on-error: true
+        timeout-minutes: 15
+        working-directory: server
+        env:
+          NODE_PATH: ${{ runner.temp }}/sentry-contract-sdk/node_modules
+          PAPERCLIP_REQUIRE_SENTRY_TEST_SDK: "1"
+        run: |
+          pnpm exec vitest run src/__tests__/sentry.test.ts src/__tests__/run-failure-sentry-real-sdk.test.ts \
+            --reporter=default --reporter=json \
+            --outputFile.json="$RUNNER_TEMP/sentry.json"
+          skipped=$(node -p 'const r=require(process.env.RUNNER_TEMP+"/sentry.json"); (r.numPendingTests??0)+(r.numTodoTests??0)')
+          if [ "$skipped" != "0" ]; then
+            echo "::error::Real-SDK Sentry tests were skipped ($skipped); the SDK did not load"
+            exit 1
+          fi
+
+      - name: Summarize Sentry tests
+        if: always()
+        run: node "$RUNNER_TEMP/summarize.mjs" "Sentry real-SDK tests (outcome ${{ steps.sentry.outcome }})" "$RUNNER_TEMP/sentry.json"
+
+      - name: Evaluate results
+        if: always()
+        env:
+          WP2: ${{ steps.wp2.outcome }}
+          LOGGING: ${{ steps.logging.outcome }}
+          TYPECHECK: ${{ steps.typecheck.outcome }}
+          BUILD: ${{ steps.build.outcome }}
+          RELATED: ${{ steps.related.outcome }}
+          SENTRY_SDK: ${{ steps.sentry_sdk.outcome }}
+          SENTRY: ${{ steps.sentry.outcome }}
+        run: |
+          {
+            echo ""
+            echo "| Check | Outcome |"
+            echo "| --- | --- |"
+            echo "| WP2 stale-entry tests | ${WP2:-not applicable} |"
+            echo "| WP1 HTTP logging tests | $LOGGING |"
+            echo "| Typecheck | $TYPECHECK |"
+            echo "| Build | $BUILD |"
+            echo "| Related regression tests | $RELATED |"
+            echo "| Sentry SDK install | $SENTRY_SDK |"
+            echo "| Sentry real-SDK tests | $SENTRY |"
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "target=$TARGET sha=$EXPECTED_SHA wp2=${WP2:-n/a} logging=$LOGGING typecheck=$TYPECHECK build=$BUILD related=$RELATED sentry_sdk=$SENTRY_SDK sentry=$SENTRY"
+          required="$LOGGING $TYPECHECK $BUILD $RELATED $SENTRY_SDK $SENTRY"
+          if [ "$TARGET" = "head" ]; then required="$WP2 $required"; fi
+          for outcome in $required; do
+            if [ "$outcome" != "success" ]; then
+              echo "::error::At least one validation check did not succeed"
+              exit 1
+            fi
+          done
+          changed="$(git status --porcelain --untracked-files=no)"
+          if [ -n "$changed" ]; then
+            echo "::error::Validation changed tracked files"
+            echo "$changed"
+            exit 1
+          fi
