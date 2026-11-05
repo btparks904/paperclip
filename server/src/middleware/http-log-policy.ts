@@ -66,6 +66,50 @@ export function isPrivateWebhookHttpRequest(
 }
 
 /**
+ * Managed agent instruction writes carry the complete private instruction file
+ * in the request body. Classify them by exact method and route so a rejected
+ * request (authentication, origin, validation, conflict or server failure)
+ * never copies that body into HTTP logs or error diagnostics. Read routes,
+ * restore, delete and bundle settings carry no instruction content and keep
+ * their ordinary diagnostics.
+ */
+const PRIVATE_INSTRUCTION_CONTENT_HTTP_ROUTES: ReadonlyArray<{
+  method: string;
+  pattern: RegExp;
+}> = [
+  {
+    method: "PUT",
+    pattern: /^\/api\/agents\/[^/]+\/instructions-bundle\/file\/?$/i,
+  },
+  {
+    method: "POST",
+    pattern:
+      /^\/api\/agents\/[^/]+\/instructions-bundle\/candidates\/[^/]+\/resolve\/?$/i,
+  },
+];
+
+function requestPathname(url: string): string {
+  const pathname = normalizePath(url);
+  // Absolute-form request targets reach Express unchanged. Classify their path
+  // component instead of letting a scheme and host prefix skip the match.
+  return /^https?:\/\//i.test(pathname)
+    ? pathname.replace(/^https?:\/\/[^/]*/i, "") || "/"
+    : pathname;
+}
+
+export function isPrivateInstructionContentHttpRequest(
+  method: string | undefined,
+  url: string | undefined,
+): boolean {
+  if (!method || !url) return false;
+  const upperMethod = method.toUpperCase();
+  const pathname = requestPathname(url);
+  return PRIVATE_INSTRUCTION_CONTENT_HTTP_ROUTES.some(
+    (route) => route.method === upperMethod && route.pattern.test(pathname),
+  );
+}
+
+/**
  * These routes accept or create one-time connector credentials. A provider or
  * validation error can echo credential material in its message even after the
  * structured request body has been redacted, so HTTP failure logs use generic

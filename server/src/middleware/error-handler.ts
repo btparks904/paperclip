@@ -7,7 +7,10 @@ import { getTelemetryClient } from "../telemetry.js";
 import { captureException } from "../sentry.js";
 import { COMPANY_IMPORT_API_PATH } from "../routes/company-import-paths.js";
 import { logger } from "./logger.js";
-import { isSecretSensitiveHttpRequest } from "./http-log-policy.js";
+import {
+  isPrivateInstructionContentHttpRequest,
+  isSecretSensitiveHttpRequest,
+} from "./http-log-policy.js";
 import {
   collectSensitiveStringValues,
   redactSensitiveValueOccurrences,
@@ -55,7 +58,9 @@ function attachErrorContext(
     error: payload,
     method: req.method,
     url: req.originalUrl,
-    reqBody: req.body,
+    // Instruction writes carry the private file as the body. Never retain it
+    // in diagnostics, whatever the error path.
+    reqBody: isPrivateInstructionContentRequest(req) ? "[REDACTED]" : req.body,
     reqParams: req.params,
     reqQuery: req.query,
   } satisfies ErrorContext;
@@ -64,7 +69,40 @@ function attachErrorContext(
   }
 }
 
+function isPrivateInstructionContentRequest(req: Request): boolean {
+  return isPrivateInstructionContentHttpRequest(req.method, req.originalUrl);
+}
+
+/**
+ * Replace an error raised while handling a private instruction write with a
+ * content-free one before it reaches crash reporting, res.err or HTTP error
+ * context. Messages, stacks and details may quote the submitted file. The
+ * client response is built separately and is unchanged.
+ */
+function sanitizeInstructionContentError(): Error {
+  const sanitized = new Error("Instruction content request failed");
+  sanitized.name = "Error";
+  return sanitized;
+}
+
+function instructionContentErrorPayload(
+  details: unknown,
+): ErrorContext["error"] {
+  const code =
+    details && typeof details === "object" && !Array.isArray(details)
+      ? (details as { code?: unknown }).code
+      : undefined;
+  return {
+    message: "Instruction content request failed",
+    name: "Error",
+    ...(typeof code === "string" ? { details: { code } } : {}),
+  };
+}
+
 function sanitizeSecretSensitiveError(req: Request, error: Error): Error {
+  if (isPrivateInstructionContentRequest(req)) {
+    return sanitizeInstructionContentError();
+  }
   if (!isSecretSensitiveHttpRequest(req.method, req.originalUrl)) return error;
   const sanitized = new Error("Secret-sensitive request failed");
   // Both `name` and `message` are attacker/provider-controlled properties on
@@ -166,7 +204,9 @@ export function errorHandler(
       attachErrorContext(
         req,
         res,
-        isSecretSensitiveHttpRequest(req.method, req.originalUrl)
+        isPrivateInstructionContentRequest(req)
+          ? instructionContentErrorPayload(err.details)
+          : isSecretSensitiveHttpRequest(req.method, req.originalUrl)
           ? { message: reportableError.message, name: reportableError.name }
           : {
               message: err.message,
@@ -267,7 +307,9 @@ export function errorHandler(
   attachErrorContext(
     req,
     res,
-    isSecretSensitiveHttpRequest(req.method, req.originalUrl)
+    isPrivateInstructionContentRequest(req)
+      ? instructionContentErrorPayload(undefined)
+      : isSecretSensitiveHttpRequest(req.method, req.originalUrl)
       ? { message: reportableError.message, name: reportableError.name }
       : err instanceof Error
         ? { message: err.message, stack: err.stack, name: err.name }

@@ -3,6 +3,7 @@ import type { Logger } from "pino";
 import { pinoHttp } from "pino-http";
 import { HTTP_LOG_REDACT_PATHS } from "./http-log-redaction.js";
 import {
+  isPrivateInstructionContentHttpRequest,
   isPrivateWebhookHttpRequest,
   isSecretSensitiveHttpRequest,
   shouldSilenceHttpSuccessLog,
@@ -60,6 +61,38 @@ function isPrivateWebhook(req: {
     req.method,
     requestClassificationUrl(req),
   );
+}
+
+function isPrivateInstructionContent(req: {
+  method?: string;
+  originalUrl?: unknown;
+  url?: unknown;
+}) {
+  return isPrivateInstructionContentHttpRequest(
+    req.method,
+    requestClassificationUrl(req),
+  );
+}
+
+/**
+ * Keep only a non-sensitive type marker and a string error code. Error
+ * messages, stacks, details and raw values on instruction writes can quote the
+ * submitted file, so none of them are logged.
+ */
+function instructionContentErrorContext(
+  ctx: { error?: { name?: unknown; details?: unknown } } | undefined,
+): { name: string; code?: string } {
+  const details = ctx?.error?.details;
+  const code =
+    details && typeof details === "object" && !Array.isArray(details)
+      ? (details as { code?: unknown }).code
+      : undefined;
+  return {
+    name: "Error",
+    ...(typeof code === "string" && /^[A-Za-z0-9_.:-]{1,64}$/.test(code)
+      ? { code }
+      : {}),
+  };
 }
 
 function privateWebhookLogUrl(url: unknown) {
@@ -137,7 +170,8 @@ export function createHttpLogger(baseLogger: Logger) {
     },
     customErrorMessage(req, res, err) {
       if (
-        isSecretSensitiveHttpRequest(req.method, requestClassificationUrl(req))
+        isSecretSensitiveHttpRequest(req.method, requestClassificationUrl(req)) ||
+        isPrivateInstructionContent(req)
       ) {
         return `${req.method} ${requestLogUrl(req)} ${res.statusCode} — request failed`;
       }
@@ -152,12 +186,19 @@ export function createHttpLogger(baseLogger: Logger) {
     customErrorObject(req, _res, _err, value) {
       // pino-http serializes res.err independently of customProps/errorContext.
       // Do not rely on a particular error handler having sanitized an SDK Error.
-      return isPrivateWebhook(req)
-        ? {
-            ...value,
-            err: { type: "Error", message: "Chat webhook request failed" },
-          }
-        : value;
+      if (isPrivateWebhook(req)) {
+        return {
+          ...value,
+          err: { type: "Error", message: "Chat webhook request failed" },
+        };
+      }
+      if (isPrivateInstructionContent(req)) {
+        return {
+          ...value,
+          err: { type: "Error", message: "Instruction content request failed" },
+        };
+      }
+      return value;
     },
     customProps(req, res) {
       if (res.statusCode >= 400) {
@@ -171,6 +212,27 @@ export function createHttpLogger(baseLogger: Logger) {
               ? { errorContext: { name: "Error" } }
               : {}),
           };
+        }
+        if (isPrivateInstructionContent(req)) {
+          // The request body is the private instruction file. Omit it whole
+          // (not key-redacted: `content` is not, and must not globally become,
+          // a sensitive key) on every failure, with or without error context.
+          const props: Record<string, unknown> = { reqBody: "[REDACTED]" };
+          const params = ctx ? ctx.reqParams : (req as any).params;
+          if (
+            params &&
+            typeof params === "object" &&
+            Object.keys(params).length > 0
+          ) {
+            props.reqParams = redactSensitive(params);
+          }
+          if ((req as any).route?.path) {
+            props.routePath = (req as any).route.path;
+          }
+          if (ctx || (res as any).err) {
+            props.errorContext = instructionContentErrorContext(ctx);
+          }
+          return props;
         }
         if (ctx) {
           const secretSensitiveRoute = isSecretSensitiveHttpRequest(
