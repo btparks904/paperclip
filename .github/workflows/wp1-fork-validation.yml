@@ -1,0 +1,272 @@
+name: WP1 fork validation
+
+# Fork-only validation of two pinned commits. It validates the exact WP1 head
+# and the exact v2026.1005.0 baseline. It does not deploy, publish, release or
+# write to the repository, and it uses no secrets.
+on:
+  push:
+    branches:
+      - chore/wp1-fork-ci-validation
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Validate ${{ matrix.target }} (${{ matrix.sha }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: head
+            sha: 3acc176b3b4cd5c16e8b2bf715ebc8d7bd21acff
+            focused: >-
+              src/__tests__/http-log-instruction-content.test.ts
+              src/__tests__/http-log-policy.test.ts
+              src/__tests__/http-log-redaction.test.ts
+              src/__tests__/error-handler.test.ts
+              src/__tests__/sentry.test.ts
+          - target: base
+            sha: 467125fafb47a8520856504fecc48d6e32055db1
+            # The WP1 instruction-content test file does not exist on the base.
+            focused: >-
+              src/__tests__/http-log-policy.test.ts
+              src/__tests__/http-log-redaction.test.ts
+              src/__tests__/error-handler.test.ts
+              src/__tests__/sentry.test.ts
+    env:
+      EXPECTED_SHA: ${{ matrix.sha }}
+      TARGET: ${{ matrix.target }}
+      FOCUSED_FILES: ${{ matrix.focused }}
+      # The 33 server test files that import the changed middleware at the WP1
+      # head. Files absent at a commit are listed in the summary, not run.
+      WIDER_FILES: >-
+        src/__tests__/agent-auth-middleware.test.ts
+        src/__tests__/agent-device-login-routes.test.ts
+        src/__tests__/agent-secrets-routes.test.ts
+        src/__tests__/announcement-feed.test.ts
+        src/__tests__/announcements-routes.test.ts
+        src/__tests__/auth-session-route.test.ts
+        src/__tests__/cases-routes.test.ts
+        src/__tests__/chat-channels.integration.test.ts
+        src/__tests__/chat-webhook-diagnostics.test.ts
+        src/__tests__/company-skill-policy-routes.test.ts
+        src/__tests__/company-skills-import-authz-routes.test.ts
+        src/__tests__/environment-run-orchestrator.test.ts
+        src/__tests__/environment-runtime.test.ts
+        src/__tests__/error-handler.test.ts
+        src/__tests__/generic-mcp-connection.test.ts
+        src/__tests__/heartbeat-orphaned-active-lease-sweep.test.ts
+        src/__tests__/heartbeat-pending-cleanup-sweep.test.ts
+        src/__tests__/http-log-instruction-content.test.ts
+        src/__tests__/http-log-policy.test.ts
+        src/__tests__/http-log-redaction.test.ts
+        src/__tests__/issue-existing-branch-validation-status.test.ts
+        src/__tests__/json-parse-error-handler.test.ts
+        src/__tests__/live-events-ws.test.ts
+        src/__tests__/logger-tz.test.ts
+        src/__tests__/pipelines-routes.test.ts
+        src/__tests__/plugin-worker-manager.test.ts
+        src/__tests__/routines-e2e.test.ts
+        src/__tests__/secret-proposals-routes.test.ts
+        src/__tests__/secrets-routes.test.ts
+        src/__tests__/sentry.test.ts
+        src/__tests__/server-startup-feedback-export.test.ts
+        src/__tests__/skills-catalog-service.test.ts
+        src/__tests__/task-connector-read-routes.test.ts
+    steps:
+      - name: Checkout pinned commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ matrix.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Verify exact commit
+        run: |
+          actual="$(git rev-parse HEAD)"
+          echo "target=$TARGET expected=$EXPECTED_SHA actual=$actual"
+          if [ "$actual" != "$EXPECTED_SHA" ]; then
+            echo "::error::Checked-out commit does not match the expected full SHA"
+            exit 1
+          fi
+          {
+            echo "## WP1 fork validation: $TARGET"
+            echo ""
+            echo "- Validated commit: \`$actual\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: 24.11.1
+          package-manager-cache: false
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6
+        with:
+          version: 9.15.4
+
+      - name: Record toolchain
+        run: |
+          echo "node=$(node --version) pnpm=$(pnpm --version) runner_user=$(id -un) uid=$(id -u)"
+          {
+            echo "- Node: \`$(node --version)\`"
+            echo "- pnpm: \`$(pnpm --version)\`"
+            echo "- Runner user: \`$(id -un)\` (uid $(id -u))"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Install dependencies (frozen lockfile)
+        run: pnpm install --frozen-lockfile
+
+      - name: Write result summarizer
+        run: |
+          cat > "$RUNNER_TEMP/summarize.mjs" <<'EOF'
+          import fs from "node:fs";
+          const [label, file] = process.argv.slice(2);
+          let line;
+          if (!fs.existsSync(file)) {
+            line = `- ${label}: no result file (run did not complete)`;
+          } else {
+            const r = JSON.parse(fs.readFileSync(file, "utf8"));
+            const skipped = (r.numPendingTests ?? 0) + (r.numTodoTests ?? 0);
+            const failedFiles = (r.testResults ?? [])
+              .filter((t) => t.status === "failed")
+              .map((t) => t.name.replace(/^.*\/server\//, ""));
+            line =
+              `- ${label}: total ${r.numTotalTests}, passed ${r.numPassedTests}, ` +
+              `failed ${r.numFailedTests}, skipped ${skipped}, ` +
+              `suites ${r.numTotalTestSuites ?? "n/a"}, success ${r.success}` +
+              (failedFiles.length ? `; failed files: ${failedFiles.join(", ")}` : "");
+          }
+          console.log(line);
+          fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, line + "\n");
+          EOF
+
+      - name: Focused WP1 security tests
+        id: focused
+        continue-on-error: true
+        timeout-minutes: 20
+        working-directory: server
+        run: |
+          echo "files: $FOCUSED_FILES"
+          pnpm exec vitest run $FOCUSED_FILES \
+            --reporter=default --reporter=json \
+            --outputFile.json="$RUNNER_TEMP/focused.json"
+
+      - name: Summarize focused tests
+        if: always()
+        run: node "$RUNNER_TEMP/summarize.mjs" "Focused tests (exit ${{ steps.focused.outcome }})" "$RUNNER_TEMP/focused.json"
+
+      - name: Server typecheck
+        id: typecheck
+        continue-on-error: true
+        timeout-minutes: 30
+        run: pnpm --filter @paperclipai/server typecheck
+
+      - name: Server build
+        id: build
+        continue-on-error: true
+        timeout-minutes: 30
+        run: |
+          pnpm --filter @paperclipai/server build
+          changed="$(git status --porcelain --untracked-files=no)"
+          if [ -n "$changed" ]; then
+            echo "::error::Build changed tracked files"
+            echo "$changed"
+            exit 1
+          fi
+
+      - name: Wider middleware tests
+        id: wider
+        continue-on-error: true
+        timeout-minutes: 40
+        working-directory: server
+        run: |
+          present=""
+          missing=""
+          for f in $WIDER_FILES; do
+            if [ -e "$f" ]; then present="$present $f"; else missing="$missing $f"; fi
+          done
+          echo "present: $(echo $present | wc -w) missing: ${missing:-none}"
+          echo "- Wider population: $(echo $present | wc -w) present, missing:${missing:- none}" >> "$GITHUB_STEP_SUMMARY"
+          set -o pipefail
+          timeout --kill-after=30s 2100 pnpm exec vitest run $present \
+            --reporter=default --reporter=json \
+            --outputFile.json="$RUNNER_TEMP/wider.json" \
+            2>&1 | tee "$RUNNER_TEMP/wider.log"
+
+      - name: Summarize wider tests
+        if: always()
+        run: |
+          node "$RUNNER_TEMP/summarize.mjs" "Wider tests (outcome ${{ steps.wider.outcome }})" "$RUNNER_TEMP/wider.json"
+          pg_failures=0
+          if [ -f "$RUNNER_TEMP/wider.log" ]; then
+            pg_failures=$(grep -c "Failed to start embedded PostgreSQL" "$RUNNER_TEMP/wider.log" || true)
+          fi
+          echo "- Embedded PostgreSQL startup failures in wider log: $pg_failures" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Install the optional Sentry SDK outside the workspace
+        id: sentry_sdk
+        continue-on-error: true
+        timeout-minutes: 10
+        # Same mechanism as the repository's sentry-contract.yml: the version
+        # comes from the pinned server peer dependency and stays out of the
+        # workspace lockfile.
+        run: |
+          sentry_version=$(node -p 'require("./server/package.json").peerDependencies["@sentry/node"]')
+          echo "sentry_version=$sentry_version"
+          npm install --prefix "$RUNNER_TEMP/sentry-contract-sdk" --ignore-scripts --no-audit --no-fund --package-lock=false "@sentry/node@$sentry_version"
+
+      - name: Sentry tests with the real SDK
+        id: sentry
+        continue-on-error: true
+        timeout-minutes: 15
+        working-directory: server
+        env:
+          NODE_PATH: ${{ runner.temp }}/sentry-contract-sdk/node_modules
+          PAPERCLIP_REQUIRE_SENTRY_TEST_SDK: "1"
+        run: |
+          pnpm exec vitest run src/__tests__/sentry.test.ts src/__tests__/run-failure-sentry-real-sdk.test.ts \
+            --reporter=default --reporter=json \
+            --outputFile.json="$RUNNER_TEMP/sentry.json"
+          skipped=$(node -p 'const r=require(process.env.RUNNER_TEMP+"/sentry.json"); (r.numPendingTests??0)+(r.numTodoTests??0)')
+          if [ "$skipped" != "0" ]; then
+            echo "::error::Real-SDK Sentry tests were skipped ($skipped); the SDK did not load"
+            exit 1
+          fi
+
+      - name: Summarize Sentry tests
+        if: always()
+        run: node "$RUNNER_TEMP/summarize.mjs" "Sentry real-SDK tests (outcome ${{ steps.sentry.outcome }})" "$RUNNER_TEMP/sentry.json"
+
+      - name: Evaluate results
+        if: always()
+        env:
+          FOCUSED: ${{ steps.focused.outcome }}
+          TYPECHECK: ${{ steps.typecheck.outcome }}
+          BUILD: ${{ steps.build.outcome }}
+          WIDER: ${{ steps.wider.outcome }}
+          SENTRY_SDK: ${{ steps.sentry_sdk.outcome }}
+          SENTRY: ${{ steps.sentry.outcome }}
+        run: |
+          {
+            echo ""
+            echo "| Check | Outcome |"
+            echo "| --- | --- |"
+            echo "| Focused tests | $FOCUSED |"
+            echo "| Typecheck | $TYPECHECK |"
+            echo "| Build | $BUILD |"
+            echo "| Wider middleware tests | $WIDER |"
+            echo "| Sentry SDK install | $SENTRY_SDK |"
+            echo "| Sentry real-SDK tests | $SENTRY |"
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "target=$TARGET sha=$EXPECTED_SHA focused=$FOCUSED typecheck=$TYPECHECK build=$BUILD wider=$WIDER sentry_sdk=$SENTRY_SDK sentry=$SENTRY"
+          for outcome in "$FOCUSED" "$TYPECHECK" "$BUILD" "$WIDER" "$SENTRY_SDK" "$SENTRY"; do
+            if [ "$outcome" != "success" ]; then
+              echo "::error::At least one validation check did not succeed"
+              exit 1
+            fi
+          done
