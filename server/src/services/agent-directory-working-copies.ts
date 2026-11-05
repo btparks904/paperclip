@@ -5,7 +5,7 @@ import { agents, environmentLeases, environments, agentInstructionWorkingCopies 
 import { syncDirectoryToSsh, restoreWorkspaceFromSshExecution } from "@paperclipai/adapter-utils/ssh";
 import { prepareAdapterExecutionTargetRuntime, runAdapterExecutionTargetShellCommand, type AdapterExecutionTarget, type PreparedAdapterExecutionTargetRuntime } from "@paperclipai/adapter-utils/execution-target";
 import { withDirectoryMergeLock, directorySnapshotSha256, parseDirectorySnapshot, serializeDirectorySnapshot, type DirectoryMergeLockOperation } from "@paperclipai/adapter-utils/workspace-restore-merge";
-import { AGENT_FILES_CONTRACT, AgentFileLimitError, agentFileStore, agentStorageWarning, inspectAgentDirectory } from "./agent-file-store.js";
+import { AGENT_FILES_CONTRACT, AGENT_FILES_ENTRY_CONFLICT, AgentFileLimitError, agentFileStore, agentStorageWarning, inspectAgentDirectory, isAgentFileEntryConflict } from "./agent-file-store.js";
 import { agentInstructionsBundleMode, deriveBundleState, resolveManagedInstructionsRoot } from "./agent-instructions.js";
 import { instructionGitExcludeProgram } from "./agent-instruction-files.js";
 import { resolveInstructionActor } from "./agent-instruction-authorization.js";
@@ -22,6 +22,7 @@ export class AgentDirectoryReuseInvalidatedError extends Error {}
 const completed = new Set(["saved", "unchanged", "resolved", "unavailable"]);
 const transports = new Map<string, PreparedAdapterExecutionTargetRuntime>();
 const key = (row: Pick<Copy, "companyId" | "runId">) => `${row.companyId}:${row.runId}`;
+const ENTRY_CONFLICT_MESSAGE = "The instruction entry changed after this run's copy was prepared. This run's agent-folder changes were rejected and not saved; the temporary copy is discarded.";
 export function isAgentDirectoryCopy(row: Pick<Copy, "receipt"> | null): boolean {
   return row?.receipt?.schema === AGENT_FILES_CONTRACT;
 }
@@ -209,6 +210,11 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
   }
   async function checkpoint(row: Copy, target?: AdapterExecutionTarget | null, stopped = false): Promise<Copy> {
     if (!await owns(row) || row.state === "superseded") return row;
+    // A rejected stale entry is terminal for this copy. Later checkpoints and
+    // stopped collection never re-evaluate or reapply it.
+    if (row.errorCode === AGENT_FILES_ENTRY_CONFLICT) {
+      return stopped ? patch(row, { state: "unavailable", processStoppedAt: row.processStoppedAt ?? new Date(), nextAttemptAt: null }) : row;
+    }
     let failure: unknown;
     for (let attempt = 0; attempt < 3; attempt++) {
       let captured: Awaited<ReturnType<typeof captureAgentFileCheckpoint>> | undefined;
@@ -232,10 +238,17 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
       } catch (error) {
         failure = error;
         logger.warn({ err: error, runId: row.runId, attempt: attempt + 1, stopped }, "Agent file checkpoint failed");
+        if (isAgentFileEntryConflict(error)) break;
       }
       finally {
         await captured?.cleanup().catch(error => logger.warn({ err: error, runId: row.runId }, "Agent checkpoint scratch cleanup deferred to session retirement"));
       }
+    }
+    if (isAgentFileEntryConflict(failure)) {
+      // The provider may still be running. Record the rejection, keep the copy
+      // out of warm reuse, and let the stopped boundary discard it.
+      return patch(row, { errorCode: AGENT_FILES_ENTRY_CONFLICT, errorMessage: ENTRY_CONFLICT_MESSAGE, nextAttemptAt: null,
+        ...(stopped ? { state: "unavailable", processStoppedAt: new Date() } : { receipt: { ...row.receipt, checkpointState: "conflict" } }) });
     }
     if (!stopped) return patch(row, { errorCode: "AGENT_FILES_CHECKPOINT_UNSTABLE", errorMessage: "Incremental checkpoint could not be validated; collecting after provider stop.", nextAttemptAt: null });
     const storageLimit = failure instanceof AgentFileLimitError || String(failure).includes("LIMIT_EXCEEDED");
@@ -273,10 +286,11 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
       } catch (error) {
         const retryable = !(error instanceof HttpError) || error.status >= 500;
         if (retryable && row.attempts < 3) continue;
+        const entryConflict = isAgentFileEntryConflict(error);
         row = await patch(row, { state: "unavailable", nextAttemptAt: null,
           receipt: { ...row.receipt, storageWarning: error instanceof AgentFileLimitError ? agentStorageWarning(error.message) : row.receipt?.storageWarning ?? null },
-          errorCode: error instanceof AgentFileLimitError ? "AGENT_FILES_LIMIT_EXCEEDED" : "AGENT_FILES_SAVE_FAILED",
-          errorMessage: error instanceof HttpError && error.status === 422
+          errorCode: entryConflict ? AGENT_FILES_ENTRY_CONFLICT : error instanceof AgentFileLimitError ? "AGENT_FILES_LIMIT_EXCEEDED" : "AGENT_FILES_SAVE_FAILED",
+          errorMessage: entryConflict ? ENTRY_CONFLICT_MESSAGE : error instanceof HttpError && error.status === 422
             ? `${error.message}. This run's agent-folder changes were not saved; the temporary copy is discarded.`
             : "Agent-file synchronization failed. No successful save is claimed; the temporary copy is discarded.",
         });

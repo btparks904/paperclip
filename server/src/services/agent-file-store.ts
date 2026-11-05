@@ -6,7 +6,7 @@ import { Readable } from "node:stream";
 import path from "node:path";
 import { and, eq } from "drizzle-orm";
 import { agents, activityLog, agentInstructionHeads, agentInstructionRevisions, type Db } from "@paperclipai/db";
-import { captureDirectorySnapshot, mergeDirectoryWithBaseline, type DirectorySnapshot } from "@paperclipai/adapter-utils/workspace-restore-merge";
+import { captureDirectorySnapshot, mergeDirectoryWithBaseline, type DirectorySnapshot, type SnapshotEntry } from "@paperclipai/adapter-utils/workspace-restore-merge";
 import { HttpError, conflict, notFound, unprocessable } from "../errors.js";
 import { authorizeInstructionCommit, authorizeInstructionRead } from "./agent-instruction-authorization.js";
 import { assertInstructionPathSafe, instructionPath, instructionBytes, materializeInstructionBytes, readInstructionBytes, MAX_INSTRUCTION_BYTES } from "./agent-instruction-files.js";
@@ -33,6 +33,32 @@ function assertDirectorySize(size: number, count: number) {
   if (size > MAX_AGENT_DIRECTORY_BYTES) throw new AgentFileLimitError("Agent directory exceeds the 2 GiB total storage limit");
   if (count > MAX_AGENT_DIRECTORY_ENTRIES) throw new AgentFileLimitError("Agent directory exceeds the 100,000-entry limit (files and folders)");
 }
+export const AGENT_FILES_ENTRY_CONFLICT = "AGENT_FILES_ENTRY_CONFLICT";
+
+/** Content identity of one snapshot entry. Files compare by SHA-256 only, never
+ * by mode, size, timestamps, inode or path; an absent entry is null. */
+function entryIdentity(entry: SnapshotEntry | undefined): string | null {
+  if (!entry) return null;
+  if (entry.kind === "file") return `file:${entry.hash}`;
+  return entry.kind === "symlink" ? `symlink:${entry.target}` : "dir";
+}
+
+/** A write-back is stale for the configured entry when the working copy changed
+ * it, canonical storage also changed it after the copy's durable baseline, and
+ * the two results differ. Applying it would replace newer entry content. */
+export function isStaleEntryWriteBack(entryPath: string, baseline: DirectorySnapshot,
+  incoming: DirectorySnapshot, current: DirectorySnapshot): boolean {
+  const before = entryIdentity(baseline.entries.get(entryPath));
+  const next = entryIdentity(incoming.entries.get(entryPath));
+  const present = entryIdentity(current.entries.get(entryPath));
+  return next !== before && present !== before && next !== present;
+}
+
+export function isAgentFileEntryConflict(error: unknown): boolean {
+  return error instanceof HttpError && error.status === 409 &&
+    (error.details as { code?: unknown } | undefined)?.code === AGENT_FILES_ENTRY_CONFLICT;
+}
+
 export function agentStorageWarning(detail: string) {
   return `Agent storage is full. ${detail}. Runs can continue; remove or shrink files in AGENT_HOME to free space. Changes exceeding the storage limits will not be saved.`;
 }
@@ -234,6 +260,14 @@ export function agentFileStore(db: Db) {
         // over quota. Enforce limits on the incoming and resulting tree so a
         // run can delete files to recover instead of being locked out forever.
         const current = input.checkpoint ? checkpointSnapshot(await cachedAgentFileManifest(root)) : await snapshotAgentFiles(root, false);
+        // Managed instruction saves take this same agent row lock, so canonical
+        // content cannot change between this check and the merge below. A stale
+        // entry rejects the whole write-back before any file is touched: no
+        // partial apply, no preserved candidate. Report only the entry path.
+        if (isStaleEntryWriteBack(entryPath, input.baseline, incoming, current)) {
+          throw conflict("The instruction entry changed after this working copy was prepared. The write-back was rejected and no files were saved.",
+            { code: AGENT_FILES_ENTRY_CONFLICT, path: entryPath });
+        }
         // Rebase only the run's changed paths onto the current tree. This makes
         // same-file edits/deletions last-sync-wins while untouched files retain
         // changes from other runs. Ancestors may need recreating after a writer

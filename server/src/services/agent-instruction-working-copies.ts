@@ -1,4 +1,5 @@
 import { agentDirectoryWorkingCopyService, isAgentDirectoryCopy } from "./agent-directory-working-copies.js";
+import { AGENT_FILES_ENTRY_CONFLICT } from "./agent-file-store.js";
 import { createHash } from "node:crypto";
 import { execFile as execFileCallback } from "node:child_process";
 import { promisify } from "node:util";
@@ -314,8 +315,9 @@ export function agentInstructionWorkingCopyService(db: Db, options: { environmen
         const result = await collectStopped({ companyId: row.companyId, runId: row.runId });
         if (result && isAgentDirectoryCopy(result) && completed.has(result.state)) await directories.release(result);
       } else if (row.location !== "local" && await remoteExecutionHasStopped(db, row.companyId, row.runId)) {
+        // Keep a recorded stale-entry rejection as the copy's final outcome.
         const unavailable = row.receipt?.warm === true
-          ? await patch(row, { state: "unavailable", errorCode: "AGENT_FILES_FINAL_COLLECTION_UNAVAILABLE",
+          ? await patch(row, row.errorCode === AGENT_FILES_ENTRY_CONFLICT ? { state: "unavailable", nextAttemptAt: null } : { state: "unavailable", errorCode: "AGENT_FILES_FINAL_COLLECTION_UNAVAILABLE",
             errorMessage: "The last completed checkpoint remains saved. Files changed afterwards could not be collected after remote termination.", nextAttemptAt: null })
           : await reportUnavailable(row.companyId, row.runId);
         if (unavailable && isAgentDirectoryCopy(unavailable)) {
