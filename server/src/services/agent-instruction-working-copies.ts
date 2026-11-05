@@ -21,6 +21,8 @@ import { hasNativeLocalProcessStop } from "./native-local-process-stop.js";
 import { remoteExecutionHasStopped } from "./remote-execution-termination.js";
 import type { AuthorizationActor } from "./authorization.js";
 import type { EnvironmentRuntimeService } from "./environment-runtime.js";
+// Same bounded text that the directory lifecycle records for this rejection.
+const ENTRY_CONFLICT_MESSAGE = "The instruction entry changed after this run's copy was prepared. This run's agent-folder changes were rejected and not saved; the temporary copy is discarded.";
 
 const execFile = promisify(execFileCallback);
 type Copy = typeof copies.$inferSelect;
@@ -315,9 +317,11 @@ export function agentInstructionWorkingCopyService(db: Db, options: { environmen
         const result = await collectStopped({ companyId: row.companyId, runId: row.runId });
         if (result && isAgentDirectoryCopy(result) && completed.has(result.state)) await directories.release(result);
       } else if (row.location !== "local" && await remoteExecutionHasStopped(db, row.companyId, row.runId)) {
-        // Keep a recorded stale-entry rejection as the copy's final outcome.
+        // Keep a recorded stale-entry rejection as the copy's final outcome. The
+        // receipt marker survives transitions that replace the visible code.
+        const entryConflict = row.errorCode === AGENT_FILES_ENTRY_CONFLICT || row.receipt?.checkpointState === "conflict";
         const unavailable = row.receipt?.warm === true
-          ? await patch(row, row.errorCode === AGENT_FILES_ENTRY_CONFLICT ? { state: "unavailable", nextAttemptAt: null } : { state: "unavailable", errorCode: "AGENT_FILES_FINAL_COLLECTION_UNAVAILABLE",
+          ? await patch(row, entryConflict ? { state: "unavailable", errorCode: AGENT_FILES_ENTRY_CONFLICT, errorMessage: ENTRY_CONFLICT_MESSAGE, nextAttemptAt: null } : { state: "unavailable", errorCode: "AGENT_FILES_FINAL_COLLECTION_UNAVAILABLE",
             errorMessage: "The last completed checkpoint remains saved. Files changed afterwards could not be collected after remote termination.", nextAttemptAt: null })
           : await reportUnavailable(row.companyId, row.runId);
         if (unavailable && isAgentDirectoryCopy(unavailable)) {

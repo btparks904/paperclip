@@ -5,12 +5,13 @@ import { randomUUID } from "node:crypto";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { eq, sql } from "drizzle-orm";
 import { parseDirectorySnapshot, type DirectorySnapshot, type SnapshotEntry } from "@paperclipai/adapter-utils/workspace-restore-merge";
-import { activityLog, agents, agentInstructionWorkingCopies, authUsers, companies, companyMemberships, createDb, heartbeatRuns, principalPermissionGrants } from "@paperclipai/db";
+import { activityLog, agents, agentInstructionWorkingCopies, authUsers, companies, companyMemberships, createDb, environmentLeases, environments, heartbeatRuns, principalPermissionGrants } from "@paperclipai/db";
 import { AGENT_FILES_ENTRY_CONFLICT, agentFileStore, agentFileTokenFromHash, fileHash, isStaleEntryWriteBack, snapshotAgentFiles } from "../services/agent-file-store.js";
 import { agentInstructionRevisionService } from "../services/agent-instruction-revisions.js";
 import { agentInstructionWorkingCopyService } from "../services/agent-instruction-working-copies.js";
 import { resolveManagedInstructionsRoot } from "../services/agent-instructions.js";
 import { logger } from "../middleware/logger.js";
+import { remoteTerminationReceipt } from "../services/remote-execution-termination.js";
 import { startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 
 // Synthetic sentinels stand in for private instruction text. None of them may
@@ -295,6 +296,85 @@ describe("stale instruction entry write-back", () => {
     expect(await readEntry()).toBe(ORIGINAL);
     await expect(fs.stat(path.join(root, "unrelated.txt"))).rejects.toMatchObject({ code: "ENOENT" });
     await expect(fs.stat(path.dirname(copy.localRoot))).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  /** Move a local warm copy to a remote location whose sandbox is not yet
+   * confirmed stopped, then run the unconfirmed-stop sweep. */
+  async function makeRemoteUnconfirmed(runId: string) {
+    const environmentId = randomUUID(), leaseId = randomUUID(), remoteCwd = "/fixture/task";
+    await db.insert(environments).values({ id: environmentId, name: environmentId, driver: "sandbox" });
+    await db.update(heartbeatRuns).set({ status: "succeeded", runtimeMode: "native" }).where(eq(heartbeatRuns.id, runId));
+    const saved = (await copies.get(companyId, runId))!;
+    await db.update(agentInstructionWorkingCopies).set({ location: `remote:${environmentId}`,
+      executionRoot: path.posix.join(remoteCwd, ".paperclip-runtime", "agent-files", agentId, runId),
+      receipt: { ...saved.receipt, cleanup: { leaseId, remoteCwd } } }).where(eq(agentInstructionWorkingCopies.runId, runId));
+    copies = agentInstructionWorkingCopyService(db);
+    await copies.recoverStopped();
+    const unconfirmed = (await copies.get(companyId, runId))!;
+    expect(unconfirmed).toMatchObject({ state: "pending_collection", errorCode: "INSTRUCTION_STOP_UNCONFIRMED" });
+    return { environmentId, leaseId };
+  }
+  /** Record verified sandbox destruction and run the remote finalization sweep. */
+  async function confirmRemoteTermination(runId: string, environmentId: string, leaseId: string) {
+    const lease = { id: leaseId, companyId, environmentId, heartbeatRunId: runId, provider: "daytona", providerLeaseId: `destroyed-${runId}` };
+    await db.insert(environmentLeases).values({ ...lease, status: "released", releasedAt: new Date(), cleanupStatus: "success",
+      metadata: { remoteExecutionTermination: remoteTerminationReceipt(lease, { providerLeaseId: lease.providerLeaseId, state: "destroyed" }) } });
+    copies = agentInstructionWorkingCopyService(db);
+    await copies.recoverStopped();
+    return (await copies.get(companyId, runId))!;
+  }
+
+  it("keeps a warm conflict as the final outcome after unconfirmed stop and remote termination", async () => {
+    const warn = vi.spyOn(logger, "warn");
+    const copy = await run({ warm: true });
+    await fs.writeFile(path.join(copy.localRoot, entryFile), STALE);
+    await fs.writeFile(path.join(copy.localRoot, "unrelated.txt"), UNRELATED);
+    await managedSave(NEWER);
+    const rejected = (await copies.checkpointWarm({ companyId, runId: copy.runId }))!;
+    expect(rejected).toMatchObject({ state: "prepared", errorCode: AGENT_FILES_ENTRY_CONFLICT });
+    expect(rejected.receipt?.checkpointState).toBe("conflict");
+    const conflictMessage = rejected.errorMessage;
+    const before = await tree();
+    const activity = await activityCount();
+    const apply = vi.spyOn(agentFileStore(db), "apply");
+
+    const { environmentId, leaseId } = await makeRemoteUnconfirmed(copy.runId);
+    // The visible code changed, but the durable marker still identifies the conflict.
+    expect((await copies.get(companyId, copy.runId))?.receipt?.checkpointState).toBe("conflict");
+
+    const final = await confirmRemoteTermination(copy.runId, environmentId, leaseId);
+    expect(final).toMatchObject({ state: "unavailable", errorCode: AGENT_FILES_ENTRY_CONFLICT, errorMessage: conflictMessage });
+    expect(final.processStoppedAt).not.toBeNull();
+    expect(final.receipt?.cleanupPending).toBe(false);
+    expectNoSentinel(final.errorMessage);
+    expectNoSentinel(final.receipt);
+    // Terminal: no reapply, no canonical change, no audited save.
+    expect(apply).not.toHaveBeenCalled();
+    expect(await readEntry()).toBe(NEWER);
+    expect(await tree()).toEqual(before);
+    expect(await activityCount()).toBe(activity);
+    await expect(fs.stat(path.dirname(copy.localRoot))).rejects.toMatchObject({ code: "ENOENT" });
+    copies = agentInstructionWorkingCopyService(db);
+    await copies.recoverStopped();
+    await copies.collectStopped({ companyId, runId: copy.runId });
+    expect(await copies.get(companyId, copy.runId)).toMatchObject({ state: "unavailable", errorCode: AGENT_FILES_ENTRY_CONFLICT });
+    expect(await readEntry()).toBe(NEWER);
+    expect(await tree()).toEqual(before);
+    expectNoSentinel(serializeLogCalls(warn));
+    expectNoSentinel((await db.select().from(activityLog).where(eq(activityLog.entityId, agentId))).map(row => row.details));
+  });
+
+  it("keeps the existing final-collection outcome for a non-conflict remote termination", async () => {
+    const copy = await run({ warm: true });
+    await fs.writeFile(path.join(copy.localRoot, "unrelated.txt"), UNRELATED);
+    const before = await tree();
+    const { environmentId, leaseId } = await makeRemoteUnconfirmed(copy.runId);
+    const final = await confirmRemoteTermination(copy.runId, environmentId, leaseId);
+    expect(final).toMatchObject({ state: "unavailable", errorCode: "AGENT_FILES_FINAL_COLLECTION_UNAVAILABLE",
+      errorMessage: "The last completed checkpoint remains saved. Files changed afterwards could not be collected after remote termination." });
+    expect(final.receipt?.cleanupPending).toBe(false);
+    expect(await readEntry()).toBe(ORIGINAL);
+    expect(await tree()).toEqual(before);
   });
 
   it("G: rejects the same way for a cancelled run", async () => {
