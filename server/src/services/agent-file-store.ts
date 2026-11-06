@@ -9,7 +9,7 @@ import { agents, activityLog, agentInstructionHeads, agentInstructionRevisions, 
 import { captureDirectorySnapshot, mergeDirectoryWithBaseline, type DirectorySnapshot, type SnapshotEntry } from "@paperclipai/adapter-utils/workspace-restore-merge";
 import { HttpError, conflict, notFound, unprocessable } from "../errors.js";
 import { authorizeInstructionCommit, authorizeInstructionRead } from "./agent-instruction-authorization.js";
-import { assertInstructionPathSafe, instructionPath, instructionBytes, materializeInstructionBytes, readInstructionBytes, MAX_INSTRUCTION_BYTES } from "./agent-instruction-files.js";
+import { assertInstructionPathSafe, instructionPath, instructionPathKey, matchesInstructionEntry, instructionBytes, materializeInstructionBytes, readInstructionBytes, MAX_INSTRUCTION_BYTES } from "./agent-instruction-files.js";
 import { agentInstructionsBundleMode, deriveBundleState, resolveManagedInstructionsRoot, resolveRecoveredManagedBundle, type RecoveredManagedBundle } from "./agent-instructions.js";
 import type { AuthorizationActor } from "./authorization.js";
 
@@ -278,9 +278,12 @@ export function agentFileStore(db: Db) {
         const entryFiles = new Set([deriveBundleState(agent).entryFile]);
         if (recovered) entryFiles.add(recovered.entryFile);
         const relative = agentFilePath(input.path);
+        // On a case-insensitive volume "agents.md" opens, replaces and unlinks
+        // "AGENTS.md", so the entry is matched by folded key and file identity.
+        const isEntry = await matchesInstructionEntry(root, relative, entryFiles);
         // Entry content changes only through the canonical instruction revision
         // service. Refuse before any check that could adopt or write files.
-        if (input.bytes !== null && entryFiles.has(relative)) {
+        if (input.bytes !== null && isEntry) {
           throw unprocessable("Entry edits require the canonical instruction commit service and baseRevisionId", { code: "INSTRUCTION_REVISION_REQUIRED" });
         }
         if (input.bytes) assertFileSize(input.bytes.length, relative);
@@ -296,7 +299,7 @@ export function agentFileStore(db: Db) {
           return { contentHash: currentHash, changed: false };
         }
         if (currentHash !== input.baseHash) throw conflict("This file changed since it was read. Reload before saving.", { code: "AGENT_FILE_CONFLICT", path: relative, currentHash });
-        if (input.bytes === null && entryFiles.has(relative)) throw unprocessable("The configured instruction entry cannot be deleted");
+        if (input.bytes === null && isEntry) throw unprocessable("The configured instruction entry cannot be deleted");
         if (input.bytes !== null) {
           // A quota check needs metadata only. Do not hash unrelated large
           // files while holding the editor's row lock for a one-file save.
@@ -350,6 +353,21 @@ export function agentFileStore(db: Db) {
         // over quota. Enforce limits on the incoming and resulting tree so a
         // run can delete files to recover instead of being locked out forever.
         const current = input.checkpoint ? checkpointSnapshot(await cachedAgentFileManifest(root)) : await snapshotAgentFiles(root, false);
+        // A changed path that names the entry under another spelling (letter case
+        // or Unicode form), or that replaces or removes a folder above the entry
+        // under another spelling, would land on the entry on a case-insensitive
+        // volume, past the stale-entry check below. Reject the whole write-back.
+        const entryKey = instructionPathKey(entryPath);
+        for (const name of new Set([...input.baseline.entries, ...incoming.entries].map(([entryName]) => entryName))) {
+          if (name === entryPath || JSON.stringify(input.baseline.entries.get(name)) === JSON.stringify(incoming.entries.get(name))) continue;
+          const key = instructionPathKey(name);
+          const replacesEntryFolder = entryKey.startsWith(`${key}/`) && !entryPath.startsWith(`${name}/`)
+            && incoming.entries.get(name)?.kind !== "dir";
+          if (key === entryKey || replacesEntryFolder) {
+            throw conflict("A changed path names the instruction entry under another spelling. The write-back was rejected and no files were saved.",
+              { code: AGENT_FILES_ENTRY_CONFLICT, path: entryPath });
+          }
+        }
         // Managed instruction saves take this same agent row lock, so canonical
         // content cannot change between this check and the merge below. A stale
         // entry rejects the whole write-back before any file is touched: no
