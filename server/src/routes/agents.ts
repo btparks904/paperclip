@@ -2900,13 +2900,16 @@ export function agentRoutes(
   function repairInstructionsConfig(req: Request): AgentFileConfigRepair {
     const actor = getActorInfo(req);
     return async (tx, agent, adapterConfig) => {
-      const normalized = await secretsSvc.normalizeAdapterConfigForPersistence(
+      // The store transaction is a full Db for the services' queries. Normalize
+      // on it too, so a managed secret created for a raw value commits or rolls
+      // back with the repaired configuration instead of committing on its own.
+      const txDb = tx as unknown as Db;
+      const normalized = await secretService(txDb).normalizeAdapterConfigForPersistence(
         agent.companyId,
         adapterConfig,
         { strictMode: strictSecretsMode, adapterType: agent.adapterType },
       );
-      // The store transaction is a full Db for the agent service's queries.
-      await agentService(tx as unknown as Db).update(
+      await agentService(txDb).update(
         agent.id,
         { adapterConfig: normalized },
         {

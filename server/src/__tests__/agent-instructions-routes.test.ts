@@ -61,6 +61,9 @@ const mockSecretService = vi.hoisted(() => ({
   resolveAdapterConfigForRuntime: vi.fn(),
   normalizeAdapterConfigForPersistence: vi.fn(async (_companyId: string, config: Record<string, unknown>) => config),
 }));
+// Records the connection each secret service is built on, so a test can prove
+// which database handle (global or transaction) a code path normalizes with.
+const mockSecretServiceFactory = vi.hoisted(() => vi.fn((_db?: unknown) => mockSecretService));
 const mockEnvironmentService = vi.hoisted(() => ({
   getById: vi.fn(),
 }));
@@ -82,13 +85,13 @@ vi.mock("../services/index.js", () => ({
   issueApprovalService: () => ({}),
   issueService: () => ({}),
   logActivity: mockLogActivity,
-  secretService: () => mockSecretService,
+  secretService: mockSecretServiceFactory,
   syncInstructionsBundleConfigFromFilePath: mockSyncInstructionsBundleConfigFromFilePath,
   workspaceOperationService: () => ({}),
 }));
 
 vi.mock("../services/secrets.js", () => ({
-  secretService: () => mockSecretService,
+  secretService: mockSecretServiceFactory,
 }));
 
 vi.mock("../services/environments.js", () => ({
@@ -114,13 +117,13 @@ function registerModuleMocks() {
     issueApprovalService: () => ({}),
     issueService: () => ({}),
     logActivity: mockLogActivity,
-    secretService: () => mockSecretService,
+    secretService: mockSecretServiceFactory,
     syncInstructionsBundleConfigFromFilePath: mockSyncInstructionsBundleConfigFromFilePath,
     workspaceOperationService: () => ({}),
   }));
 
   vi.doMock("../services/secrets.js", () => ({
-    secretService: () => mockSecretService,
+    secretService: mockSecretServiceFactory,
   }));
 
   vi.doMock("../services/environments.js", () => ({
@@ -1103,10 +1106,17 @@ describe("agent instructions bundle routes", () => {
         const repair = mockAgentFileWrite.mock.calls[0]![2].repairConfig as (tx: unknown, agent: unknown, config: Record<string, unknown>) => Promise<void>;
         mockAgentService.update.mockClear();
         mockSecretService.normalizeAdapterConfigForPersistence.mockClear();
+        mockSecretServiceFactory.mockClear();
         const repaired = { instructionsBundleMode: "managed", instructionsRootPath: managedRoot };
-        await repair({}, { ...b3Agent(), adapterType: "codex_local" }, repaired);
+        const tx = { storeTransaction: true };
+        await repair(tx, { ...b3Agent(), adapterType: "codex_local" }, repaired);
+        // R1: normalization runs on a secret service built on the store's own
+        // transaction object, not on the router's global connection.
+        expect(mockSecretServiceFactory).toHaveBeenCalledTimes(1);
+        expect(mockSecretServiceFactory.mock.calls[0]![0]).toBe(tx);
+        expect(mockSecretService.normalizeAdapterConfigForPersistence).toHaveBeenCalledTimes(1);
         expect(mockSecretService.normalizeAdapterConfigForPersistence).toHaveBeenCalledWith("company-1", repaired,
-          expect.objectContaining({ adapterType: "codex_local" }));
+          { strictMode: false, adapterType: "codex_local" });
         expect(mockAgentService.update).toHaveBeenCalledWith(agentId, { adapterConfig: repaired },
           { recordRevision: expect.objectContaining({ source: "instructions_bundle_file_put", createdByUserId: "local-board" }) });
         expect(mockLogActivity).not.toHaveBeenCalled();

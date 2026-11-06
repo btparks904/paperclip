@@ -6,7 +6,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { eq } from "drizzle-orm";
 import {
   activityLog, agentConfigRevisions, agentInstructionHeads, agentInstructionRevisions, agents, authUsers, companies, companyMemberships,
-  companySecretBindings, companySecrets, createDb, instanceUserRoles, principalPermissionGrants, type Db,
+  companySecretBindings, companySecretVersions, companySecrets, createDb, instanceUserRoles, principalPermissionGrants, type Db,
 } from "@paperclipai/db";
 import { agentFileStore, fileHash, snapshotAgentFiles, type AgentFileConfigRepair, type AgentFileWriteOptions } from "../services/agent-file-store.js";
 import { agentInstructionRevisionService } from "../services/agent-instruction-revisions.js";
@@ -197,13 +197,18 @@ describe("instruction writes across bundle mode transitions", () => {
     const b2Config = () => ({ instructionsRootPath: staleRoot, instructionsEntryFile: entryFile });
     const repairedConfig = () => ({ instructionsBundleMode: "managed", instructionsRootPath: managedRoot, instructionsEntryFile: entryFile,
       instructionsFilePath: path.join(managedRoot, entryFile) });
-    /** Mirrors the route's repair callback: secret normalization, then the full agent-service update. */
-    const repairConfig: AgentFileConfigRepair = async (tx, agent, adapterConfig) => {
-      const normalized = await secretService(db).normalizeAdapterConfigForPersistence(agent.companyId, adapterConfig,
-        { strictMode: false, adapterType: agent.adapterType });
-      await agentService(tx as unknown as Db).update(agent.id, { adapterConfig: normalized },
+    /**
+     * Mirrors the route's repair callback: secret normalization on the store
+     * transaction, then the full agent-service update on the same transaction.
+     */
+    const makeRepair = (strictMode = false): AgentFileConfigRepair => async (tx, agent, adapterConfig) => {
+      const txDb = tx as unknown as Db;
+      const normalized = await secretService(txDb).normalizeAdapterConfigForPersistence(agent.companyId, adapterConfig,
+        { strictMode, adapterType: agent.adapterType });
+      await agentService(txDb).update(agent.id, { adapterConfig: normalized },
         { recordRevision: { createdByAgentId: null, createdByUserId: userId, source: "instructions_bundle_file_put" } });
     };
+    const repairConfig = makeRepair();
     const recoveredOptions = (): AgentFileWriteOptions => ({ allowRecoveredManaged: true, repairConfig });
     const recoveredWrite = (content: string | null, baseHash: string | null, options: AgentFileWriteOptions = recoveredOptions(),
       actor: AuthorizationActor = board(), filePath = NOTE) => agentFileStore(db).write({
@@ -639,13 +644,153 @@ describe("instruction writes across bundle mode transitions", () => {
         it("an existing valid binding is kept unchanged by a successful repair", async () => {
           await setClaude();
           await setConfig({ ...b3Config(), env: { CLAUDE_CODE_OAUTH_TOKEN: binding } });
+          const secretCount = (await db.select().from(companySecrets).where(eq(companySecrets.companyId, companyId))).length;
           await expect(recoveredWrite(INCOMING, hashOf(MANAGED_NOTE))).resolves.toMatchObject({ changed: true });
           const stored = (await loadAgent()).adapterConfig as Record<string, unknown>;
           expect(stored).toMatchObject({ instructionsRootPath: managedRoot, env: { CLAUDE_CODE_OAUTH_TOKEN: binding } });
           expect(Object.keys(stored.env as Record<string, unknown>)).toEqual(["CLAUDE_CODE_OAUTH_TOKEN"]);
+          // R1e: the short binding is stored in its canonical form (the defaults the
+          // normalizer already filled in before R1), and the repair creates no company secret.
+          expect((stored.env as Record<string, unknown>).CLAUDE_CODE_OAUTH_TOKEN)
+            .toEqual({ ...binding, version: "latest", required: true, allowMissingOverride: false });
+          expect(await db.select().from(companySecrets).where(eq(companySecrets.companyId, companyId))).toHaveLength(secretCount);
           expect(await fs.readFile(path.join(managedRoot, NOTE), "utf8")).toBe(INCOMING);
           expect(await revisions()).toHaveLength(1);
         });
+      });
+    });
+
+    describe("R1: repair secret normalization commits with the store transaction", () => {
+      // A synthetic stand-in for a raw adapter schema-secret value. It is never printed;
+      // assertions only check that stored records do not contain it.
+      const RAW_API_KEY = "SENTINEL-SYNTHETIC-RAW-API-KEY-5e21";
+      const setStatus = (status: string) => db.update(agents).set({ status }).where(eq(agents.id, agentId));
+      const setHermes = () => db.update(agents).set({ adapterType: "hermes_gateway" }).where(eq(agents.id, agentId));
+      const rawSecretConfig = () => ({ ...b3Config(), apiKey: RAW_API_KEY });
+      const secretRows = () => db.select().from(companySecrets).where(eq(companySecrets.companyId, companyId));
+      const versionRows = async () => {
+        const ids = new Set((await secretRows()).map((row) => row.id));
+        return (await db.select().from(companySecretVersions)).filter((row) => ids.has(row.secretId));
+      };
+      const allVersionCount = async () => (await db.select().from(companySecretVersions)).length;
+      const secretState = async () => ({ secrets: (await secretRows()).length, versions: (await versionRows()).length, allVersions: await allVersionCount() });
+      const noRawValue = (value: unknown) => expect(JSON.stringify(value).includes(RAW_API_KEY)).toBe(false);
+      function countingRepair(repair: AgentFileConfigRepair = repairConfig) {
+        let calls = 0;
+        const callback: AgentFileConfigRepair = async (tx, agent, adapterConfig) => { calls += 1; await repair(tx, agent, adapterConfig); };
+        return { callback, calls: () => calls };
+      }
+
+      it("R1a: a pending-approval rejection after normalizing a raw schema secret leaves no secret and no change, every attempt", async () => {
+        await fs.rm(path.dirname(markerPath()), { recursive: true, force: true });
+        await setHermes();
+        await setConfig(rawSecretConfig());
+        await setStatus("pending_approval");
+        const before = await unchangedSnapshot();
+        const secretsBefore = await secretState();
+        const { callback, calls } = countingRepair();
+        for (let attempt = 1; attempt <= 3; attempt += 1) {
+          await expect(recoveredWrite(INCOMING, hashOf(MANAGED_NOTE), { allowRecoveredManaged: true, repairConfig: callback }))
+            .rejects.toMatchObject({ status: 409, details: { code: "pending_approval_agent_config_frozen" } });
+          expect(calls()).toBe(attempt);
+          expect(await secretState()).toEqual(secretsBefore);
+        }
+        expect(await unchangedSnapshot()).toEqual(before);
+        expect((await loadAgent()).adapterConfig).toEqual(rawSecretConfig());
+        expect(await fs.readFile(path.join(managedRoot, NOTE), "utf8")).toBe(MANAGED_NOTE);
+      });
+
+      it("R1b: a file-write failure after a normalizing repair rolls back the new secret with the configuration", async () => {
+        await setHermes();
+        await setConfig(rawSecretConfig());
+        const secretsBefore = await secretState();
+        const revisionsBefore = (await revisions()).length;
+        const activityBefore = (await activity()).length;
+        const { callback, calls } = countingRepair();
+        const notesDir = path.join(managedRoot, "notes");
+        // The suite runs as a non-root user, so a read-only directory makes the temporary file create fail.
+        await fs.chmod(notesDir, 0o555);
+        try {
+          await expect(recoveredWrite(INCOMING, hashOf(MANAGED_NOTE), { allowRecoveredManaged: true, repairConfig: callback }))
+            .rejects.toMatchObject({ code: "EACCES" });
+        } finally {
+          await fs.chmod(notesDir, 0o755);
+        }
+        // The repair ran (normalization executed) before the write failed.
+        expect(calls()).toBe(1);
+        expect(await secretState()).toEqual(secretsBefore);
+        expect((await loadAgent()).adapterConfig).toEqual(rawSecretConfig());
+        expect(await revisions()).toHaveLength(revisionsBefore);
+        expect(await activity()).toHaveLength(activityBefore);
+        expect(await fs.readFile(path.join(managedRoot, NOTE), "utf8")).toBe(MANAGED_NOTE);
+        expect(await fs.readFile(path.join(staleRoot, NOTE), "utf8")).toBe(STALE_NOTE);
+      });
+
+      it("R1c: a successful save creates exactly one managed secret, referenced by the committed configuration", async () => {
+        await setHermes();
+        await setConfig(rawSecretConfig());
+        const secretsBefore = await secretState();
+        const staleBefore = await tree(staleRoot);
+        // A stale base is still refused before any repair or secret.
+        await expect(recoveredWrite(INCOMING, hashOf(OTHER))).rejects.toMatchObject({ status: 409, details: { code: "AGENT_FILE_CONFLICT" } });
+        expect(await secretState()).toEqual(secretsBefore);
+
+        await expect(recoveredWrite(INCOMING, hashOf(MANAGED_NOTE))).resolves.toEqual({ contentHash: hashOf(INCOMING), changed: true });
+        const created = await secretRows();
+        expect(created).toHaveLength(secretsBefore.secrets + 1);
+        const secret = created[created.length - 1]!;
+        expect(secret).toMatchObject({ companyId, status: "active" });
+        expect(await versionRows()).toHaveLength(secretsBefore.versions + 1);
+        const stored = (await loadAgent()).adapterConfig as Record<string, unknown>;
+        const { apiKey, ...rest } = stored;
+        expect(apiKey).toEqual({ type: "secret_ref", secretId: secret.id, version: "latest", projectionClass: "unclassified", projectionAllowlistKey: null });
+        expect(rest).toEqual(repairedConfig());
+        noRawValue(stored);
+        noRawValue(secret);
+        const revisionRows = await revisions();
+        expect(revisionRows).toHaveLength(1);
+        expect(revisionRows[0]).toMatchObject({ source: "instructions_bundle_file_put", createdByUserId: userId });
+        noRawValue(revisionRows[0]!.afterConfig);
+        // The agent service records the new binding, in the same transaction; the store audits the file update.
+        const rows = await activity();
+        expect(rows.map((row) => row.action).sort()).toEqual(["agent.files_updated", "secret.binding.created"]);
+        expect(rows.find((row) => row.action === "agent.files_updated")).toMatchObject({ details: { path: NOTE, contentHash: hashOf(INCOMING) } });
+        expect(rows.find((row) => row.action === "secret.binding.created")).toMatchObject({ details: { configPath: "apiKey", bindingType: "secret_ref" } });
+        noRawValue(rows);
+        expect((await bindings()).filter((row) => row.secretId === secret.id)).toHaveLength(1);
+        expect(await fs.readFile(path.join(managedRoot, NOTE), "utf8")).toBe(INCOMING);
+        expect(await tree(staleRoot)).toEqual(staleBefore);
+      });
+
+      it("R1e: a canonical Claude OAuth user_secret_ref is unchanged after a successful normalizing repair", async () => {
+        const canonical = { type: "user_secret_ref", key: "CLAUDE_CODE_OAUTH_TOKEN", version: "latest", required: true, allowMissingOverride: false };
+        await db.update(agents).set({ adapterType: "claude_local" }).where(eq(agents.id, agentId));
+        await setConfig({ ...b3Config(), env: { CLAUDE_CODE_OAUTH_TOKEN: canonical } });
+        const secretsBefore = await secretState();
+        const bindingsBefore = await bindings();
+        await expect(recoveredWrite(INCOMING, hashOf(MANAGED_NOTE))).resolves.toMatchObject({ changed: true });
+        const stored = (await loadAgent()).adapterConfig as Record<string, unknown>;
+        expect((stored.env as Record<string, unknown>).CLAUDE_CODE_OAUTH_TOKEN).toStrictEqual(canonical);
+        expect(stored).toEqual({ ...repairedConfig(), env: { CLAUDE_CODE_OAUTH_TOKEN: canonical } });
+        expect(await secretState()).toEqual(secretsBefore);
+        expect(await bindings()).toEqual(bindingsBefore);
+      });
+
+      it("R1d: strict mode rejects a sensitive plain env value before any secret or file change; non-strict keeps it", async () => {
+        const sensitiveEnv = { SERVICE_API_KEY: { type: "plain", value: "SENTINEL-SYNTHETIC-PLAIN-KEY" } };
+        await setConfig({ ...b3Config(), env: sensitiveEnv });
+        const before = await unchangedSnapshot();
+        const secretsBefore = await secretState();
+        await expect(recoveredWrite(INCOMING, hashOf(MANAGED_NOTE), { allowRecoveredManaged: true, repairConfig: makeRepair(true) }))
+          .rejects.toMatchObject({ status: 422 });
+        expect(await secretState()).toEqual(secretsBefore);
+        expect(await unchangedSnapshot()).toEqual(before);
+        expect(await fs.readFile(path.join(managedRoot, NOTE), "utf8")).toBe(MANAGED_NOTE);
+
+        await expect(recoveredWrite(INCOMING, hashOf(MANAGED_NOTE), { allowRecoveredManaged: true, repairConfig: makeRepair(false) }))
+          .resolves.toMatchObject({ changed: true });
+        expect(await secretState()).toEqual(secretsBefore);
+        expect((await loadAgent()).adapterConfig).toEqual({ ...repairedConfig(), env: sensitiveEnv });
       });
     });
 
