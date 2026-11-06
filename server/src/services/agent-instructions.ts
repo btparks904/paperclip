@@ -4,7 +4,7 @@ import path from "node:path";
 import { and, eq } from "drizzle-orm";
 import { agentInstructionHeads, agents, type Db } from "@paperclipai/db";
 import { instructionPath, assertInstructionPathSafe, instructionBytes, readInstructionBytes } from "./agent-instruction-files.js";
-import { notFound, unprocessable } from "../errors.js";
+import { conflict, notFound, unprocessable } from "../errors.js";
 import { resolveHomeAwarePath, resolvePaperclipInstanceRoot } from "../home-paths.js";
 
 const ENTRY_FILE_DEFAULT = "AGENTS.md";
@@ -30,6 +30,8 @@ const IGNORED_INSTRUCTIONS_DIRECTORY_NAMES = new Set([
 ]);
 
 type BundleMode = "managed" | "external";
+/** The bundle mode a write path was selected for; see assertExpectedBundleMode. */
+export type InstructionBundleWriteMode = BundleMode;
 
 type AgentLike = {
   id: string;
@@ -700,14 +702,35 @@ export function agentInstructionsService(db?: Db) {
     return { bundle, adapterConfig };
   }
 
+  // The bundle mode a caller chose its write path for. "external" means the
+  // unversioned path for any bundle that is not managed, matching the route's
+  // branch predicate. A mismatch under the lock means the mode changed after
+  // the caller read the agent, so nothing may be written or deleted.
+  function assertExpectedBundleMode(current: AgentLike, expectedMode: InstructionBundleWriteMode | undefined) {
+    if (!expectedMode) return;
+    const currentlyManaged = agentInstructionsBundleMode(current) === "managed";
+    if (currentlyManaged !== (expectedMode === "managed")) {
+      throw conflict("The instructions bundle mode changed; reload and retry");
+    }
+  }
+
   // Reload configuration under the commit lock: a previously supporting file
   // may have become the configured entry since the route loaded its agent.
-  async function withCurrentAgent<T>(agent: AgentLike, relativePath: string, operation: (current: AgentLike) => Promise<T>) {
-    if (!db) return operation(agent);
+  async function withCurrentAgent<T>(
+    agent: AgentLike,
+    relativePath: string,
+    operation: (current: AgentLike) => Promise<T>,
+    expectedMode?: InstructionBundleWriteMode,
+  ) {
+    if (!db) {
+      assertExpectedBundleMode(agent, expectedMode);
+      return operation(agent);
+    }
     return db.transaction(async (tx) => {
       const [current] = await tx.select().from(agents)
         .where(and(eq(agents.id, agent.id), eq(agents.companyId, agent.companyId))).for("update");
       if (!current) throw notFound("Agent not found");
+      assertExpectedBundleMode(current, expectedMode);
       if (relativePath !== LEGACY_PROMPT_TEMPLATE_PATH) {
         // Historical entries also remain projections if the configured entry changes.
         await assertUnversionedEntry(current, normalizeRelativeFilePath(relativePath), tx);
@@ -715,11 +738,18 @@ export function agentInstructionsService(db?: Db) {
       return operation(current);
     });
   }
-  async function writeFile(...args: Parameters<typeof writeFileUnversioned>) {
-    return withCurrentAgent(args[0], args[1], (current) => writeFileUnversioned(current, args[1], args[2], args[3]));
+  async function writeFile(
+    agent: AgentLike,
+    relativePath: string,
+    content: string,
+    options?: { clearLegacyPromptTemplate?: boolean; expectedMode?: InstructionBundleWriteMode },
+  ) {
+    const writeOptions = options ? { clearLegacyPromptTemplate: options.clearLegacyPromptTemplate } : undefined;
+    return withCurrentAgent(agent, relativePath,
+      (current) => writeFileUnversioned(current, relativePath, content, writeOptions), options?.expectedMode);
   }
-  async function deleteFile(...args: Parameters<typeof deleteFileUnversioned>) {
-    return withCurrentAgent(args[0], args[1], (current) => deleteFileUnversioned(current, args[1]));
+  async function deleteFile(agent: AgentLike, relativePath: string, options?: { expectedMode?: InstructionBundleWriteMode }) {
+    return withCurrentAgent(agent, relativePath, (current) => deleteFileUnversioned(current, relativePath), options?.expectedMode);
   }
 
   async function exportFiles(agent: AgentLike, options?: { rejectSymlinks?: boolean }): Promise<{

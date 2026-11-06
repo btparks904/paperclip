@@ -5223,7 +5223,11 @@ export function agentRoutes(
     await assertCanManageInstructionsPath(req, existing);
     assertExternalInstructionsAdmin(req, existing);
 
-    if (agentInstructionsBundleMode(existing) === "managed" && req.body.path !== "promptTemplate.legacy.md") {
+    // A request that supplies baseHash (including null for a new file) always
+    // takes the managed compare-and-swap path. Its row lock rejects a bundle that
+    // became external, so the base is never silently ignored by the external path.
+    const managedWrite = agentInstructionsBundleMode(existing) === "managed" || req.body.baseHash !== undefined;
+    if (managedWrite && req.body.path !== "promptTemplate.legacy.md") {
       if (req.body.baseHash === undefined) throw unprocessable("Read the file and supply baseHash (null for a new file)");
       await agentFiles.write({ companyId: existing.companyId, agentId: existing.id, path: req.body.path,
         bytes: Buffer.from(req.body.content, "utf8"), baseHash: req.body.baseHash }, req.actor);
@@ -5232,6 +5236,9 @@ export function agentRoutes(
     const actor = getActorInfo(req);
     const result = await instructions.writeFile(existing, req.body.path, req.body.content, {
       clearLegacyPromptTemplate: req.body.clearLegacyPromptTemplate,
+      // Refuse under the lock if the bundle became managed after the read above.
+      // The legacy pseudo-file lives in adapter config, not in either root.
+      expectedMode: req.body.path === "promptTemplate.legacy.md" ? undefined : "external",
     });
     const normalizedAdapterConfig = await secretsSvc.normalizeAdapterConfigForPersistence(
       existing.companyId,
@@ -5350,7 +5357,9 @@ export function agentRoutes(
       res.json(await instructions.getBundle(existing)); return;
     }
     const actor = getActorInfo(req);
-    const result = await instructions.deleteFile(existing, relativePath);
+    const result = await instructions.deleteFile(existing, relativePath, {
+      expectedMode: relativePath === "promptTemplate.legacy.md" ? undefined : "external",
+    });
     await logActivity(db, {
       companyId: existing.companyId,
       actorType: actor.actorType,

@@ -29,9 +29,17 @@ const mockInstructionWorkingCopies = vi.hoisted(() => ({ list: vi.fn(), resolve:
 vi.mock("../services/agent-instruction-working-copies.js", () => ({ agentInstructionWorkingCopyService: () => mockInstructionWorkingCopies }));
 
 const mockDownloadAgentFile = vi.hoisted(() => vi.fn());
+// Records managed writes. It calls the real store unless a test installs an implementation.
+const mockAgentFileWrite = vi.hoisted(() => vi.fn());
 vi.mock("../services/agent-file-store.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../services/agent-file-store.js")>();
-  return { ...actual, agentFileStore: (...args: Parameters<typeof actual.agentFileStore>) => ({ ...actual.agentFileStore(...args), download: mockDownloadAgentFile }) };
+  return { ...actual, agentFileStore: (...args: Parameters<typeof actual.agentFileStore>) => {
+    const store = actual.agentFileStore(...args);
+    const write: typeof store.write = (...input) => mockAgentFileWrite.getMockImplementation()
+      ? mockAgentFileWrite(...input)
+      : store.write(...input);
+    return { ...store, download: mockDownloadAgentFile, write };
+  } };
 });
 
 const mockInstructionRevisions = vi.hoisted(() => ({ readCurrent: vi.fn(), commit: vi.fn(), restore: vi.fn(), history: vi.fn(), readRevision: vi.fn(), diff: vi.fn(), materializeCurrent: vi.fn() }));
@@ -836,5 +844,134 @@ describe("agent instructions bundle routes", () => {
     expect(res.body.adapterConfig.instructionsRootPath).toBeUndefined();
     expect(res.body.adapterConfig.instructionsEntryFile).toBeUndefined();
     expect(res.body.adapterConfig.instructionsFilePath).toBeUndefined();
+  });
+
+  describe("instruction file writes across bundle mode transitions", () => {
+    const agentId = "11111111-1111-4111-8111-111111111111";
+    const filePath = `/api/agents/${agentId}/instructions-bundle/file`;
+    const baseHash = "a".repeat(64);
+    const externalAgent = () => ({ ...makeAgent(), adapterConfig: {
+      instructionsBundleMode: "external", instructionsRootPath: "/srv/paperclip/external-agent", instructionsEntryFile: "AGENTS.md",
+    } });
+    const managedAgent = () => ({ ...makeAgent(), adapterConfig: { instructionsBundleMode: "managed", instructionsEntryFile: "AGENTS.md" } });
+    const externalModeRejection = () => Object.assign(new Error("External instructions must be migrated to managed storage first"), { status: 422 });
+
+    beforeEach(() => {
+      mockAgentFileWrite.mockReset();
+      mockAgentInstructionsService.deleteFile.mockResolvedValue({ bundle: { files: [] }, adapterConfig: externalAgent().adapterConfig });
+    });
+
+    it("routes a non-entry save with baseHash through the managed path after the bundle became external", async () => {
+      mockAgentService.getById.mockResolvedValue(externalAgent());
+      const { HttpError } = await vi.importActual<typeof import("../errors.js")>("../errors.js");
+      mockAgentFileWrite.mockRejectedValue(new HttpError(422, externalModeRejection().message));
+      const res = await requestApp(await createApp(), url => request(url).put(filePath)
+        .send({ path: "notes/plan.md", content: "draft\n", baseHash }));
+      expect(res.status, JSON.stringify(res.body)).toBe(422);
+      expect(res.body.error).toContain("External instructions must be migrated");
+      expect(mockAgentFileWrite).toHaveBeenCalledOnce();
+      expect(mockAgentFileWrite).toHaveBeenCalledWith(expect.objectContaining({ agentId, path: "notes/plan.md", baseHash }), expect.objectContaining({ type: "board" }));
+      expect(mockAgentInstructionsService.writeFile).not.toHaveBeenCalled();
+      expect(mockAgentService.update).not.toHaveBeenCalled();
+      expect(mockLogActivity).not.toHaveBeenCalled();
+    });
+
+    it("treats an explicit null baseHash as base-bearing and an omitted one as not", async () => {
+      mockAgentService.getById.mockResolvedValue(externalAgent());
+      const { HttpError } = await vi.importActual<typeof import("../errors.js")>("../errors.js");
+      mockAgentFileWrite.mockRejectedValue(new HttpError(422, externalModeRejection().message));
+      const withNull = await requestApp(await createApp(), url => request(url).put(filePath)
+        .send({ path: "notes/new.md", content: "new\n", baseHash: null }));
+      expect(withNull.status, JSON.stringify(withNull.body)).toBe(422);
+      expect(mockAgentFileWrite).toHaveBeenCalledWith(expect.objectContaining({ path: "notes/new.md", baseHash: null }), expect.anything());
+      expect(mockAgentInstructionsService.writeFile).not.toHaveBeenCalled();
+
+      mockAgentFileWrite.mockClear();
+      const omitted = await requestApp(await createApp(), url => request(url).put(filePath)
+        .send({ path: "notes/new.md", content: "new\n" }));
+      expect(omitted.status, JSON.stringify(omitted.body)).toBe(200);
+      expect(mockAgentFileWrite).not.toHaveBeenCalled();
+      expect(mockAgentInstructionsService.writeFile).toHaveBeenCalledWith(expect.objectContaining({ id: agentId }), "notes/new.md", "new\n",
+        { clearLegacyPromptTemplate: false, expectedMode: "external" });
+    });
+
+    it("keeps external saves without baseHash on the external path, guarded by the expected mode", async () => {
+      mockAgentService.getById.mockResolvedValue(externalAgent());
+      const res = await requestApp(await createApp(), url => request(url).put(filePath)
+        .send({ path: "notes/plan.md", content: "external\n" }));
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(mockAgentInstructionsService.writeFile).toHaveBeenCalledOnce();
+      expect(mockAgentInstructionsService.writeFile.mock.calls[0]![3]).toEqual({ clearLegacyPromptTemplate: false, expectedMode: "external" });
+      expect(mockAgentFileWrite).not.toHaveBeenCalled();
+      expect(mockLogActivity).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ action: "agent.instructions_file_updated" }));
+    });
+
+    it("returns the conflict and records nothing when the bundle became managed under the lock", async () => {
+      mockAgentService.getById.mockResolvedValue(externalAgent());
+      const { conflict } = await vi.importActual<typeof import("../errors.js")>("../errors.js");
+      mockAgentInstructionsService.writeFile.mockRejectedValueOnce(conflict("The instructions bundle mode changed; reload and retry"));
+      mockAgentInstructionsService.deleteFile.mockRejectedValueOnce(conflict("The instructions bundle mode changed; reload and retry"));
+      const put = await requestApp(await createApp(), url => request(url).put(filePath).send({ path: "notes/plan.md", content: "x\n" }));
+      expect(put.status, JSON.stringify(put.body)).toBe(409);
+      const del = await requestApp(await createApp(), url => request(url).delete(filePath).query({ path: "notes/plan.md" }));
+      expect(del.status, JSON.stringify(del.body)).toBe(409);
+      expect(mockAgentService.update).not.toHaveBeenCalled();
+      expect(mockLogActivity).not.toHaveBeenCalled();
+    });
+
+    it("passes the external expected mode to external deletes", async () => {
+      mockAgentService.getById.mockResolvedValue(externalAgent());
+      const res = await requestApp(await createApp(), url => request(url).delete(filePath).query({ path: "notes/plan.md" }));
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(mockAgentInstructionsService.deleteFile).toHaveBeenCalledWith(expect.objectContaining({ id: agentId }), "notes/plan.md", { expectedMode: "external" });
+      expect(mockLogActivity).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ action: "agent.instructions_file_deleted" }));
+    });
+
+    it("leaves the legacy pseudo-file on its existing path without an expected mode", async () => {
+      mockAgentService.getById.mockResolvedValue(managedAgent());
+      const res = await requestApp(await createApp(), url => request(url).put(filePath)
+        .send({ path: "promptTemplate.legacy.md", content: "legacy\n", baseHash }));
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(mockAgentFileWrite).not.toHaveBeenCalled();
+      expect(mockAgentInstructionsService.writeFile).toHaveBeenCalledWith(expect.objectContaining({ id: agentId }), "promptTemplate.legacy.md", "legacy\n",
+        { clearLegacyPromptTemplate: false, expectedMode: undefined });
+    });
+
+    it("still requires baseHash for managed non-entry saves", async () => {
+      mockAgentService.getById.mockResolvedValue(managedAgent());
+      const res = await requestApp(await createApp(), url => request(url).put(filePath).send({ path: "notes/plan.md", content: "x\n" }));
+      expect(res.status, JSON.stringify(res.body)).toBe(422);
+      expect(mockAgentFileWrite).not.toHaveBeenCalled();
+      expect(mockAgentInstructionsService.writeFile).not.toHaveBeenCalled();
+    });
+
+    it("keeps entry-file saves on the canonical commit even with baseHash", async () => {
+      mockAgentService.getById.mockResolvedValue(externalAgent());
+      const { HttpError } = await vi.importActual<typeof import("../errors.js")>("../errors.js");
+      mockInstructionRevisions.commit.mockRejectedValueOnce(new HttpError(422, "External host instructions do not support revision write-back."));
+      const res = await requestApp(await createApp(), url => request(url).put(filePath).send({ path: "AGENTS.md", content: "x\n", baseHash }));
+      expect(res.status, JSON.stringify(res.body)).toBe(422);
+      expect(mockInstructionRevisions.commit).toHaveBeenCalledOnce();
+      expect(mockAgentFileWrite).not.toHaveBeenCalled();
+      expect(mockAgentInstructionsService.writeFile).not.toHaveBeenCalled();
+    });
+
+    it("still requires instance admin before any external write path, including base-bearing saves", async () => {
+      mockAgentService.getById.mockResolvedValue(externalAgent());
+      const app = await createApp({ type: "board", userId: "company-admin", companyIds: ["company-1"],
+        memberships: [{ companyId: "company-1", status: "active", membershipRole: "admin" }], source: "session", isInstanceAdmin: false });
+      for (const perform of [
+        () => request(app).put(filePath).send({ path: "notes/plan.md", content: "x\n", baseHash }),
+        () => request(app).put(filePath).send({ path: "notes/plan.md", content: "x\n", baseHash: null }),
+        () => request(app).put(filePath).send({ path: "notes/plan.md", content: "x\n" }),
+        () => request(app).delete(filePath).query({ path: "notes/plan.md" }),
+      ]) {
+        const res = await perform();
+        expect(res.status, JSON.stringify(res.body)).toBe(403);
+      }
+      expect(mockAgentFileWrite).not.toHaveBeenCalled();
+      expect(mockAgentInstructionsService.writeFile).not.toHaveBeenCalled();
+      expect(mockAgentInstructionsService.deleteFile).not.toHaveBeenCalled();
+    });
   });
 });
