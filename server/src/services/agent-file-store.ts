@@ -102,9 +102,12 @@ export function agentFileTokenFromHash(h: string): string {
   return `${h.slice(0, 8)}-${h.slice(8, 12)}-8${h.slice(13, 16)}-a${h.slice(17, 20)}-${h.slice(20, 32)}`;
 }
 
-/** Call under the agent row lock. Import deployed revision heads once, then the
- * directory is authoritative. The adoption marker lives OUTSIDE agent files. */
-export async function adoptAgentFiles(tx: Tx, agent: Agent, options?: { recoveredManaged?: boolean }): Promise<string> {
+type AdoptionPlan = { root: string; markerRoot: string; marker: string; pending: Array<{ entryFile: string; bytes: Buffer }> | null };
+
+/** Call under the agent row lock. Reads what first adoption would write
+ * without writing it (beyond creating the managed directory), so a caller can
+ * validate an operation before any file bytes change. */
+async function planAgentFileAdoption(tx: Tx, agent: Agent, options?: { recoveredManaged?: boolean }): Promise<AdoptionPlan> {
   // A recovered-managed bundle is classified "external" by the synchronous
   // check only because its stored root is stale; the caller has already
   // re-evaluated it under this lock as managed at the canonical managed root.
@@ -123,14 +126,27 @@ export async function adoptAgentFiles(tx: Tx, agent: Agent, options?: { recovere
   });
   if (adopted !== null) {
     if (JSON.parse(adopted).schema !== AGENT_FILES_CONTRACT) throw new Error("Unsupported agent file contract");
-    return root;
+    return { root, markerRoot, marker, pending: null };
   }
   const legacy = await tx.select({ entryFile: agentInstructionHeads.entryFile, contentBase64: agentInstructionRevisions.contentBase64 })
     .from(agentInstructionHeads).innerJoin(agentInstructionRevisions, eq(agentInstructionHeads.revisionId, agentInstructionRevisions.id))
     .where(and(eq(agentInstructionHeads.companyId, agent.companyId), eq(agentInstructionHeads.agentId, agent.id)));
-  for (const entry of legacy) await materializeInstructionBytes(root, entry.entryFile, Buffer.from(entry.contentBase64, "base64"));
-  await materializeInstructionBytes(markerRoot, marker, Buffer.from(JSON.stringify({ schema: AGENT_FILES_CONTRACT })));
-  return root;
+  return { root, markerRoot, marker, pending: legacy.map(entry => ({ entryFile: entry.entryFile, bytes: Buffer.from(entry.contentBase64, "base64") })) };
+}
+
+async function completeAgentFileAdoption(plan: AdoptionPlan) {
+  if (!plan.pending) return;
+  for (const entry of plan.pending) await materializeInstructionBytes(plan.root, entry.entryFile, entry.bytes);
+  await materializeInstructionBytes(plan.markerRoot, plan.marker, Buffer.from(JSON.stringify({ schema: AGENT_FILES_CONTRACT })));
+  plan.pending = null;
+}
+
+/** Call under the agent row lock. Import deployed revision heads once, then the
+ * directory is authoritative. The adoption marker lives OUTSIDE agent files. */
+export async function adoptAgentFiles(tx: Tx, agent: Agent, options?: { recoveredManaged?: boolean }): Promise<string> {
+  const plan = await planAgentFileAdoption(tx, agent, options);
+  await completeAgentFileAdoption(plan);
+  return plan.root;
 }
 
 async function openAgentFile(root: string, relative: string) {
@@ -210,17 +226,19 @@ export async function snapshotAgentFiles(root: string, enforceLimits = true): Pr
 
 export function agentFileStore(db: Db) {
   async function locked<T>(companyId: string, agentId: string, actor: AuthorizationActor, write: boolean,
-    fn: (tx: Tx, agent: Agent, root: string, bound: AuthorizationActor, recovered: RecoveredManagedBundle | null) => Promise<T>,
-    options?: { recoverManaged?: boolean; allowRecoveredManaged?: boolean }) {
+    fn: (tx: Tx, agent: Agent, root: string, bound: AuthorizationActor, recovered: RecoveredManagedBundle | null, adoption: AdoptionPlan) => Promise<T>,
+    options?: { recoverManaged?: boolean; allowRecoveredManaged?: boolean; deferAdoption?: boolean }) {
     return db.transaction(async tx => {
       const [agent] = await tx.select().from(agents).where(and(eq(agents.companyId, companyId), eq(agents.id, agentId))).for("update");
       if (!agent) throw notFound("Agent not found");
       const bound = write ? await authorizeInstructionCommit(tx, actor, agent) : await authorizeInstructionRead(tx, actor, agent);
       // Re-evaluate recovery on the locked row, never on the caller's earlier read.
       const recovered = options?.recoverManaged || options?.allowRecoveredManaged ? await resolveRecoveredManagedBundle(agent) : null;
-      const root = await adoptAgentFiles(tx, agent, { recoveredManaged: options?.allowRecoveredManaged === true && recovered !== null });
-      if (recovered && root !== recovered.rootPath) throw conflict("The instructions bundle mode changed; reload and retry");
-      return fn(tx, agent, root, bound, recovered);
+      const adoption = await planAgentFileAdoption(tx, agent, { recoveredManaged: options?.allowRecoveredManaged === true && recovered !== null });
+      if (recovered && adoption.root !== recovered.rootPath) throw conflict("The instructions bundle mode changed; reload and retry");
+      // A deferring caller completes adoption itself once its operation is valid.
+      if (!options?.deferAdoption) await completeAgentFileAdoption(adoption);
+      return fn(tx, agent, adoption.root, bound, recovered, adoption);
     });
   }
   async function audit(tx: Tx, agent: Agent, actor: AuthorizationActor, details: Record<string, unknown>) {
@@ -249,7 +267,7 @@ export function agentFileStore(db: Db) {
       locked(companyId, agentId, actor, false, (_tx, _agent, root) => readAgentFile(root, instructionPath(relative))),
     write: (input: { companyId: string; agentId: string; path: string; bytes: Buffer | null; baseHash: string | null }, actor: AuthorizationActor,
       options?: AgentFileWriteOptions) =>
-      locked(input.companyId, input.agentId, actor, true, async (tx, agent, root, bound, recovered) => {
+      locked(input.companyId, input.agentId, actor, true, async (tx, agent, root, bound, recovered, adoption) => {
         // Bundles the store did not serve before (unconfigured or stale-root
         // recovered-managed) use the recovered entry and may need their stored
         // configuration repaired. Normal managed bundles keep their behavior.
@@ -257,10 +275,17 @@ export function agentFileStore(db: Db) {
         const entryFile = recoveredOnly?.entryFile ?? deriveBundleState(agent).entryFile;
         const relative = agentFilePath(input.path);
         if (input.bytes) assertFileSize(input.bytes.length, relative);
-        const previous = await inspectAgentFile(root, relative);
+        // First adoption is validated against, not written, until this operation
+        // passes its checks: a rejected save or delete changes no file bytes.
+        const pending = adoption.pending ?? [];
+        const pendingBytes = pending.find(entry => entry.entryFile === relative)?.bytes;
+        const previous = pendingBytes ? { size: pendingBytes.length, hash: fileHash(pendingBytes) } : await inspectAgentFile(root, relative);
         const currentHash = previous?.hash ?? null;
         const incomingHash = input.bytes === null ? null : fileHash(input.bytes);
-        if (currentHash === incomingHash) return { contentHash: currentHash, changed: false };
+        if (currentHash === incomingHash) {
+          await completeAgentFileAdoption(adoption);
+          return { contentHash: currentHash, changed: false };
+        }
         if (currentHash !== input.baseHash) throw conflict("This file changed since it was read. Reload before saving.", { code: "AGENT_FILE_CONFLICT", path: relative, currentHash });
         if (input.bytes === null && relative === entryFile) throw unprocessable("The configured instruction entry cannot be deleted");
         if (input.bytes !== null) {
@@ -268,10 +293,23 @@ export function agentFileStore(db: Db) {
           // A quota check needs metadata only. Do not hash unrelated large
           // files while holding the editor's row lock for a one-file save.
           const snapshot = await scanAgentFiles(root);
-          const total = snapshot.size + input.bytes.length - (previous?.size ?? 0);
-          const newEntries = relative.split("/").map((_part, i, parts) => parts.slice(0, i + 1).join("/")).filter(name => !snapshot.entries.has(name)).length;
-          assertDirectorySize(total, snapshot.entries.size + newEntries);
+          const ancestry = (name: string) => name.split("/").map((_part, i, parts) => parts.slice(0, i + 1).join("/"));
+          const diskSize = async (name: string) => {
+            const stat = await fs.lstat(path.join(root, name)).catch(() => null);
+            return stat?.isFile() ? stat.size : 0;
+          };
+          // Size after adoption and this write: the target replaces whatever is on
+          // disk now, and every other pending head replaces its disk copy.
+          let total = snapshot.size + input.bytes.length - (pendingBytes ? await diskSize(relative) : (previous?.size ?? 0));
+          const added = new Set<string>();
+          for (const entry of pending) {
+            if (entry.entryFile !== relative) total += entry.bytes.length - await diskSize(entry.entryFile);
+            for (const name of ancestry(entry.entryFile)) if (!snapshot.entries.has(name)) added.add(name);
+          }
+          for (const name of ancestry(relative)) if (!snapshot.entries.has(name)) added.add(name);
+          assertDirectorySize(total, snapshot.entries.size + added.size);
         }
+        await completeAgentFileAdoption(adoption);
         if (input.bytes === null) await fs.unlink(await assertInstructionPathSafe(root, relative));
         else await materializeInstructionBytes(root, relative, input.bytes);
         // Persist the configuration the unversioned save path would have stored
@@ -284,7 +322,7 @@ export function agentFileStore(db: Db) {
         await audit(tx, agent, bound, { path: relative, contentHash: incomingHash });
         return { contentHash: incomingHash, changed: true };
       }, { recoverManaged: options?.repairConfig !== undefined || options?.allowRecoveredManaged === true,
-        allowRecoveredManaged: options?.allowRecoveredManaged === true }),
+        allowRecoveredManaged: options?.allowRecoveredManaged === true, deferAdoption: true }),
     apply: (input: { companyId: string; agentId: string; sourceDir: string; baseline: DirectorySnapshot; checkpoint?: AgentFileManifest }, actor: AuthorizationActor) =>
       locked(input.companyId, input.agentId, actor, true, async (tx, agent, root, bound) => {
         const incoming = input.checkpoint ? checkpointSnapshot(input.checkpoint) : await snapshotAgentFiles(input.sourceDir);

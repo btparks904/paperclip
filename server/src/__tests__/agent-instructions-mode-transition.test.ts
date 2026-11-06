@@ -212,8 +212,16 @@ describe("instruction writes across bundle mode transitions", () => {
     const revisions = () => db.select().from(agentConfigRevisions).where(eq(agentConfigRevisions.agentId, agentId));
     const bindings = () => db.select().from(companySecretBindings).where(eq(companySecretBindings.companyId, companyId));
     const allTrees = async () => ({ ...(await bothTrees()), stale: await tree(staleRoot) });
+    const markerPath = () => path.join(path.dirname(managedRoot), "file-sync", "adopted.json");
+    const markerPresent = () => fs.stat(markerPath()).then(() => true, () => false);
     const unchangedSnapshot = async () => ({ trees: await allTrees(), config: (await loadAgent()).adapterConfig,
-      activity: (await activity()).length, revisions: (await revisions()).length });
+      activity: (await activity()).length, revisions: (await revisions()).length, marker: await markerPresent() });
+    const seedEntryHead = async () => {
+      const revisionId = randomUUID();
+      await db.insert(agentInstructionRevisions).values({ id: revisionId, companyId, agentId, entryFile,
+        contentBase64: Buffer.from(HEAD_ENTRY).toString("base64"), contentHash: hashOf(HEAD_ENTRY), byteLength: HEAD_ENTRY.length, source: "board" });
+      await db.insert(agentInstructionHeads).values({ companyId, agentId, entryFile, revisionId });
+    };
 
     beforeEach(async () => {
       staleRoot = path.join(home, "moved-instance", agentId, "instructions");
@@ -415,10 +423,7 @@ describe("instruction writes across bundle mode transitions", () => {
 
     it("10: first adoption of a recovered bundle materializes only revision heads into the managed root", async () => {
       await setConfig(b3Config());
-      const revisionId = randomUUID();
-      await db.insert(agentInstructionRevisions).values({ id: revisionId, companyId, agentId, entryFile,
-        contentBase64: Buffer.from(HEAD_ENTRY).toString("base64"), contentHash: hashOf(HEAD_ENTRY), byteLength: HEAD_ENTRY.length, source: "board" });
-      await db.insert(agentInstructionHeads).values({ companyId, agentId, entryFile, revisionId });
+      await seedEntryHead();
       const staleBefore = await tree(staleRoot);
       await recoveredWrite(INCOMING, hashOf(MANAGED_NOTE));
       expect(await fs.readFile(path.join(managedRoot, entryFile), "utf8")).toBe(HEAD_ENTRY);
@@ -428,6 +433,26 @@ describe("instruction writes across bundle mode transitions", () => {
       await fs.writeFile(path.join(managedRoot, entryFile), ENTRY);
       await recoveredWrite(OTHER, hashOf(INCOMING));
       expect(await fs.readFile(path.join(managedRoot, entryFile), "utf8")).toBe(ENTRY);
+    });
+
+    it("10b/14: a rejected first-adoption save or delete writes no adopted head and no marker", async () => {
+      for (const [config, allowRecoveredManaged] of [[b3Config(), true], [b2Config(), true], [{}, false], [managedConfig(), false]] as const) {
+        await fs.rm(path.dirname(markerPath()), { recursive: true, force: true });
+        await fs.writeFile(path.join(managedRoot, entryFile), ENTRY);
+        await db.delete(agentInstructionHeads).where(eq(agentInstructionHeads.agentId, agentId));
+        await seedEntryHead();
+        await setConfig(config);
+        const before = await unchangedSnapshot();
+        expect(before.marker).toBe(false);
+        const options = { allowRecoveredManaged, repairConfig };
+        await expect(recoveredWrite(INCOMING, hashOf(OTHER), options)).rejects.toMatchObject({ status: 409, details: { code: "AGENT_FILE_CONFLICT" } });
+        await expect(recoveredWrite(null, hashOf(OTHER), options)).rejects.toMatchObject({ status: 409 });
+        // The base is checked against the head that adoption would materialize.
+        await expect(recoveredWrite(null, hashOf(ENTRY), options, board(), entryFile)).rejects.toMatchObject({ status: 409 });
+        await expect(recoveredWrite(null, hashOf(HEAD_ENTRY), options, board(), entryFile)).rejects.toMatchObject({ status: 422 });
+        expect(await unchangedSnapshot()).toEqual(before);
+        expect(await fs.readFile(path.join(managedRoot, entryFile), "utf8")).toBe(ENTRY);
+      }
     });
 
     describe("G1 authorization for recovered-managed writes", () => {
