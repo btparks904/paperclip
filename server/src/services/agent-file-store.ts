@@ -321,7 +321,9 @@ export function agentFileStore(db: Db) {
         }
         await audit(tx, agent, bound, { path: relative, contentHash: incomingHash });
         return { contentHash: incomingHash, changed: true };
-      }, { recoverManaged: options?.repairConfig !== undefined || options?.allowRecoveredManaged === true,
+      // Always resolve recovery under the lock so an unconfigured bundle's
+      // recovered entry stays protected even without the stale-root allowance.
+      }, { recoverManaged: true,
         allowRecoveredManaged: options?.allowRecoveredManaged === true, deferAdoption: true }),
     apply: (input: { companyId: string; agentId: string; sourceDir: string; baseline: DirectorySnapshot; checkpoint?: AgentFileManifest }, actor: AuthorizationActor) =>
       locked(input.companyId, input.agentId, actor, true, async (tx, agent, root, bound) => {

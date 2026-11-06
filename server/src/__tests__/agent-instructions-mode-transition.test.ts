@@ -346,6 +346,22 @@ describe("instruction writes across bundle mode transitions", () => {
       }
     });
 
+    it("8b: an unconfigured bundle's recovered entry cannot be deleted, with or without store options", async () => {
+      await setConfig({});
+      await fs.rm(managedRoot, { recursive: true, force: true });
+      await fs.mkdir(managedRoot, { recursive: true });
+      await fs.writeFile(path.join(managedRoot, "CUSTOM.md"), ENTRY);
+      await fs.writeFile(path.join(managedRoot, "other.md"), OTHER);
+      const before = await unchangedSnapshot();
+      for (const options of [{}, { allowRecoveredManaged: false }, { repairConfig }]) {
+        await expect(recoveredWrite(null, hashOf(ENTRY), options, board(), "CUSTOM.md"))
+          .rejects.toMatchObject({ status: 422, message: "The configured instruction entry cannot be deleted" });
+      }
+      expect(await unchangedSnapshot()).toEqual(before);
+      await expect(recoveredWrite(null, hashOf(OTHER), {}, board(), "other.md")).resolves.toEqual({ contentHash: null, changed: true });
+      expect(await fs.readFile(path.join(managedRoot, "CUSTOM.md"), "utf8")).toBe(ENTRY);
+    });
+
     it("A2: a changing save repairs the unconfigured configuration; an identical save does not", async () => {
       await setConfig({});
       await expect(recoveredWrite(MANAGED_NOTE, hashOf(MANAGED_NOTE), { repairConfig })).resolves.toEqual({ contentHash: hashOf(MANAGED_NOTE), changed: false });
