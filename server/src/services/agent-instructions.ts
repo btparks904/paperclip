@@ -452,6 +452,39 @@ function buildPersistedBundleConfig(
   });
 }
 
+/**
+ * The destination an unversioned write or delete resolves to: the effective
+ * (recovered) mode and the canonical root path. Two targets are equal only when
+ * both match, so a different external root or a recovered-managed bundle that
+ * became external never compares equal. This compares path strings; it does
+ * not pin filesystem identity (per-operation path safety checks still apply).
+ */
+export type InstructionWriteTarget = { mode: BundleMode | null; rootPath: string | null };
+
+export async function resolveInstructionWriteTarget(agent: AgentLike): Promise<InstructionWriteTarget> {
+  const state = await recoverManagedBundleState(agent, deriveBundleState(agent));
+  return { mode: state.mode, rootPath: state.rootPath ? path.resolve(state.rootPath) : null };
+}
+
+/**
+ * Classify a bundle that the existing recovery rules already treat as managed
+ * at the canonical managed root, without widening them. An explicitly external
+ * persisted mode is never recovered. Returns the persisted configuration that
+ * the unversioned write path would have stored for it, or null when the stored
+ * configuration already matches.
+ */
+export type RecoveredManagedBundle = { rootPath: string; entryFile: string; repairedConfig: Record<string, unknown> | null };
+
+export async function resolveRecoveredManagedBundle(agent: AgentLike): Promise<RecoveredManagedBundle | null> {
+  const derived = deriveBundleState(agent);
+  if (derived.mode === "external") return null;
+  const recovered = await recoverManagedBundleState(agent, derived);
+  const managedRoot = resolveManagedInstructionsRoot(agent);
+  if (recovered.mode !== "managed" || !recovered.rootPath || path.resolve(recovered.rootPath) !== managedRoot) return null;
+  const repaired = buildPersistedBundleConfig(derived, recovered);
+  return { rootPath: managedRoot, entryFile: recovered.entryFile, repairedConfig: repaired === derived.config ? null : repaired };
+}
+
 async function writeBundleFiles(
   rootPath: string,
   files: Record<string, string>,
@@ -714,23 +747,35 @@ export function agentInstructionsService(db?: Db) {
     }
   }
 
+  // The exact destination a caller routed for. A different mode or root under
+  // the lock means another change won the race, so nothing may be written.
+  async function assertExpectedTarget(current: AgentLike, expectedTarget: InstructionWriteTarget | undefined) {
+    if (!expectedTarget) return;
+    const target = await resolveInstructionWriteTarget(current);
+    if (target.mode !== expectedTarget.mode || target.rootPath !== expectedTarget.rootPath) {
+      throw conflict("The instructions bundle mode changed; reload and retry");
+    }
+  }
+
   // Reload configuration under the commit lock: a previously supporting file
   // may have become the configured entry since the route loaded its agent.
   async function withCurrentAgent<T>(
     agent: AgentLike,
     relativePath: string,
     operation: (current: AgentLike) => Promise<T>,
-    expectedMode?: InstructionBundleWriteMode,
+    expected?: { mode?: InstructionBundleWriteMode; target?: InstructionWriteTarget },
   ) {
     if (!db) {
-      assertExpectedBundleMode(agent, expectedMode);
+      assertExpectedBundleMode(agent, expected?.mode);
+      await assertExpectedTarget(agent, expected?.target);
       return operation(agent);
     }
     return db.transaction(async (tx) => {
       const [current] = await tx.select().from(agents)
         .where(and(eq(agents.id, agent.id), eq(agents.companyId, agent.companyId))).for("update");
       if (!current) throw notFound("Agent not found");
-      assertExpectedBundleMode(current, expectedMode);
+      assertExpectedBundleMode(current, expected?.mode);
+      await assertExpectedTarget(current, expected?.target);
       if (relativePath !== LEGACY_PROMPT_TEMPLATE_PATH) {
         // Historical entries also remain projections if the configured entry changes.
         await assertUnversionedEntry(current, normalizeRelativeFilePath(relativePath), tx);
@@ -742,14 +787,20 @@ export function agentInstructionsService(db?: Db) {
     agent: AgentLike,
     relativePath: string,
     content: string,
-    options?: { clearLegacyPromptTemplate?: boolean; expectedMode?: InstructionBundleWriteMode },
+    options?: { clearLegacyPromptTemplate?: boolean; expectedMode?: InstructionBundleWriteMode; expectedTarget?: InstructionWriteTarget },
   ) {
     const writeOptions = options ? { clearLegacyPromptTemplate: options.clearLegacyPromptTemplate } : undefined;
     return withCurrentAgent(agent, relativePath,
-      (current) => writeFileUnversioned(current, relativePath, content, writeOptions), options?.expectedMode);
+      (current) => writeFileUnversioned(current, relativePath, content, writeOptions),
+      { mode: options?.expectedMode, target: options?.expectedTarget });
   }
-  async function deleteFile(agent: AgentLike, relativePath: string, options?: { expectedMode?: InstructionBundleWriteMode }) {
-    return withCurrentAgent(agent, relativePath, (current) => deleteFileUnversioned(current, relativePath), options?.expectedMode);
+  async function deleteFile(
+    agent: AgentLike,
+    relativePath: string,
+    options?: { expectedMode?: InstructionBundleWriteMode; expectedTarget?: InstructionWriteTarget },
+  ) {
+    return withCurrentAgent(agent, relativePath, (current) => deleteFileUnversioned(current, relativePath),
+      { mode: options?.expectedMode, target: options?.expectedTarget });
   }
 
   async function exportFiles(agent: AgentLike, options?: { rejectSymlinks?: boolean }): Promise<{

@@ -1,6 +1,6 @@
 import { connectionIntentService } from "../services/connection-intents.js";
 import { completeConnectionIntentSchema } from "@paperclipai/shared";
-import { agentFileStore, agentFileTokenFromHash } from "../services/agent-file-store.js";
+import { agentFileStore, agentFileTokenFromHash, type AgentFileConfigRepair } from "../services/agent-file-store.js";
 import { pipeline } from "node:stream/promises";
 import { resolveAgentAppearance, agentAvatarUrl } from "@paperclipai/shared";
 import { listOpenRouterModels } from "../services/openrouter-models.js";
@@ -73,7 +73,7 @@ import { agentInstructionRevisionService } from "../services/agent-instruction-r
 import { agentInstructionWorkingCopyService } from "../services/agent-instruction-working-copies.js";
 import { authorizeInstructionRead } from "../services/agent-instruction-authorization.js";
 import { instructionPath } from "../services/agent-instruction-files.js";
-import { agentInstructionsBundleMode, deriveBundleState } from "../services/agent-instructions.js";
+import { agentInstructionsBundleMode, deriveBundleState, resolveInstructionWriteTarget, resolveRecoveredManagedBundle } from "../services/agent-instructions.js";
 import {
   agentService,
   agentInstructionsService,
@@ -2894,6 +2894,32 @@ export function agentRoutes(
     }
   }
 
+  // Persist a recovered bundle's repaired instruction configuration through
+  // the same normalization and agent-service update the unversioned save path
+  // uses, inside the file store's locked transaction.
+  function repairInstructionsConfig(req: Request): AgentFileConfigRepair {
+    const actor = getActorInfo(req);
+    return async (tx, agent, adapterConfig) => {
+      const normalized = await secretsSvc.normalizeAdapterConfigForPersistence(
+        agent.companyId,
+        adapterConfig,
+        { strictMode: strictSecretsMode, adapterType: agent.adapterType },
+      );
+      // The store transaction is a full Db for the agent service's queries.
+      await agentService(tx as unknown as Db).update(
+        agent.id,
+        { adapterConfig: normalized },
+        {
+          recordRevision: {
+            createdByAgentId: actor.agentId,
+            createdByUserId: actor.actorType === "user" ? actor.actorId : null,
+            source: "instructions_bundle_file_put",
+          },
+        },
+      );
+    };
+  }
+
   function adapterConfigTouchesInstructionsConfig(adapterConfig: Record<string, unknown>) {
     return KNOWN_INSTRUCTIONS_BUNDLE_KEYS.some((key) => adapterConfig[key] !== undefined);
   }
@@ -5230,15 +5256,22 @@ export function agentRoutes(
     if (managedWrite && req.body.path !== "promptTemplate.legacy.md") {
       if (req.body.baseHash === undefined) throw unprocessable("Read the file and supply baseHash (null for a new file)");
       await agentFiles.write({ companyId: existing.companyId, agentId: existing.id, path: req.body.path,
-        bytes: Buffer.from(req.body.content, "utf8"), baseHash: req.body.baseHash }, req.actor);
+        bytes: Buffer.from(req.body.content, "utf8"), baseHash: req.body.baseHash }, req.actor, {
+        // assertExternalInstructionsAdmin above already required instance admin
+        // for a stale-root bundle; the store re-checks recovery under its lock.
+        allowRecoveredManaged: agentInstructionsBundleMode(existing) === "external",
+        repairConfig: repairInstructionsConfig(req),
+      });
       res.json(await instructions.readFile(existing, req.body.path)); return;
     }
     const actor = getActorInfo(req);
     const result = await instructions.writeFile(existing, req.body.path, req.body.content, {
       clearLegacyPromptTemplate: req.body.clearLegacyPromptTemplate,
-      // Refuse under the lock if the bundle became managed after the read above.
-      // The legacy pseudo-file lives in adapter config, not in either root.
+      // Refuse under the lock if the bundle mode or destination root changed
+      // after the read above. The legacy pseudo-file lives in adapter config,
+      // not in either root.
       expectedMode: req.body.path === "promptTemplate.legacy.md" ? undefined : "external",
+      expectedTarget: req.body.path === "promptTemplate.legacy.md" ? undefined : await resolveInstructionWriteTarget(existing),
     });
     const normalizedAdapterConfig = await secretsSvc.normalizeAdapterConfigForPersistence(
       existing.companyId,
@@ -5350,15 +5383,23 @@ export function agentRoutes(
       return;
     }
 
-    if (agentInstructionsBundleMode(existing) === "managed") {
-      const baseHash = typeof req.query.baseHash === "string" && /^[a-f0-9]{64}$/.test(req.query.baseHash) ? req.query.baseHash : null;
+    const baseHash = typeof req.query.baseHash === "string" && /^[a-f0-9]{64}$/.test(req.query.baseHash) ? req.query.baseHash : null;
+    const syncMode = agentInstructionsBundleMode(existing);
+    // A recovered-managed bundle (managed files at the canonical managed root,
+    // not explicitly external) is deleted through the store when the caller
+    // read it and supplied its base. baseHash alone never selects this path.
+    const recoveredManagedDelete = syncMode !== "managed" && baseHash !== null && relativePath !== "promptTemplate.legacy.md"
+      && (await resolveRecoveredManagedBundle(existing)) !== null;
+    if (syncMode === "managed" || recoveredManagedDelete) {
       if (baseHash === null) throw unprocessable("Read the file and supply baseHash before deleting it");
-      await agentFiles.write({ companyId: existing.companyId, agentId: existing.id, path: relativePath, bytes: null, baseHash }, req.actor);
+      await agentFiles.write({ companyId: existing.companyId, agentId: existing.id, path: relativePath, bytes: null, baseHash }, req.actor,
+        { allowRecoveredManaged: syncMode === "external" });
       res.json(await instructions.getBundle(existing)); return;
     }
     const actor = getActorInfo(req);
     const result = await instructions.deleteFile(existing, relativePath, {
       expectedMode: relativePath === "promptTemplate.legacy.md" ? undefined : "external",
+      expectedTarget: relativePath === "promptTemplate.legacy.md" ? undefined : await resolveInstructionWriteTarget(existing),
     });
     await logActivity(db, {
       companyId: existing.companyId,

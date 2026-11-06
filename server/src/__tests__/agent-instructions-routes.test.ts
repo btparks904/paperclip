@@ -1,7 +1,10 @@
 import express from "express";
 import request from "supertest";
+import fs from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import { Readable } from "node:stream";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const mockAgentService = vi.hoisted(() => ({
   create: vi.fn(),
@@ -854,6 +857,7 @@ describe("agent instructions bundle routes", () => {
       instructionsBundleMode: "external", instructionsRootPath: "/srv/paperclip/external-agent", instructionsEntryFile: "AGENTS.md",
     } });
     const managedAgent = () => ({ ...makeAgent(), adapterConfig: { instructionsBundleMode: "managed", instructionsEntryFile: "AGENTS.md" } });
+    const externalTarget = { mode: "external", rootPath: "/srv/paperclip/external-agent" };
     const externalModeRejection = () => Object.assign(new Error("External instructions must be migrated to managed storage first"), { status: 422 });
 
     beforeEach(() => {
@@ -870,7 +874,8 @@ describe("agent instructions bundle routes", () => {
       expect(res.status, JSON.stringify(res.body)).toBe(422);
       expect(res.body.error).toContain("External instructions must be migrated");
       expect(mockAgentFileWrite).toHaveBeenCalledOnce();
-      expect(mockAgentFileWrite).toHaveBeenCalledWith(expect.objectContaining({ agentId, path: "notes/plan.md", baseHash }), expect.objectContaining({ type: "board" }));
+      expect(mockAgentFileWrite).toHaveBeenCalledWith(expect.objectContaining({ agentId, path: "notes/plan.md", baseHash }), expect.objectContaining({ type: "board" }),
+        expect.objectContaining({ allowRecoveredManaged: true, repairConfig: expect.any(Function) }));
       expect(mockAgentInstructionsService.writeFile).not.toHaveBeenCalled();
       expect(mockAgentService.update).not.toHaveBeenCalled();
       expect(mockLogActivity).not.toHaveBeenCalled();
@@ -883,7 +888,7 @@ describe("agent instructions bundle routes", () => {
       const withNull = await requestApp(await createApp(), url => request(url).put(filePath)
         .send({ path: "notes/new.md", content: "new\n", baseHash: null }));
       expect(withNull.status, JSON.stringify(withNull.body)).toBe(422);
-      expect(mockAgentFileWrite).toHaveBeenCalledWith(expect.objectContaining({ path: "notes/new.md", baseHash: null }), expect.anything());
+      expect(mockAgentFileWrite).toHaveBeenCalledWith(expect.objectContaining({ path: "notes/new.md", baseHash: null }), expect.anything(), expect.anything());
       expect(mockAgentInstructionsService.writeFile).not.toHaveBeenCalled();
 
       mockAgentFileWrite.mockClear();
@@ -892,7 +897,7 @@ describe("agent instructions bundle routes", () => {
       expect(omitted.status, JSON.stringify(omitted.body)).toBe(200);
       expect(mockAgentFileWrite).not.toHaveBeenCalled();
       expect(mockAgentInstructionsService.writeFile).toHaveBeenCalledWith(expect.objectContaining({ id: agentId }), "notes/new.md", "new\n",
-        { clearLegacyPromptTemplate: false, expectedMode: "external" });
+        { clearLegacyPromptTemplate: false, expectedMode: "external", expectedTarget: externalTarget });
     });
 
     it("keeps external saves without baseHash on the external path, guarded by the expected mode", async () => {
@@ -901,7 +906,7 @@ describe("agent instructions bundle routes", () => {
         .send({ path: "notes/plan.md", content: "external\n" }));
       expect(res.status, JSON.stringify(res.body)).toBe(200);
       expect(mockAgentInstructionsService.writeFile).toHaveBeenCalledOnce();
-      expect(mockAgentInstructionsService.writeFile.mock.calls[0]![3]).toEqual({ clearLegacyPromptTemplate: false, expectedMode: "external" });
+      expect(mockAgentInstructionsService.writeFile.mock.calls[0]![3]).toEqual({ clearLegacyPromptTemplate: false, expectedMode: "external", expectedTarget: externalTarget });
       expect(mockAgentFileWrite).not.toHaveBeenCalled();
       expect(mockLogActivity).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ action: "agent.instructions_file_updated" }));
     });
@@ -923,7 +928,7 @@ describe("agent instructions bundle routes", () => {
       mockAgentService.getById.mockResolvedValue(externalAgent());
       const res = await requestApp(await createApp(), url => request(url).delete(filePath).query({ path: "notes/plan.md" }));
       expect(res.status, JSON.stringify(res.body)).toBe(200);
-      expect(mockAgentInstructionsService.deleteFile).toHaveBeenCalledWith(expect.objectContaining({ id: agentId }), "notes/plan.md", { expectedMode: "external" });
+      expect(mockAgentInstructionsService.deleteFile).toHaveBeenCalledWith(expect.objectContaining({ id: agentId }), "notes/plan.md", { expectedMode: "external", expectedTarget: externalTarget });
       expect(mockLogActivity).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ action: "agent.instructions_file_deleted" }));
     });
 
@@ -972,6 +977,140 @@ describe("agent instructions bundle routes", () => {
       expect(mockAgentFileWrite).not.toHaveBeenCalled();
       expect(mockAgentInstructionsService.writeFile).not.toHaveBeenCalled();
       expect(mockAgentInstructionsService.deleteFile).not.toHaveBeenCalled();
+    });
+
+    describe("recovered-managed bundles (managed files on disk at the canonical managed root)", () => {
+      const previousHome = process.env.PAPERCLIP_HOME;
+      let home: string;
+      let managedRoot: string;
+      const staleRoot = "/srv/paperclip/moved-instance/instructions";
+      const b3Agent = () => ({ ...makeAgent(), adapterConfig: { instructionsBundleMode: "managed", instructionsRootPath: staleRoot, instructionsEntryFile: "AGENTS.md" } });
+      const b2Agent = () => ({ ...makeAgent(), adapterConfig: { instructionsRootPath: staleRoot, instructionsEntryFile: "AGENTS.md" } });
+      const a2Agent = () => ({ ...makeAgent(), adapterConfig: {} });
+      const nonAdmin = () => ({ type: "board", userId: "company-admin", companyIds: ["company-1"],
+        memberships: [{ companyId: "company-1", status: "active", membershipRole: "admin" }], source: "session", isInstanceAdmin: false });
+
+      beforeEach(async () => {
+        home = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "recovered-routes-")));
+        process.env.PAPERCLIP_HOME = home;
+        const { resolveManagedInstructionsRoot } = await vi.importActual<typeof import("../services/agent-instructions.js")>("../services/agent-instructions.js");
+        managedRoot = resolveManagedInstructionsRoot(makeAgent());
+        await fs.mkdir(path.join(managedRoot, "notes"), { recursive: true });
+        await fs.writeFile(path.join(managedRoot, "AGENTS.md"), "SENTINEL-ROUTE-ENTRY\n");
+        await fs.writeFile(path.join(managedRoot, "notes/plan.md"), "SENTINEL-ROUTE-NOTE\n");
+        mockAgentFileWrite.mockResolvedValue({ contentHash: "b".repeat(64), changed: true });
+        mockAgentInstructionsService.readFile.mockResolvedValue({ path: "notes/plan.md", content: "x\n" });
+        mockAgentInstructionsService.getBundle.mockResolvedValue({ files: [] });
+      });
+      afterEach(async () => {
+        if (previousHome === undefined) delete process.env.PAPERCLIP_HOME; else process.env.PAPERCLIP_HOME = previousHome;
+        await fs.rm(home, { recursive: true, force: true });
+      });
+
+      it("routes B2/B3 base-bearing saves to the store with recovery allowed and a repair callback", async () => {
+        for (const agent of [b3Agent(), b2Agent()]) {
+          mockAgentFileWrite.mockClear();
+          mockAgentService.getById.mockResolvedValue(agent);
+          const res = await requestApp(await createApp(), url => request(url).put(filePath).send({ path: "notes/plan.md", content: "x\n", baseHash }));
+          expect(res.status, JSON.stringify(res.body)).toBe(200);
+          expect(mockAgentFileWrite).toHaveBeenCalledWith(expect.objectContaining({ path: "notes/plan.md", baseHash }), expect.anything(),
+            expect.objectContaining({ allowRecoveredManaged: true, repairConfig: expect.any(Function) }));
+        }
+        expect(mockAgentInstructionsService.writeFile).not.toHaveBeenCalled();
+      });
+
+      it("routes an A2 base-bearing save to the store without the stale-root allowance", async () => {
+        mockAgentService.getById.mockResolvedValue(a2Agent());
+        const res = await requestApp(await createApp(nonAdmin()), url => request(url).put(filePath).send({ path: "notes/plan.md", content: "x\n", baseHash }));
+        expect(res.status, JSON.stringify(res.body)).toBe(200);
+        expect(mockAgentFileWrite).toHaveBeenCalledWith(expect.anything(), expect.anything(),
+          expect.objectContaining({ allowRecoveredManaged: false, repairConfig: expect.any(Function) }));
+      });
+
+      it("keeps the instance-admin gate for B2/B3 saves and deletes", async () => {
+        for (const agent of [b3Agent(), b2Agent()]) {
+          mockAgentService.getById.mockResolvedValue(agent);
+          const app = await createApp(nonAdmin());
+          for (const perform of [
+            () => request(app).put(filePath).send({ path: "notes/plan.md", content: "x\n", baseHash }),
+            () => request(app).put(filePath).send({ path: "notes/plan.md", content: "x\n" }),
+            () => request(app).delete(filePath).query({ path: "notes/plan.md", baseHash }),
+            () => request(app).delete(filePath).query({ path: "notes/plan.md" }),
+          ]) {
+            expect((await perform()).status).toBe(403);
+          }
+        }
+        expect(mockAgentFileWrite).not.toHaveBeenCalled();
+        expect(mockAgentInstructionsService.writeFile).not.toHaveBeenCalled();
+        expect(mockAgentInstructionsService.deleteFile).not.toHaveBeenCalled();
+      });
+
+      it("routes A2/B2/B3 deletes with a base to the store, and without one to the guarded unversioned path", async () => {
+        for (const [agent, allowRecoveredManaged] of [[a2Agent(), false], [b2Agent(), true], [b3Agent(), true]] as const) {
+          mockAgentFileWrite.mockClear();
+          mockAgentInstructionsService.deleteFile.mockClear();
+          mockAgentService.getById.mockResolvedValue(agent);
+          const withBase = await requestApp(await createApp(), url => request(url).delete(filePath).query({ path: "notes/plan.md", baseHash }));
+          expect(withBase.status, JSON.stringify(withBase.body)).toBe(200);
+          expect(mockAgentFileWrite).toHaveBeenCalledWith(expect.objectContaining({ path: "notes/plan.md", bytes: null, baseHash }), expect.anything(),
+            { allowRecoveredManaged });
+          expect(mockAgentInstructionsService.deleteFile).not.toHaveBeenCalled();
+
+          mockAgentFileWrite.mockClear();
+          const withoutBase = await requestApp(await createApp(), url => request(url).delete(filePath).query({ path: "notes/plan.md" }));
+          expect(withoutBase.status, JSON.stringify(withoutBase.body)).toBe(200);
+          expect(mockAgentFileWrite).not.toHaveBeenCalled();
+          expect(mockAgentInstructionsService.deleteFile).toHaveBeenCalledWith(expect.objectContaining({ id: agentId }), "notes/plan.md",
+            { expectedMode: "external", expectedTarget: { mode: "managed", rootPath: managedRoot } });
+        }
+      });
+
+      it("keeps explicit-external and other-root deletes with a base on the external path", async () => {
+        await fs.rm(managedRoot, { recursive: true, force: true });
+        const otherRoot = { ...makeAgent(), adapterConfig: { instructionsRootPath: "/srv/paperclip/other-root", instructionsEntryFile: "AGENTS.md" } };
+        // C2 (another root, no persisted mode) keeps its null effective mode in the target.
+        for (const [agent, mode, rootPath] of [[externalAgent(), "external", "/srv/paperclip/external-agent"], [otherRoot, null, "/srv/paperclip/other-root"]] as const) {
+          mockAgentInstructionsService.deleteFile.mockClear();
+          mockAgentService.getById.mockResolvedValue(agent);
+          const res = await requestApp(await createApp(), url => request(url).delete(filePath).query({ path: "notes/plan.md", baseHash }));
+          expect(res.status, JSON.stringify(res.body)).toBe(200);
+          expect(mockAgentInstructionsService.deleteFile).toHaveBeenCalledWith(expect.objectContaining({ id: agentId }), "notes/plan.md",
+            { expectedMode: "external", expectedTarget: { mode, rootPath } });
+        }
+        expect(mockAgentFileWrite).not.toHaveBeenCalled();
+      });
+
+      it("keeps explicit-external deletes with a base on the external path even when managed files exist", async () => {
+        mockAgentService.getById.mockResolvedValue(externalAgent());
+        const res = await requestApp(await createApp(), url => request(url).delete(filePath).query({ path: "notes/plan.md", baseHash }));
+        expect(res.status, JSON.stringify(res.body)).toBe(200);
+        expect(mockAgentFileWrite).not.toHaveBeenCalled();
+        expect(mockAgentInstructionsService.deleteFile).toHaveBeenCalledOnce();
+      });
+
+      it("passes the recovered managed target to a no-base save so a concurrent switch is refused", async () => {
+        mockAgentService.getById.mockResolvedValue(b3Agent());
+        mockAgentInstructionsService.writeFile.mockResolvedValue({ file: { path: "notes/plan.md", size: 2 }, adapterConfig: b3Agent().adapterConfig });
+        const res = await requestApp(await createApp(), url => request(url).put(filePath).send({ path: "notes/plan.md", content: "x\n" }));
+        expect(res.status, JSON.stringify(res.body)).toBe(200);
+        expect(mockAgentInstructionsService.writeFile.mock.calls[0]![3]).toEqual({ clearLegacyPromptTemplate: false, expectedMode: "external",
+          expectedTarget: { mode: "managed", rootPath: managedRoot } });
+      });
+
+      it("repairs configuration through secret normalization and the agent-service update with a config revision", async () => {
+        mockAgentService.getById.mockResolvedValue(b3Agent());
+        await requestApp(await createApp(), url => request(url).put(filePath).send({ path: "notes/plan.md", content: "x\n", baseHash }));
+        const repair = mockAgentFileWrite.mock.calls[0]![2].repairConfig as (tx: unknown, agent: unknown, config: Record<string, unknown>) => Promise<void>;
+        mockAgentService.update.mockClear();
+        mockSecretService.normalizeAdapterConfigForPersistence.mockClear();
+        const repaired = { instructionsBundleMode: "managed", instructionsRootPath: managedRoot };
+        await repair({}, { ...b3Agent(), adapterType: "codex_local" }, repaired);
+        expect(mockSecretService.normalizeAdapterConfigForPersistence).toHaveBeenCalledWith("company-1", repaired,
+          expect.objectContaining({ adapterType: "codex_local" }));
+        expect(mockAgentService.update).toHaveBeenCalledWith(agentId, { adapterConfig: repaired },
+          { recordRevision: expect.objectContaining({ source: "instructions_bundle_file_put", createdByUserId: "local-board" }) });
+        expect(mockLogActivity).not.toHaveBeenCalled();
+      });
     });
   });
 });
