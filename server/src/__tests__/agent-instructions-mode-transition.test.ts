@@ -6,7 +6,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { eq } from "drizzle-orm";
 import {
   activityLog, agentConfigRevisions, agentInstructionHeads, agentInstructionRevisions, agents, authUsers, companies, companyMemberships,
-  companySecretBindings, createDb, instanceUserRoles, principalPermissionGrants, type Db,
+  companySecretBindings, companySecrets, createDb, instanceUserRoles, principalPermissionGrants, type Db,
 } from "@paperclipai/db";
 import { agentFileStore, fileHash, snapshotAgentFiles, type AgentFileConfigRepair, type AgentFileWriteOptions } from "../services/agent-file-store.js";
 import { agentInstructionRevisionService } from "../services/agent-instruction-revisions.js";
@@ -469,6 +469,184 @@ describe("instruction writes across bundle mode transitions", () => {
         expect(await unchangedSnapshot()).toEqual(before);
         expect(await fs.readFile(path.join(managedRoot, entryFile), "utf8")).toBe(ENTRY);
       }
+    });
+
+    describe("F1: entry saves through the file store", () => {
+      const CUSTOM = "CUSTOM.md";
+      const heads = () => db.select().from(agentInstructionHeads).where(eq(agentInstructionHeads.agentId, agentId));
+      const instructionRevisionRows = () => db.select().from(agentInstructionRevisions).where(eq(agentInstructionRevisions.agentId, agentId));
+      /** Managed root holds a non-default entry and an ordinary file, but no AGENTS.md. */
+      async function customEntryRoot() {
+        await fs.rm(managedRoot, { recursive: true, force: true });
+        await fs.rm(path.dirname(markerPath()), { recursive: true, force: true });
+        await fs.mkdir(managedRoot, { recursive: true });
+        await fs.writeFile(path.join(managedRoot, CUSTOM), ENTRY);
+        await fs.writeFile(path.join(managedRoot, "other.md"), OTHER);
+      }
+      const cases: Array<[string, () => Record<string, unknown>, AgentFileWriteOptions]> = [
+        ["A2 (unconfigured)", () => ({}), { repairConfig }],
+        ["A2 with an explicit false allowance", () => ({}), { allowRecoveredManaged: false, repairConfig }],
+        ["B2 without an entry key", () => ({ instructionsRootPath: staleRoot }), { allowRecoveredManaged: true, repairConfig }],
+        ["B3 without an entry key", () => ({ instructionsBundleMode: "managed", instructionsRootPath: staleRoot }), { allowRecoveredManaged: true, repairConfig }],
+        ["B3 with CUSTOM.md configured", () => ({ ...b3Config(), instructionsEntryFile: CUSTOM }), { allowRecoveredManaged: true, repairConfig }],
+        ["normal managed without an entry key", () => ({ instructionsBundleMode: "managed", instructionsRootPath: managedRoot }), {}],
+        ["normal managed with CUSTOM.md configured", () => ({ ...managedConfig(), instructionsEntryFile: CUSTOM }), {}],
+      ];
+      for (const [label, config, options] of cases) {
+        it(`${label}: a save to the recovered entry is refused for every base, with no bytes, adoption, revision or audit`, async () => {
+          await customEntryRoot();
+          await setConfig(config());
+          // The bundle reports CUSTOM.md as its entry; the unversioned path refuses it.
+          expect((await agentInstructionsService(db).getBundle(await loadAgent())).entryFile).toBe(CUSTOM);
+          // A pending first-adoption head for the entry: a refusal must not adopt it.
+          const revisionId = randomUUID();
+          await db.insert(agentInstructionRevisions).values({ id: revisionId, companyId, agentId, entryFile: CUSTOM,
+            contentBase64: Buffer.from(HEAD_ENTRY).toString("base64"), contentHash: hashOf(HEAD_ENTRY), byteLength: HEAD_ENTRY.length, source: "board" });
+          await db.insert(agentInstructionHeads).values({ companyId, agentId, entryFile: CUSTOM, revisionId });
+          const before = { ...(await unchangedSnapshot()), heads: await heads(), instructionRevisions: (await instructionRevisionRows()).length };
+          expect(before.marker).toBe(false);
+          // Matching disk base, matching planned base, stale base, new-file base, and identical content.
+          for (const [content, base] of [[INCOMING, hashOf(ENTRY)], [INCOMING, hashOf(HEAD_ENTRY)], [INCOMING, hashOf(OTHER)], [INCOMING, null], [HEAD_ENTRY, hashOf(HEAD_ENTRY)]] as const) {
+            await expect(recoveredWrite(content, base, options, board(), CUSTOM)).rejects.toMatchObject({
+              status: 422, details: { code: "INSTRUCTION_REVISION_REQUIRED" },
+            });
+          }
+          expect({ ...(await unchangedSnapshot()), heads: await heads(), instructionRevisions: (await instructionRevisionRows()).length }).toEqual(before);
+          expect(await fs.readFile(path.join(managedRoot, CUSTOM), "utf8")).toBe(ENTRY);
+          expect((await activity()).filter(row => row.action === "agent.files_updated")).toHaveLength(0);
+
+          // An ordinary file in the same bundle stays writable.
+          await expect(recoveredWrite(INCOMING, hashOf(OTHER), options, board(), "other.md")).resolves.toEqual({ contentHash: hashOf(INCOMING), changed: true });
+          expect(await fs.readFile(path.join(managedRoot, "other.md"), "utf8")).toBe(INCOMING);
+          expect(await fs.readFile(path.join(managedRoot, CUSTOM), "utf8")).not.toBe(INCOMING);
+        });
+      }
+
+      it("a configured entry missing on disk stays the protected entry; other files keep their recovered status", async () => {
+        await customEntryRoot();
+        // The configured AGENTS.md is absent, so the configured name stays the entry and CUSTOM.md is an ordinary file.
+        await setConfig(b3Config());
+        expect((await agentInstructionsService(db).getBundle(await loadAgent())).entryFile).toBe(entryFile);
+        const before = await unchangedSnapshot();
+        await expect(recoveredWrite(INCOMING, null, recoveredOptions(), board(), entryFile)).rejects.toMatchObject({
+          status: 422, details: { code: "INSTRUCTION_REVISION_REQUIRED" },
+        });
+        expect(await unchangedSnapshot()).toEqual(before);
+        await expect(recoveredWrite(INCOMING, hashOf(ENTRY), recoveredOptions(), board(), CUSTOM)).resolves.toMatchObject({ changed: true });
+      });
+
+      it("the canonical entry commit still updates a non-default entry after a refused store save", async () => {
+        await customEntryRoot();
+        await setConfig({ ...managedConfig(), instructionsEntryFile: CUSTOM });
+        await expect(recoveredWrite(INCOMING, hashOf(ENTRY), {}, board(), CUSTOM)).rejects.toMatchObject({ status: 422 });
+        const revisionsSvc = agentInstructionRevisionService(db);
+        const current = await revisionsSvc.readCurrent({ companyId, agentId }, board());
+        const receipt = await revisionsSvc.commit({ companyId, agentId, entryFile: CUSTOM, content: INCOMING, source: "board",
+          baseRevisionId: current?.revision.id ?? null }, board());
+        expect(receipt.revision).toMatchObject({ entryFile: CUSTOM, contentHash: hashOf(INCOMING) });
+        expect(await fs.readFile(path.join(managedRoot, CUSTOM), "utf8")).toBe(INCOMING);
+        expect((await revisionsSvc.readCurrent({ companyId, agentId }, board()))?.content).toBe(INCOMING);
+      });
+    });
+
+    describe("F2: configuration repair runs before adoption and the file write", () => {
+      const setStatus = (status: string) => db.update(agents).set({ status }).where(eq(agents.id, agentId));
+      /** Records the managed note and marker as the repair saw them, and how often it ran. */
+      function observedRepair() {
+        const seen: Array<{ note: string; entry: string; marker: boolean }> = [];
+        const callback: AgentFileConfigRepair = async (tx, agent, adapterConfig) => {
+          seen.push({ note: await fs.readFile(path.join(managedRoot, NOTE), "utf8"), entry: await fs.readFile(path.join(managedRoot, entryFile), "utf8"),
+            marker: await markerPresent() });
+          await repairConfig(tx, agent, adapterConfig);
+        };
+        return { seen, callback };
+      }
+      const firstAdoptionState = async () => {
+        await fs.rm(path.dirname(markerPath()), { recursive: true, force: true });
+        await db.delete(agentInstructionHeads).where(eq(agentInstructionHeads.agentId, agentId));
+        await seedEntryHead();
+      };
+
+      for (const [label, config, allowRecoveredManaged] of [["A2", () => ({}), false], ["B2", () => b2Config(), true], ["B3", () => b3Config(), true]] as const) {
+        it(`${label}: a pending-approval rejection inside the repair leaves every root, the marker, config, revisions and audit unchanged`, async () => {
+          await firstAdoptionState();
+          await setConfig(config());
+          await setStatus("pending_approval");
+          const before = await unchangedSnapshot();
+          expect(before.marker).toBe(false);
+          const { seen, callback } = observedRepair();
+          await expect(recoveredWrite(INCOMING, hashOf(MANAGED_NOTE), { allowRecoveredManaged, repairConfig: callback }))
+            .rejects.toMatchObject({ status: 409, details: { code: "pending_approval_agent_config_frozen" } });
+          // The repair ran before any file change.
+          expect(seen).toEqual([{ note: MANAGED_NOTE, entry: ENTRY, marker: false }]);
+          expect(await unchangedSnapshot()).toEqual(before);
+          expect(await fs.readFile(path.join(managedRoot, NOTE), "utf8")).toBe(MANAGED_NOTE);
+          expect(await fs.readFile(path.join(managedRoot, entryFile), "utf8")).toBe(ENTRY);
+          expect(await fs.readFile(path.join(staleRoot, NOTE), "utf8")).toBe(STALE_NOTE);
+        });
+      }
+
+      it("a successful repair still runs before the write and the save then writes, adopts, revises and audits once", async () => {
+        await firstAdoptionState();
+        await setConfig(b3Config());
+        const secrets = () => db.select().from(companySecrets).where(eq(companySecrets.companyId, companyId));
+        const secretsBefore = await secrets();
+        const { seen, callback } = observedRepair();
+        await expect(recoveredWrite(INCOMING, hashOf(MANAGED_NOTE), { allowRecoveredManaged: true, repairConfig: callback }))
+          .resolves.toEqual({ contentHash: hashOf(INCOMING), changed: true });
+        // Normalizing an already-persisted configuration creates no secret outside the transaction.
+        expect(await secrets()).toEqual(secretsBefore);
+        expect(seen).toEqual([{ note: MANAGED_NOTE, entry: ENTRY, marker: false }]);
+        expect(await fs.readFile(path.join(managedRoot, NOTE), "utf8")).toBe(INCOMING);
+        expect(await fs.readFile(path.join(managedRoot, entryFile), "utf8")).toBe(HEAD_ENTRY);
+        expect(await markerPresent()).toBe(true);
+        expect((await loadAgent()).adapterConfig).toEqual(repairedConfig());
+        expect(await revisions()).toHaveLength(1);
+        expect(await activity()).toHaveLength(1);
+      });
+
+      it("a stale base, an identical save and a delete never call the repair", async () => {
+        await setConfig(b3Config());
+        await setStatus("pending_approval");
+        const { seen, callback } = observedRepair();
+        const options = { allowRecoveredManaged: true, repairConfig: callback };
+        const before = await unchangedSnapshot();
+        await expect(recoveredWrite(INCOMING, hashOf(OTHER), options)).rejects.toMatchObject({ status: 409, details: { code: "AGENT_FILE_CONFLICT" } });
+        expect(await unchangedSnapshot()).toEqual(before);
+        await expect(recoveredWrite(MANAGED_NOTE, hashOf(MANAGED_NOTE), options)).resolves.toEqual({ contentHash: hashOf(MANAGED_NOTE), changed: false });
+        await expect(recoveredWrite(null, hashOf(MANAGED_NOTE), options)).resolves.toEqual({ contentHash: null, changed: true });
+        expect(seen).toHaveLength(0);
+        expect((await loadAgent()).adapterConfig).toEqual(b3Config());
+        expect(await revisions()).toHaveLength(0);
+      });
+
+      describe("Claude OAuth binding", () => {
+        const binding = { type: "user_secret_ref", key: "CLAUDE_CODE_OAUTH_TOKEN" };
+        const setClaude = () => db.update(agents).set({ adapterType: "claude_local" }).where(eq(agents.id, agentId));
+
+        it("a pre-existing invalid binding configuration rejects inside the repair with no file change", async () => {
+          await firstAdoptionState();
+          await setClaude();
+          await setConfig({ ...b3Config(), env: { CLAUDE_CODE_OAUTH_TOKEN: binding, ANTHROPIC_API_KEY: { type: "plain", value: "SENTINEL-SYNTHETIC-KEY" } } });
+          const before = await unchangedSnapshot();
+          const { seen, callback } = observedRepair();
+          await expect(recoveredWrite(INCOMING, hashOf(MANAGED_NOTE), { allowRecoveredManaged: true, repairConfig: callback }))
+            .rejects.toMatchObject({ status: 409, details: { code: "claude_oauth_credential_conflict" } });
+          expect(seen).toEqual([{ note: MANAGED_NOTE, entry: ENTRY, marker: false }]);
+          expect(await unchangedSnapshot()).toEqual(before);
+        });
+
+        it("an existing valid binding is kept unchanged by a successful repair", async () => {
+          await setClaude();
+          await setConfig({ ...b3Config(), env: { CLAUDE_CODE_OAUTH_TOKEN: binding } });
+          await expect(recoveredWrite(INCOMING, hashOf(MANAGED_NOTE))).resolves.toMatchObject({ changed: true });
+          const stored = (await loadAgent()).adapterConfig as Record<string, unknown>;
+          expect(stored).toMatchObject({ instructionsRootPath: managedRoot, env: { CLAUDE_CODE_OAUTH_TOKEN: binding } });
+          expect(Object.keys(stored.env as Record<string, unknown>)).toEqual(["CLAUDE_CODE_OAUTH_TOKEN"]);
+          expect(await fs.readFile(path.join(managedRoot, NOTE), "utf8")).toBe(INCOMING);
+          expect(await revisions()).toHaveLength(1);
+        });
+      });
     });
 
     describe("G1 authorization for recovered-managed writes", () => {

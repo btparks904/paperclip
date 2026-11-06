@@ -272,8 +272,17 @@ export function agentFileStore(db: Db) {
         // recovered-managed) use the recovered entry and may need their stored
         // configuration repaired. Normal managed bundles keep their behavior.
         const recoveredOnly = recovered !== null && agentInstructionsBundleMode(agent) !== "managed" ? recovered : null;
-        const entryFile = recoveredOnly?.entryFile ?? deriveBundleState(agent).entryFile;
+        // The entry is protected under both the configured name and the name the
+        // recovery rules select from disk, as resolved on this locked row: either
+        // can be the entry the bundle reports, and neither may change here.
+        const entryFiles = new Set([deriveBundleState(agent).entryFile]);
+        if (recovered) entryFiles.add(recovered.entryFile);
         const relative = agentFilePath(input.path);
+        // Entry content changes only through the canonical instruction revision
+        // service. Refuse before any check that could adopt or write files.
+        if (input.bytes !== null && entryFiles.has(relative)) {
+          throw unprocessable("Entry edits require the canonical instruction commit service and baseRevisionId", { code: "INSTRUCTION_REVISION_REQUIRED" });
+        }
         if (input.bytes) assertFileSize(input.bytes.length, relative);
         // First adoption is validated against, not written, until this operation
         // passes its checks: a rejected save or delete changes no file bytes.
@@ -287,9 +296,8 @@ export function agentFileStore(db: Db) {
           return { contentHash: currentHash, changed: false };
         }
         if (currentHash !== input.baseHash) throw conflict("This file changed since it was read. Reload before saving.", { code: "AGENT_FILE_CONFLICT", path: relative, currentHash });
-        if (input.bytes === null && relative === entryFile) throw unprocessable("The configured instruction entry cannot be deleted");
+        if (input.bytes === null && entryFiles.has(relative)) throw unprocessable("The configured instruction entry cannot be deleted");
         if (input.bytes !== null) {
-          if (relative === entryFile) instructionBytes(input.bytes);
           // A quota check needs metadata only. Do not hash unrelated large
           // files while holding the editor's row lock for a one-file save.
           const snapshot = await scanAgentFiles(root);
@@ -309,16 +317,19 @@ export function agentFileStore(db: Db) {
           for (const name of ancestry(relative)) if (!snapshot.entries.has(name)) added.add(name);
           assertDirectorySize(total, snapshot.entries.size + added.size);
         }
-        await completeAgentFileAdoption(adoption);
-        if (input.bytes === null) await fs.unlink(await assertInstructionPathSafe(root, relative));
-        else await materializeInstructionBytes(root, relative, input.bytes);
         // Persist the configuration the unversioned save path would have stored
-        // (only on a changing save, never on a delete). The file bytes above are
-        // not transactional: if this or the audit below fails, the database rows
-        // roll back but the written file remains, as for any managed save.
+        // (only on a changing save, never on a delete). It runs before adoption
+        // and the file write, inside this transaction, so a rejected repair
+        // changes no file bytes and a later failure rolls its database rows back.
         if (input.bytes !== null && recoveredOnly?.repairedConfig && options?.repairConfig) {
           await options.repairConfig(tx, agent, recoveredOnly.repairedConfig);
         }
+        // The file bytes below are not transactional: if the audit fails, the
+        // database rows roll back but the written file remains, as for any
+        // managed save.
+        await completeAgentFileAdoption(adoption);
+        if (input.bytes === null) await fs.unlink(await assertInstructionPathSafe(root, relative));
+        else await materializeInstructionBytes(root, relative, input.bytes);
         await audit(tx, agent, bound, { path: relative, contentHash: incomingHash });
         return { contentHash: incomingHash, changed: true };
       // Always resolve recovery under the lock so an unconfigured bundle's
