@@ -307,6 +307,51 @@ describe("instruction entry aliases (letter case, Unicode form, file identity)",
         expect(await state()).toEqual(before);
       });
 
+      const marker = () => path.join(path.dirname(managedRoot), "file-sync", "adopted.json");
+      const adopted = () => fs.stat(marker()).then(() => true, () => false);
+      async function expectFirstAliasRejectedThenLegitimateApplied(projectedEntry: string) {
+        expect(await adopted()).toBe(false);
+        const baseline = await snapshotAgentFiles(managedRoot);
+        const before = await state();
+        // Two case variants of the entry, each on what would be the first write-back.
+        for (const alias of ["agents.md", "Agents.MD"]) {
+          const source = await sourceWith({ [entryFile]: ENTRY, [NOTE]: ALIAS, [alias]: ALIAS });
+          await expect(apply(source, baseline)).rejects.toMatchObject({ status: 409, details: { code: AGENT_FILES_ENTRY_CONFLICT, path: entryFile } });
+          // No marker, no head projection, no file, config, revision or activity change.
+          expect(await adopted()).toBe(false);
+          expect(await state()).toEqual(before);
+          expect(await read(managedRoot, entryFile)).toBe(ENTRY);
+          expect(await read(managedRoot, NOTE)).toBe(OTHER);
+        }
+        // A legitimate write-back afterwards completes adoption and applies normally.
+        const source = await sourceWith({ [entryFile]: ENTRY, [NOTE]: ALIAS });
+        await expect(apply(source, baseline)).resolves.toBeDefined();
+        expect(await adopted()).toBe(true);
+        expect(await read(managedRoot, entryFile)).toBe(projectedEntry);
+        expect(await read(managedRoot, NOTE)).toBe(ALIAS);
+        expect((await activity()).length).toBe(before.activity + 1);
+      }
+
+      it("rejects a first alias write-back before adoption when legacy heads exist", async () => {
+        await seedHead(entryFile);
+        await expectFirstAliasRejectedThenLegitimateApplied(HEAD_ENTRY);
+      });
+
+      it("rejects a first alias write-back before adoption when there are no legacy heads", async () => {
+        await expectFirstAliasRejectedThenLegitimateApplied(ENTRY);
+      });
+
+      it("rejects an alias write-back on an already adopted bundle without changing it", async () => {
+        await adopt();
+        expect(await adopted()).toBe(true);
+        const baseline = await snapshotAgentFiles(managedRoot);
+        const source = await sourceWith({ [entryFile]: ENTRY, [NOTE]: ALIAS, "agents.md": ALIAS });
+        const before = await state();
+        await expect(apply(source, baseline)).rejects.toMatchObject({ status: 409, details: { code: AGENT_FILES_ENTRY_CONFLICT, path: entryFile } });
+        expect(await state()).toEqual(before);
+        expect(await read(managedRoot, entryFile)).toBe(ENTRY);
+      });
+
       it("still applies ordinary changes, including files in a differently spelled ordinary folder", async () => {
         const baseline = await snapshotAgentFiles(managedRoot);
         const source = await sourceWith({ [entryFile]: ENTRY, [NOTE]: ALIAS, "NOTES/extra.md": OTHER, "notes/agents-guide.md": OTHER });

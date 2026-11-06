@@ -340,23 +340,17 @@ export function agentFileStore(db: Db) {
       }, { recoverManaged: true,
         allowRecoveredManaged: options?.allowRecoveredManaged === true, deferAdoption: true }),
     apply: (input: { companyId: string; agentId: string; sourceDir: string; baseline: DirectorySnapshot; checkpoint?: AgentFileManifest }, actor: AuthorizationActor) =>
-      locked(input.companyId, input.agentId, actor, true, async (tx, agent, root, bound) => {
+      locked(input.companyId, input.agentId, actor, true, async (tx, agent, root, bound, _recovered, adoption) => {
         const incoming = input.checkpoint ? checkpointSnapshot(input.checkpoint) : await snapshotAgentFiles(input.sourceDir);
         const entryPath = deriveBundleState(agent).entryFile;
-        if (incoming.entries.get(entryPath)?.kind !== "file") throw unprocessable("The configured instruction entry cannot be deleted");
-        if (!input.checkpoint || JSON.stringify(incoming.entries.get(entryPath)) !== JSON.stringify(input.baseline.entries.get(entryPath))) {
-          const entry = await readInstructionBytes(input.sourceDir, entryPath);
-          if (entry === null) throw unprocessable("The configured instruction entry cannot be deleted");
-          instructionBytes(entry);
-        }
-        // Previously saved/imported bytes must remain readable, including when
-        // over quota. Enforce limits on the incoming and resulting tree so a
-        // run can delete files to recover instead of being locked out forever.
-        const current = input.checkpoint ? checkpointSnapshot(await cachedAgentFileManifest(root)) : await snapshotAgentFiles(root, false);
         // A changed path that names the entry under another spelling (letter case
         // or Unicode form), or that replaces or removes a folder above the entry
         // under another spelling, would land on the entry on a case-insensitive
         // volume, past the stale-entry check below. Reject the whole write-back.
+        // The check reads only the baseline and incoming snapshots, so it runs
+        // before first adoption: a rejection leaves the adoption marker and the
+        // legacy head projections untouched. The checks after adoption keep
+        // their existing order.
         const entryKey = instructionPathKey(entryPath);
         for (const name of new Set([...input.baseline.entries, ...incoming.entries].map(([entryName]) => entryName))) {
           if (name === entryPath || JSON.stringify(input.baseline.entries.get(name)) === JSON.stringify(incoming.entries.get(name))) continue;
@@ -368,6 +362,17 @@ export function agentFileStore(db: Db) {
               { code: AGENT_FILES_ENTRY_CONFLICT, path: entryPath });
           }
         }
+        await completeAgentFileAdoption(adoption);
+        if (incoming.entries.get(entryPath)?.kind !== "file") throw unprocessable("The configured instruction entry cannot be deleted");
+        if (!input.checkpoint || JSON.stringify(incoming.entries.get(entryPath)) !== JSON.stringify(input.baseline.entries.get(entryPath))) {
+          const entry = await readInstructionBytes(input.sourceDir, entryPath);
+          if (entry === null) throw unprocessable("The configured instruction entry cannot be deleted");
+          instructionBytes(entry);
+        }
+        // Previously saved/imported bytes must remain readable, including when
+        // over quota. Enforce limits on the incoming and resulting tree so a
+        // run can delete files to recover instead of being locked out forever.
+        const current = input.checkpoint ? checkpointSnapshot(await cachedAgentFileManifest(root)) : await snapshotAgentFiles(root, false);
         // Managed instruction saves take this same agent row lock, so canonical
         // content cannot change between this check and the merge below. A stale
         // entry rejects the whole write-back before any file is touched: no
@@ -425,6 +430,6 @@ export function agentFileStore(db: Db) {
           ...(input.checkpoint ? { snapshots: { source: incoming, current } } : {}) });
         await audit(tx, agent, bound, { sourceRunId: actor.runId, contract: AGENT_FILES_CONTRACT });
         return { storageWarning: storageWarning(total, finalEntries.size, fullFile) };
-      }),
+      }, { deferAdoption: true }),
   };
 }
