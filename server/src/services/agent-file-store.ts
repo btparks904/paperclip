@@ -41,7 +41,7 @@ export class AgentFileLimitError extends HttpError {
 function assertFileSize(size: number, relative: string) {
   if (size > MAX_AGENT_FILE_BYTES) throw new AgentFileLimitError(`Agent file "${relative}" exceeds the 256 MiB per-file limit`);
 }
-function assertDirectorySize(size: number, count: number) {
+export function assertDirectorySize(size: number, count: number) {
   if (size > MAX_AGENT_DIRECTORY_BYTES) throw new AgentFileLimitError("Agent directory exceeds the 2 GiB total storage limit");
   if (count > MAX_AGENT_DIRECTORY_ENTRIES) throw new AgentFileLimitError("Agent directory exceeds the 100,000-entry limit (files and folders)");
 }

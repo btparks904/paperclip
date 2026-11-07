@@ -2897,7 +2897,10 @@ export function agentRoutes(
   // Persist a recovered bundle's repaired instruction configuration through
   // the same normalization and agent-service update the unversioned save path
   // uses, inside the file store's locked transaction.
-  function repairInstructionsConfig(req: Request): AgentFileConfigRepair {
+  function repairInstructionsConfig(
+    req: Request,
+    source: "instructions_bundle_file_put" | "instructions_bundle_patch" | "instructions_path_patch" = "instructions_bundle_file_put",
+  ): AgentFileConfigRepair {
     const actor = getActorInfo(req);
     return async (tx, agent, adapterConfig) => {
       // The store transaction is a full Db for the services' queries. Normalize
@@ -2916,11 +2919,35 @@ export function agentRoutes(
           recordRevision: {
             createdByAgentId: actor.agentId,
             createdByUserId: actor.actorType === "user" ? actor.actorId : null,
-            source: "instructions_bundle_file_put",
+            source,
           },
         },
       );
     };
+  }
+
+  // Server-side instance-admin determination (never from the request body,
+  // query or headers); it only selects the detail level of a copy 409.
+  function isInstanceAdminActor(req: Request): boolean {
+    return req.actor.type === "board" && (req.actor.source === "local_implicit" || req.actor.isInstanceAdmin === true);
+  }
+
+  // Lock the agent row and refuse unless the bundle the route authorized
+  // against is still the one configured (target and config-only mode).
+  async function lockAgentForInstructionsChange(
+    tx: Parameters<Parameters<Db["transaction"]>[0]>[0],
+    existing: { id: string; companyId: string; name: string; adapterConfig: unknown },
+    expectedTarget: Awaited<ReturnType<typeof resolveInstructionWriteTarget>>,
+  ) {
+    const [current] = await tx.select().from(agentsTable)
+      .where(and(eq(agentsTable.id, existing.id), eq(agentsTable.companyId, existing.companyId))).for("update");
+    if (!current) return null;
+    const target = await resolveInstructionWriteTarget(current);
+    if (target.mode !== expectedTarget.mode || target.rootPath !== expectedTarget.rootPath
+      || agentInstructionsBundleMode(current) !== agentInstructionsBundleMode(existing)) {
+      throw conflict("The instructions bundle mode changed; reload and retry");
+    }
+    return current;
   }
 
   function adapterConfigTouchesInstructionsConfig(adapterConfig: Record<string, unknown>) {
@@ -5042,7 +5069,6 @@ export function agentRoutes(
     await assertCanManageInstructionsPath(req, existing);
     assertExternalInstructionsAdmin(req, existing);
 
-    const existingAdapterConfig = asRecord(existing.adapterConfig) ?? {};
     const explicitKey = asNonEmptyString(req.body.adapterConfigKey);
     const defaultKey = resolveInstructionsPathKey(existing.adapterType);
     const adapterConfigKey = explicitKey ?? defaultKey;
@@ -5053,32 +5079,51 @@ export function agentRoutes(
       return;
     }
 
-    const nextAdapterConfig: Record<string, unknown> = { ...existingAdapterConfig };
-    if (req.body.path === null) {
-      delete nextAdapterConfig[adapterConfigKey];
-    } else {
-      nextAdapterConfig[adapterConfigKey] = resolveInstructionsFilePath(req.body.path, existingAdapterConfig);
-    }
-
-    const syncedAdapterConfig = syncInstructionsBundleConfigFromFilePath(existing, nextAdapterConfig);
-    assertExternalInstructionsAdmin(req, { ...existing, adapterConfig: syncedAdapterConfig });
-    const normalizedAdapterConfig = await secretsSvc.normalizeAdapterConfigForPersistence(
-      existing.companyId,
-      syncedAdapterConfig,
-      { strictMode: strictSecretsMode, adapterType: existing.adapterType },
-    );
+    const buildPathConfig = (row: Parameters<typeof syncInstructionsBundleConfigFromFilePath>[0]) => {
+      const rowConfig = asRecord(row.adapterConfig) ?? {};
+      const nextAdapterConfig: Record<string, unknown> = { ...rowConfig };
+      if (req.body.path === null) {
+        delete nextAdapterConfig[adapterConfigKey];
+      } else {
+        nextAdapterConfig[adapterConfigKey] = resolveInstructionsFilePath(req.body.path, rowConfig);
+      }
+      return syncInstructionsBundleConfigFromFilePath(row, nextAdapterConfig);
+    };
+    // Fail fast on the unlocked read; the same check repeats on the locked row.
+    assertExternalInstructionsAdmin(req, { ...existing, adapterConfig: buildPathConfig(existing) });
+    const expectedTarget = await resolveInstructionWriteTarget(existing);
     const actor = getActorInfo(req);
-    const agent = await svc.update(
-      id,
-      { adapterConfig: normalizedAdapterConfig },
-      {
-        recordRevision: {
-          createdByAgentId: actor.agentId,
-          createdByUserId: actor.actorType === "user" ? actor.actorId : null,
-          source: "instructions_path_patch",
+    // Read-modify-write on the locked row, refusing if the bundle changed after
+    // the authorization checks above read it.
+    const agent = await db.transaction(async (tx) => {
+      const current = await lockAgentForInstructionsChange(tx, existing, expectedTarget);
+      if (!current) return null;
+      const syncedAdapterConfig = buildPathConfig(current);
+      assertExternalInstructionsAdmin(req, { ...current, adapterConfig: syncedAdapterConfig });
+      const txDb = tx as unknown as Db;
+      // A new instruction root must not activate a folder that a copy record
+      // marks as incomplete (same classifier and 409 as the bundle PATCH).
+      const nextTarget = await resolveInstructionWriteTarget({ ...current, adapterConfig: syncedAdapterConfig });
+      if (nextTarget.rootPath && nextTarget.rootPath !== expectedTarget.rootPath) {
+        await instructions.assertNoCopyIntentForRoot(tx, current, nextTarget.rootPath, isInstanceAdminActor(req));
+      }
+      const normalizedAdapterConfig = await secretService(txDb).normalizeAdapterConfigForPersistence(
+        current.companyId,
+        syncedAdapterConfig,
+        { strictMode: strictSecretsMode, adapterType: current.adapterType },
+      );
+      return agentService(txDb).update(
+        id,
+        { adapterConfig: normalizedAdapterConfig },
+        {
+          recordRevision: {
+            createdByAgentId: actor.agentId,
+            createdByUserId: actor.actorType === "user" ? actor.actorId : null,
+            source: "instructions_path_patch",
+          },
         },
-      },
-    );
+      );
+    });
     if (!agent) {
       res.status(404).json({ error: "Agent not found" });
       return;
@@ -5146,23 +5191,16 @@ export function agentRoutes(
     if (req.body.mode === "external") assertInstanceAdmin(req);
 
     const actor = getActorInfo(req);
-    const { bundle, adapterConfig } = await instructions.updateBundle(existing, req.body);
-    const normalizedAdapterConfig = await secretsSvc.normalizeAdapterConfigForPersistence(
-      existing.companyId,
-      adapterConfig,
-      { strictMode: strictSecretsMode, adapterType: existing.adapterType },
-    );
-    await svc.update(
-      id,
-      { adapterConfig: normalizedAdapterConfig },
-      {
-        recordRevision: {
-          createdByAgentId: actor.agentId,
-          createdByUserId: actor.actorType === "user" ? actor.actorId : null,
-          source: "instructions_bundle_patch",
-        },
-      },
-    );
+    // Plan, copy and persist under the agent row lock, refusing if the bundle
+    // changed after the authorization checks above read it.
+    const { bundle } = await instructions.updateBundle(existing, req.body, {
+      expectedTarget: await resolveInstructionWriteTarget(existing),
+      expectedConfigMode: agentInstructionsBundleMode(existing),
+      persist: (tx, current, adapterConfig) =>
+        repairInstructionsConfig(req, "instructions_bundle_patch")(tx, current as Parameters<AgentFileConfigRepair>[1], adapterConfig),
+      isInstanceAdmin: isInstanceAdminActor(req),
+      actor: { actorType: actor.actorType, actorId: actor.actorId, runId: actor.runId },
+    });
 
     await logActivity(db, {
       companyId: existing.companyId,
@@ -5238,13 +5276,16 @@ export function agentRoutes(
           contentHash: receipt.revision.contentHash }).catch(() => undefined);
       }
       if (req.body.clearLegacyPromptTemplate) {
-        const fresh = await svc.getById(existing.id);
-        if (fresh) {
+        // Read-modify-write on the locked row, not an unlocked fresh read.
+        await db.transaction(async (tx) => {
+          const [fresh] = await tx.select().from(agentsTable)
+            .where(and(eq(agentsTable.id, existing.id), eq(agentsTable.companyId, existing.companyId))).for("update");
+          if (!fresh) return;
           const adapterConfig = { ...asRecord(fresh.adapterConfig) };
           delete adapterConfig.promptTemplate;
           delete adapterConfig.bootstrapPromptTemplate;
-          await svc.update(existing.id, { adapterConfig });
-        }
+          await agentService(tx as unknown as Db).update(existing.id, { adapterConfig });
+        });
       }
       res.json(instructionFileDetail(receipt, receipt));
       return;
@@ -5275,23 +5316,11 @@ export function agentRoutes(
       // not in either root.
       expectedMode: req.body.path === "promptTemplate.legacy.md" ? undefined : "external",
       expectedTarget: req.body.path === "promptTemplate.legacy.md" ? undefined : await resolveInstructionWriteTarget(existing),
+      // Persist on the locked row, so a bundle PATCH queued behind this write
+      // is not reverted by a configuration built from the pre-PATCH row.
+      persistConfig: (tx, current, adapterConfig) =>
+        repairInstructionsConfig(req)(tx, current as Parameters<AgentFileConfigRepair>[1], adapterConfig),
     });
-    const normalizedAdapterConfig = await secretsSvc.normalizeAdapterConfigForPersistence(
-      existing.companyId,
-      result.adapterConfig,
-      { strictMode: strictSecretsMode, adapterType: existing.adapterType },
-    );
-    await svc.update(
-      id,
-      { adapterConfig: normalizedAdapterConfig },
-      {
-        recordRevision: {
-          createdByAgentId: actor.agentId,
-          createdByUserId: actor.actorType === "user" ? actor.actorId : null,
-          source: "instructions_bundle_file_put",
-        },
-      },
-    );
 
     await logActivity(db, {
       companyId: existing.companyId,
