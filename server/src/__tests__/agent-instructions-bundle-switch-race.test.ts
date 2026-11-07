@@ -336,7 +336,7 @@ describe("instructions bundle copy-and-switch", () => {
       expect(await ls(ext)).toEqual(["AGENTS.md", "README.txt"]);
       expect(await read(ext, "README.txt")).toBe("SENTINEL-OPERATOR\n");
       expect(await read(ext, "AGENTS.md")).toBe(ENTRY);
-      expect(await completionRows()).toHaveLength(0);
+      expect(await completionRows()).toHaveLength(1);
       expect(await intents()).toEqual([]);
     });
 
@@ -472,6 +472,36 @@ describe("instructions bundle copy-and-switch", () => {
       expect(raced).toBe(1);
       expect(result.ok).toBe(true);
       expect(await read(ext, "AGENTS.md")).toBe(outside);
+    });
+    it("W1b: a missing-entry write that fails after creating the file leaves a record; the retry refuses and keeps the bytes", async () => {
+      await seedSource(ext, { "README.txt": "SENTINEL-OPERATOR\n" });
+      const entryPath = path.join(ext, "AGENTS.md");
+      const real = fs.open.bind(fs);
+      vi.spyOn(fs, "open").mockImplementation((async (file: Parameters<typeof fs.open>[0], flags?: any, mode?: any) => {
+        const handle = await real(file, flags, mode);
+        if (String(file) === entryPath && flags === "wx") {
+          handle.writeFile = async (data: any) => { await handle.write(Buffer.from(data).subarray(0, 5)); throw errno("ENOSPC"); };
+        }
+        return handle;
+      }) as typeof fs.open);
+      const before = await configOf();
+      expect(await patch({ mode: "external", rootPath: ext })).toMatchObject({ ok: false, code: "ENOSPC" });
+      vi.restoreAllMocks();
+      expect(await configOf()).toEqual(before);
+      const truncated = await fs.readFile(entryPath);
+      expect(truncated.length).toBe(5);
+      expect(await intents()).toHaveLength(1);
+      expect(await patch({ mode: "external", rootPath: ext })).toMatchObject({ ok: false, status: 409, code: COPY_INCOMPLETE });
+      expect(await fs.readFile(entryPath)).toEqual(truncated);
+      expect(await configOf()).toEqual(before);
+    });
+
+    it("W1c: a successful missing-entry write records completion and removes its record", async () => {
+      await seedSource(ext, { "README.txt": "SENTINEL-OPERATOR\n" });
+      expect((await patch({ mode: "external", rootPath: ext })).ok).toBe(true);
+      expect(await intents()).toEqual([]);
+      expect(await completionRows()).toHaveLength(1);
+      expect((await completionRows())[0]!.details).toMatchObject({ plannedCount: 1, plannedBytes: Buffer.byteLength(ENTRY) });
     });
   });
 

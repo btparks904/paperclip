@@ -1071,6 +1071,66 @@ export function agentInstructionsService(db?: Db) {
   // Switch or reconfigure the bundle under the agent row lock (consolidated
   // 5.3, addenda 2 and 3). There is no unlocked form: export, copy, the
   // configuration persist and the completion record share one transaction.
+  /** Writes our durable record, then re-scans; any other matching record aborts before a write. */
+  async function beginCopyIntent(
+    tx: InstructionTx,
+    current: AgentLike,
+    options: UpdateBundleOptions,
+    identity: DestinationIdentity,
+    rootPath: string,
+    operationId: string,
+    sourceRoot: string | null,
+    plannedCount: number,
+    plannedBytes: number,
+  ): Promise<string> {
+    const file = await createCopyIntent({
+      version: 1,
+      operationId,
+      companyId: current.companyId,
+      agentId: current.id,
+      destination: identity,
+      sourceRoot,
+      plannedCount,
+      plannedBytes,
+      startedAt: new Date().toISOString(),
+    });
+    try {
+      await classifyCopyIntents(tx, current, options, identity, rootPath, true, operationId);
+    } catch (error) {
+      await fs.unlink(file).catch(() => undefined);
+      throw error;
+    }
+    return file;
+  }
+
+  /** Completion evidence on tx (addendum 2): an admin hint only, never an authorization. */
+  async function recordCopyCompletion(
+    tx: InstructionTx,
+    current: AgentLike,
+    options: UpdateBundleOptions,
+    operationId: string,
+    identity: DestinationIdentity,
+    plannedCount: number,
+    plannedBytes: number,
+  ) {
+    await tx.insert(activityLog).values({
+      companyId: current.companyId,
+      actorType: options.actor.actorType,
+      actorId: options.actor.actorId,
+      runId: options.actor.runId ?? null,
+      action: INSTRUCTION_BUNDLE_COPY_COMPLETED_ACTION,
+      entityType: "agent",
+      entityId: current.id,
+      agentId: current.id,
+      details: {
+        operationId,
+        destination: { ino: identity.ino, birthtimeNs: identity.birthtimeNs, pathKeyHash: pathKeyHash(identity.pathKey) },
+        plannedCount,
+        plannedBytes,
+      },
+    });
+  }
+
   async function updateBundle(
     agent: AgentLike,
     input: UpdateBundleInput,
@@ -1129,54 +1189,29 @@ export function agentInstructionsService(db?: Db) {
         const entryBytes = existingFiles.includes(nextEntryFile) ? null : await sourceEntryBytes(state, null, nextEntryFile, current);
         await options.persist(tx, current, nextConfig);
         if (entryBytes) {
+          // The entry write is guarded like a copy: a record is durable before
+          // the file is created, so a write that fails after creating it (for
+          // example ENOSPC) leaves a record that refuses the next PATCH instead
+          // of a truncated entry that would be adopted.
+          const operationId = randomUUID();
+          ownIntentFile = await beginCopyIntent(tx, current, options, identity, nextRootPath, operationId, null, 1, entryBytes.length);
           const entryPath = await assertInstructionPathSafe(nextRootPath, nextEntryFile);
           await fs.mkdir(path.dirname(entryPath), { recursive: true });
           await writeFileExclusive(entryPath, entryBytes, { existingIsPresent: true });
+          await recordCopyCompletion(tx, current, options, operationId, identity, 1, entryBytes.length);
         }
       } else {
         // Step 5: pass 1; step 6: persist before anything is written.
         const plan = await planBundleCopy(state, current, nextEntryFile);
         await options.persist(tx, current, nextConfig);
-        // Step 7: our intent, durable before the first destination write.
+        // Steps 7 and 8: our intent, durable before the first destination
+        // write, then the peer re-scan.
         const operationId = randomUUID();
-        ownIntentFile = await createCopyIntent({
-          version: 1,
-          operationId,
-          companyId: current.companyId,
-          agentId: current.id,
-          destination: identity,
-          sourceRoot: plan.sourceRoot,
-          plannedCount: plan.files.length,
-          plannedBytes: plan.bytes,
-          startedAt: new Date().toISOString(),
-        });
-        // Step 8: peer re-scan; any other matching record aborts before a write.
-        try {
-          await classifyCopyIntents(tx, current, options, identity, nextRootPath, true, operationId);
-        } catch (error) {
-          await fs.unlink(ownIntentFile).catch(() => undefined);
-          ownIntentFile = null;
-          throw error;
-        }
+        ownIntentFile = await beginCopyIntent(tx, current, options, identity, nextRootPath, operationId, plan.sourceRoot, plan.files.length, plan.bytes);
         // Steps 9 to 11: copy, verify, completion evidence on tx.
         await copyPlannedFiles(nextRootPath, plan);
         await verifyCopiedFiles(nextRootPath, plan);
-        await tx.insert(activityLog).values({
-          companyId: current.companyId,
-          actorType: options.actor.actorType,
-          actorId: options.actor.actorId,
-          runId: options.actor.runId ?? null,
-          action: INSTRUCTION_BUNDLE_COPY_COMPLETED_ACTION,
-          entityType: "agent",
-          entityId: current.id,
-          agentId: current.id,
-          details: {
-            operationId,
-            destination: { ino: identity.ino, birthtimeNs: identity.birthtimeNs, pathKeyHash: pathKeyHash(identity.pathKey) },
-            plannedCount: plan.files.length,
-            plannedBytes: plan.bytes,
-          },
-        });
+        await recordCopyCompletion(tx, current, options, operationId, identity, plan.files.length, plan.bytes);
       }
       const bundle = await getBundle({ ...current, adapterConfig: nextConfig });
       return { bundle, adapterConfig: nextConfig };
