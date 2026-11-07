@@ -25,6 +25,7 @@ import { agentService } from "../services/agents.js";
 import { secretService } from "../services/secrets.js";
 import { buildHostServices } from "../services/plugin-host-services.js";
 import { activityRoutes } from "../routes/activity.js";
+import { agentRoutes } from "../routes/agents.js";
 import { errorHandler } from "../middleware/index.js";
 import { startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 
@@ -928,6 +929,74 @@ describe("instructions bundle copy-and-switch", () => {
       expect(other).toMatchObject({ ok: false, status: 409, code: COPY_INCOMPLETE,
         message: "A previous instructions copy for this agent did not finish. An instance administrator must resolve it." });
       expect(other.ok === false && other.details).toEqual({ code: COPY_INCOMPLETE });
+    });
+  });
+
+  describe("W4: the instructions-path PATCH never activates a partial copy", () => {
+    const pathApp = () => {
+      const app = express();
+      app.use(express.json());
+      app.use((req, _res, next) => {
+        (req as any).actor = { type: "board", userId, companyIds: [companyId], source: "local_implicit", isInstanceAdmin: true };
+        next();
+      });
+      app.use("/api", agentRoutes(db as any));
+      app.use(errorHandler);
+      return app;
+    };
+    const setPath = (filePath: string) => request(pathApp()).patch(`/api/agents/${agentId}/instructions-path`)
+      .send({ path: filePath, adapterConfigKey: "instructionsFilePath" });
+    async function failedCopy() {
+      let count = 0;
+      spyOpen((file, flags) => { if (isDestWrite(file, flags) && ++count === 2) throw errno("EIO"); });
+      expect((await patch({ mode: "external", rootPath: ext })).ok).toBe(false);
+      vi.restoreAllMocks();
+      return { records: await intents(), listing: await ls(ext), entry: await fs.readFile(path.join(ext, "AGENTS.md")).catch(() => null) };
+    }
+    async function snapshot() {
+      return {
+        config: await configOf(),
+        revisions: (await db.select().from(agentConfigRevisions).where(eq(agentConfigRevisions.agentId, agentId))).length,
+        activity: (await db.select().from(activityLog).where(eq(activityLog.companyId, companyId))).length,
+        records: await intents(),
+        listing: await ls(ext),
+        source: await ls(managedRoot),
+      };
+    }
+
+    it("refuses the failed-copy folder, its case variant, a dotted spelling and a symlink, changing nothing", async () => {
+      const failed = await failedCopy();
+      expect(failed.records).toHaveLength(1);
+      const before = await snapshot();
+      const link = path.join(home, "link-to-ext");
+      await fs.symlink(ext, link);
+      const spellings = [
+        path.join(ext, "AGENTS.md"),
+        path.join(home, "EXT", agentId, "AGENTS.md"),
+        `${ext}/notes/../AGENTS.md`,
+        path.join(link, "AGENTS.md"),
+      ];
+      for (const spelling of spellings) {
+        const res = await setPath(spelling);
+        expect(res.status, `${spelling}: ${JSON.stringify(res.body)}`).toBe(409);
+        expect(JSON.stringify(res.body)).toContain(COPY_INCOMPLETE);
+        expect(await snapshot(), spelling).toEqual(before);
+        expect(await fs.readFile(path.join(ext, "AGENTS.md")).catch(() => null)).toEqual(failed.entry);
+      }
+      await fs.rm(link);
+    });
+
+    it("still switches to a folder with no matching record, and refuses again once a record exists", async () => {
+      const clean = path.join(home, "clean", agentId);
+      await seedSource(clean, { "AGENTS.md": "SENTINEL-CLEAN\n" });
+      const ok = await setPath(path.join(clean, "AGENTS.md"));
+      expect(ok.status, JSON.stringify(ok.body)).toBe(200);
+      expect((await configOf()).instructionsRootPath).toBe(clean);
+      await db.update(agents).set({ adapterConfig: cfg("managed", managedRoot) }).where(eq(agents.id, agentId));
+      await failedCopy();
+      const res = await setPath(path.join(ext, "AGENTS.md"));
+      expect(res.status).toBe(409);
+      expect((await configOf()).instructionsBundleMode).toBe("managed");
     });
   });
 

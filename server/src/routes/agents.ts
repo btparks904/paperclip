@@ -5101,6 +5101,12 @@ export function agentRoutes(
       const syncedAdapterConfig = buildPathConfig(current);
       assertExternalInstructionsAdmin(req, { ...current, adapterConfig: syncedAdapterConfig });
       const txDb = tx as unknown as Db;
+      // A new instruction root must not activate a folder that a copy record
+      // marks as incomplete (same classifier and 409 as the bundle PATCH).
+      const nextTarget = await resolveInstructionWriteTarget({ ...current, adapterConfig: syncedAdapterConfig });
+      if (nextTarget.rootPath && nextTarget.rootPath !== expectedTarget.rootPath) {
+        await instructions.assertNoCopyIntentForRoot(tx, current, nextTarget.rootPath, isInstanceAdminActor(req));
+      }
       const normalizedAdapterConfig = await secretService(txDb).normalizeAdapterConfigForPersistence(
         current.companyId,
         syncedAdapterConfig,

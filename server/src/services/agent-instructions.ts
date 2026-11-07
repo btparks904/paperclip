@@ -555,6 +555,23 @@ type CopyIntent = {
 type IntentEntry = { file: string; intent: CopyIntent | null };
 
 /** Identity of the directory the copy writes into (after mkdir -p). */
+async function pathOnlyIdentity(resolved: string): Promise<DestinationIdentity> {
+  let ancestor = resolved;
+  const rest: string[] = [];
+  for (;;) {
+    try {
+      const real = await fs.realpath(ancestor);
+      const canonicalPath = path.join(real, ...rest);
+      return { ino: "", dev: "", birthtimeNs: "", canonicalPath, pathKey: instructionPathKey(canonicalPath) };
+    } catch (error) {
+      const parent = path.dirname(ancestor);
+      if (parent === ancestor) throw error;
+      rest.unshift(path.basename(ancestor));
+      ancestor = parent;
+    }
+  }
+}
+
 async function captureDestinationIdentity(rootPath: string): Promise<DestinationIdentity> {
   const canonicalPath = await fs.realpath(rootPath);
   const stat = await fs.lstat(canonicalPath, { bigint: true });
@@ -880,7 +897,7 @@ export function agentInstructionsService(db?: Db) {
   // hint is computed only for them, and never decides anything.
   async function copyIncompleteError(
     tx: InstructionTx,
-    options: UpdateBundleOptions,
+    options: Pick<UpdateBundleOptions, "isInstanceAdmin">,
     blocking: IntentEntry,
     rootPath: string,
   ) {
@@ -938,7 +955,7 @@ export function agentInstructionsService(db?: Db) {
   async function classifyCopyIntents(
     tx: InstructionTx,
     current: AgentLike,
-    options: UpdateBundleOptions,
+    options: Pick<UpdateBundleOptions, "isInstanceAdmin">,
     identity: DestinationIdentity,
     rootPath: string,
     destinationEmpty: boolean,
@@ -1129,6 +1146,27 @@ export function agentInstructionsService(db?: Db) {
         plannedBytes,
       },
     });
+  }
+
+  /**
+   * Refuses (409) when any copy record matches rootPath, for configuration
+   * writers other than the bundle PATCH that switch the instruction root
+   * (the instructions-path PATCH). Uses the same classifier as updateBundle,
+   * treating the destination as populated, so nothing is removed and every
+   * matching record refuses; recovery stays with the operator.
+   */
+  async function assertNoCopyIntentForRoot(tx: InstructionTx, agent: AgentLike, rootPath: string, isInstanceAdmin: boolean) {
+    const resolved = path.resolve(rootPath);
+    const stat = await fs.stat(resolved, { bigint: true }).catch((error: NodeJS.ErrnoException) => {
+      if (error.code === "ENOENT" || error.code === "ENOTDIR") return null;
+      throw error;
+    });
+    // A folder that is missing (or not a folder) still matches a record by
+    // its folded path, taken from the nearest existing ancestor's real path.
+    const identity: DestinationIdentity = stat?.isDirectory()
+      ? await captureDestinationIdentity(resolved)
+      : await pathOnlyIdentity(resolved);
+    await classifyCopyIntents(tx, agent, { isInstanceAdmin }, identity, resolved, false, null);
   }
 
   async function updateBundle(
@@ -1472,6 +1510,7 @@ export function agentInstructionsService(db?: Db) {
     getBundle,
     readFile,
     updateBundle,
+    assertNoCopyIntentForRoot,
     writeFile,
     deleteFile,
     exportFiles,

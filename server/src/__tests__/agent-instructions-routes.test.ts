@@ -21,6 +21,7 @@ const mockAgentInstructionsService = vi.hoisted(() => ({
   getBundle: vi.fn(),
   readFile: vi.fn(),
   updateBundle: vi.fn(),
+  assertNoCopyIntentForRoot: vi.fn(),
   writeFile: vi.fn(),
   deleteFile: vi.fn(),
   exportFiles: vi.fn(),
@@ -1201,6 +1202,8 @@ describe("agent instructions bundle routes", () => {
       const ok = await requestApp(await createApp(boardActor(), db), url => request(url).patch(pathUrl).send({ path: "/srv/paperclip/prompts/AGENTS.md" }));
       expect(ok.status, JSON.stringify(ok.body)).toBe(200);
       expect(forUpdate).toHaveBeenCalledOnce();
+      // The new root is checked for copy records on the locked transaction.
+      expect(mockAgentInstructionsService.assertNoCopyIntentForRoot).toHaveBeenCalledWith(tx, expect.objectContaining({ id: agentId }), "/srv/paperclip/prompts", true);
       expect(mockSecretServiceFactory.mock.calls.some((call) => call[0] === tx)).toBe(true);
       expect(mockAgentService.update).toHaveBeenCalledWith(agentId, expect.anything(),
         { recordRevision: expect.objectContaining({ source: "instructions_path_patch" }) });
@@ -1210,6 +1213,22 @@ describe("agent instructions bundle routes", () => {
       const refused = await requestApp(await createApp(boardActor(), db), url => request(url).patch(pathUrl).send({ path: "/srv/paperclip/prompts/AGENTS.md" }));
       expect(refused.status, JSON.stringify(refused.body)).toBe(409);
       expect(refused.body.error).toBe("The instructions bundle mode changed; reload and retry");
+      expect(mockAgentService.update).not.toHaveBeenCalled();
+      expect(mockLogActivity).not.toHaveBeenCalled();
+    });
+
+    it("W4: a copy 409 from the root check is returned unchanged and nothing is persisted or recorded", async () => {
+      const existing = { ...makeAgent(), adapterConfig: managedConfig };
+      mockAgentService.getById.mockResolvedValue(existing);
+      const { conflict } = await vi.importActual<typeof import("../errors.js")>("../errors.js");
+      mockAgentInstructionsService.assertNoCopyIntentForRoot.mockRejectedValueOnce(conflict(
+        "A previous instructions copy for this agent did not finish. An instance administrator must resolve it.", { code: "INSTRUCTION_BUNDLE_COPY_INCOMPLETE" }));
+      const { db } = lockingDb(() => existing);
+      const res = await requestApp(await createApp(boardActor(), db), url => request(url).patch(`/api/agents/${agentId}/instructions-path`)
+        .send({ path: "/srv/paperclip/prompts/AGENTS.md" }));
+      expect(res.status, JSON.stringify(res.body)).toBe(409);
+      expect(JSON.stringify(res.body)).toContain("INSTRUCTION_BUNDLE_COPY_INCOMPLETE");
+      expect(mockSecretService.normalizeAdapterConfigForPersistence).not.toHaveBeenCalled();
       expect(mockAgentService.update).not.toHaveBeenCalled();
       expect(mockLogActivity).not.toHaveBeenCalled();
     });
