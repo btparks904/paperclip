@@ -3,7 +3,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { and, eq } from "drizzle-orm";
 import { agentInstructionHeads, agents, type Db } from "@paperclipai/db";
-import { instructionPath, assertInstructionPathSafe, instructionBytes, readInstructionBytes } from "./agent-instruction-files.js";
+import { instructionPath, instructionPathKey, matchesInstructionEntry, assertInstructionPathSafe, instructionBytes, readInstructionBytes } from "./agent-instruction-files.js";
 import { conflict, notFound, unprocessable } from "../errors.js";
 import { resolveHomeAwarePath, resolvePaperclipInstanceRoot } from "../home-paths.js";
 
@@ -526,9 +526,12 @@ export function syncInstructionsBundleConfigFromFilePath(
 export function agentInstructionsService(db?: Db) {
   async function assertUnversionedEntry(agent: AgentLike, entryFile: string, connection: Db | Parameters<Parameters<Db["transaction"]>[0]>[0] | undefined = db) {
     if (!connection) throw unprocessable("Bundle initialization requires the database-backed instructions service");
-    const [head] = await connection.select().from(agentInstructionHeads).where(and(eq(agentInstructionHeads.companyId, agent.companyId),
-      eq(agentInstructionHeads.agentId, agent.id), eq(agentInstructionHeads.entryFile, entryFile)));
-    if (head) throw unprocessable("This entry has revision history. Use the instruction content API with its baseRevisionId to update it.", { code: "INSTRUCTION_REVISION_REQUIRED" });
+    // Match historical entries by folded key: on a case-insensitive volume a
+    // case or Unicode variant of a historical entry names that entry.
+    const heads = await connection.select({ entryFile: agentInstructionHeads.entryFile }).from(agentInstructionHeads)
+      .where(and(eq(agentInstructionHeads.companyId, agent.companyId), eq(agentInstructionHeads.agentId, agent.id)));
+    const key = instructionPathKey(entryFile);
+    if (heads.some(head => instructionPathKey(head.entryFile) === key)) throw unprocessable("This entry has revision history. Use the instruction content API with its baseRevisionId to update it.", { code: "INSTRUCTION_REVISION_REQUIRED" });
   }
   async function getBundle(agent: AgentLike): Promise<AgentInstructionsBundle> {
     const state = await recoverManagedBundleState(agent, deriveBundleState(agent));
@@ -696,7 +699,7 @@ export function agentInstructionsService(db?: Db) {
     }
 
     const configured = await recoverManagedBundleState(agent, current);
-    if (normalizeRelativeFilePath(relativePath) === configured.entryFile) {
+    if (await matchesInstructionEntry(configured.rootPath, normalizeRelativeFilePath(relativePath), [configured.entryFile])) {
       throw unprocessable("Entry edits require the canonical instruction commit service and baseRevisionId", { code: "INSTRUCTION_REVISION_REQUIRED" });
     }
     if (configured.mode !== "external") agentFilePath(relativePath);
@@ -725,7 +728,7 @@ export function agentInstructionsService(db?: Db) {
     }
     if (!state.rootPath) throw notFound("Agent instructions bundle is not configured");
     const normalizedPath = normalizeRelativeFilePath(relativePath);
-    if (normalizedPath === state.entryFile) {
+    if (await matchesInstructionEntry(state.rootPath, normalizedPath, [state.entryFile])) {
       throw unprocessable("Cannot delete the bundle entry file");
     }
     const absolutePath = await assertInstructionPathSafe(state.rootPath, normalizedPath);

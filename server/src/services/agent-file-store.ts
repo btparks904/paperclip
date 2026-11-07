@@ -9,7 +9,7 @@ import { agents, activityLog, agentInstructionHeads, agentInstructionRevisions, 
 import { captureDirectorySnapshot, mergeDirectoryWithBaseline, type DirectorySnapshot, type SnapshotEntry } from "@paperclipai/adapter-utils/workspace-restore-merge";
 import { HttpError, conflict, notFound, unprocessable } from "../errors.js";
 import { authorizeInstructionCommit, authorizeInstructionRead } from "./agent-instruction-authorization.js";
-import { assertInstructionPathSafe, instructionPath, instructionBytes, materializeInstructionBytes, readInstructionBytes, MAX_INSTRUCTION_BYTES } from "./agent-instruction-files.js";
+import { assertInstructionPathSafe, instructionPath, instructionPathKey, matchesInstructionEntry, instructionBytes, materializeInstructionBytes, readInstructionBytes, MAX_INSTRUCTION_BYTES } from "./agent-instruction-files.js";
 import { agentInstructionsBundleMode, deriveBundleState, resolveManagedInstructionsRoot, resolveRecoveredManagedBundle, type RecoveredManagedBundle } from "./agent-instructions.js";
 import type { AuthorizationActor } from "./authorization.js";
 
@@ -278,9 +278,12 @@ export function agentFileStore(db: Db) {
         const entryFiles = new Set([deriveBundleState(agent).entryFile]);
         if (recovered) entryFiles.add(recovered.entryFile);
         const relative = agentFilePath(input.path);
+        // On a case-insensitive volume "agents.md" opens, replaces and unlinks
+        // "AGENTS.md", so the entry is matched by folded key and file identity.
+        const isEntry = await matchesInstructionEntry(root, relative, entryFiles);
         // Entry content changes only through the canonical instruction revision
         // service. Refuse before any check that could adopt or write files.
-        if (input.bytes !== null && entryFiles.has(relative)) {
+        if (input.bytes !== null && isEntry) {
           throw unprocessable("Entry edits require the canonical instruction commit service and baseRevisionId", { code: "INSTRUCTION_REVISION_REQUIRED" });
         }
         if (input.bytes) assertFileSize(input.bytes.length, relative);
@@ -296,7 +299,7 @@ export function agentFileStore(db: Db) {
           return { contentHash: currentHash, changed: false };
         }
         if (currentHash !== input.baseHash) throw conflict("This file changed since it was read. Reload before saving.", { code: "AGENT_FILE_CONFLICT", path: relative, currentHash });
-        if (input.bytes === null && entryFiles.has(relative)) throw unprocessable("The configured instruction entry cannot be deleted");
+        if (input.bytes === null && isEntry) throw unprocessable("The configured instruction entry cannot be deleted");
         if (input.bytes !== null) {
           // A quota check needs metadata only. Do not hash unrelated large
           // files while holding the editor's row lock for a one-file save.
@@ -337,9 +340,29 @@ export function agentFileStore(db: Db) {
       }, { recoverManaged: true,
         allowRecoveredManaged: options?.allowRecoveredManaged === true, deferAdoption: true }),
     apply: (input: { companyId: string; agentId: string; sourceDir: string; baseline: DirectorySnapshot; checkpoint?: AgentFileManifest }, actor: AuthorizationActor) =>
-      locked(input.companyId, input.agentId, actor, true, async (tx, agent, root, bound) => {
+      locked(input.companyId, input.agentId, actor, true, async (tx, agent, root, bound, _recovered, adoption) => {
         const incoming = input.checkpoint ? checkpointSnapshot(input.checkpoint) : await snapshotAgentFiles(input.sourceDir);
         const entryPath = deriveBundleState(agent).entryFile;
+        // A changed path that names the entry under another spelling (letter case
+        // or Unicode form), or that replaces or removes a folder above the entry
+        // under another spelling, would land on the entry on a case-insensitive
+        // volume, past the stale-entry check below. Reject the whole write-back.
+        // The check reads only the baseline and incoming snapshots, so it runs
+        // before first adoption: a rejection leaves the adoption marker and the
+        // legacy head projections untouched. The checks after adoption keep
+        // their existing order.
+        const entryKey = instructionPathKey(entryPath);
+        for (const name of new Set([...input.baseline.entries, ...incoming.entries].map(([entryName]) => entryName))) {
+          if (name === entryPath || JSON.stringify(input.baseline.entries.get(name)) === JSON.stringify(incoming.entries.get(name))) continue;
+          const key = instructionPathKey(name);
+          const replacesEntryFolder = entryKey.startsWith(`${key}/`) && !entryPath.startsWith(`${name}/`)
+            && incoming.entries.get(name)?.kind !== "dir";
+          if (key === entryKey || replacesEntryFolder) {
+            throw conflict("A changed path names the instruction entry under another spelling. The write-back was rejected and no files were saved.",
+              { code: AGENT_FILES_ENTRY_CONFLICT, path: entryPath });
+          }
+        }
+        await completeAgentFileAdoption(adoption);
         if (incoming.entries.get(entryPath)?.kind !== "file") throw unprocessable("The configured instruction entry cannot be deleted");
         if (!input.checkpoint || JSON.stringify(incoming.entries.get(entryPath)) !== JSON.stringify(input.baseline.entries.get(entryPath))) {
           const entry = await readInstructionBytes(input.sourceDir, entryPath);
@@ -407,6 +430,6 @@ export function agentFileStore(db: Db) {
           ...(input.checkpoint ? { snapshots: { source: incoming, current } } : {}) });
         await audit(tx, agent, bound, { sourceRunId: actor.runId, contract: AGENT_FILES_CONTRACT });
         return { storageWarning: storageWarning(total, finalEntries.size, fullFile) };
-      }),
+      }, { deferAdoption: true }),
   };
 }
