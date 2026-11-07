@@ -900,7 +900,7 @@ describe("agent instructions bundle routes", () => {
       expect(omitted.status, JSON.stringify(omitted.body)).toBe(200);
       expect(mockAgentFileWrite).not.toHaveBeenCalled();
       expect(mockAgentInstructionsService.writeFile).toHaveBeenCalledWith(expect.objectContaining({ id: agentId }), "notes/new.md", "new\n",
-        { clearLegacyPromptTemplate: false, expectedMode: "external", expectedTarget: externalTarget });
+        { clearLegacyPromptTemplate: false, expectedMode: "external", expectedTarget: externalTarget, persistConfig: expect.any(Function) });
     });
 
     it("keeps external saves without baseHash on the external path, guarded by the expected mode", async () => {
@@ -909,7 +909,7 @@ describe("agent instructions bundle routes", () => {
         .send({ path: "notes/plan.md", content: "external\n" }));
       expect(res.status, JSON.stringify(res.body)).toBe(200);
       expect(mockAgentInstructionsService.writeFile).toHaveBeenCalledOnce();
-      expect(mockAgentInstructionsService.writeFile.mock.calls[0]![3]).toEqual({ clearLegacyPromptTemplate: false, expectedMode: "external", expectedTarget: externalTarget });
+      expect(mockAgentInstructionsService.writeFile.mock.calls[0]![3]).toEqual({ clearLegacyPromptTemplate: false, expectedMode: "external", expectedTarget: externalTarget, persistConfig: expect.any(Function) });
       expect(mockAgentFileWrite).not.toHaveBeenCalled();
       expect(mockLogActivity).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ action: "agent.instructions_file_updated" }));
     });
@@ -942,7 +942,7 @@ describe("agent instructions bundle routes", () => {
       expect(res.status, JSON.stringify(res.body)).toBe(200);
       expect(mockAgentFileWrite).not.toHaveBeenCalled();
       expect(mockAgentInstructionsService.writeFile).toHaveBeenCalledWith(expect.objectContaining({ id: agentId }), "promptTemplate.legacy.md", "legacy\n",
-        { clearLegacyPromptTemplate: false, expectedMode: undefined });
+        { clearLegacyPromptTemplate: false, expectedMode: undefined, expectedTarget: undefined, persistConfig: expect.any(Function) });
     });
 
     it("still requires baseHash for managed non-entry saves", async () => {
@@ -1097,7 +1097,7 @@ describe("agent instructions bundle routes", () => {
         const res = await requestApp(await createApp(), url => request(url).put(filePath).send({ path: "notes/plan.md", content: "x\n" }));
         expect(res.status, JSON.stringify(res.body)).toBe(200);
         expect(mockAgentInstructionsService.writeFile.mock.calls[0]![3]).toEqual({ clearLegacyPromptTemplate: false, expectedMode: "external",
-          expectedTarget: { mode: "managed", rootPath: managedRoot } });
+          expectedTarget: { mode: "managed", rootPath: managedRoot }, persistConfig: expect.any(Function) });
       });
 
       it("repairs configuration through secret normalization and the agent-service update with a config revision", async () => {
@@ -1121,6 +1121,111 @@ describe("agent instructions bundle routes", () => {
           { recordRevision: expect.objectContaining({ source: "instructions_bundle_file_put", createdByUserId: "local-board" }) });
         expect(mockLogActivity).not.toHaveBeenCalled();
       });
+    });
+  });
+
+  describe("locked instructions bundle PATCH, path PATCH and legacy clear", () => {
+    const agentId = "11111111-1111-4111-8111-111111111111";
+    const bundlePath = `/api/agents/${agentId}/instructions-bundle`;
+    const managedConfig = { instructionsBundleMode: "managed", instructionsEntryFile: "AGENTS.md" };
+    const sessionBoard = (isInstanceAdmin: boolean) => ({ type: "board", userId: "company-admin", companyIds: ["company-1"],
+      memberships: [{ companyId: "company-1", status: "active", membershipRole: "admin" }], source: "session", isInstanceAdmin });
+    /** A db whose transaction hands out a tx that locks and returns `locked`. */
+    const lockingDb = (locked: () => Record<string, unknown> | undefined) => {
+      const forUpdate = vi.fn(async () => (locked() ? [locked()] : []));
+      const tx = { select: vi.fn(() => ({ from: vi.fn(() => ({ where: vi.fn(() => ({ for: forUpdate })) })) })) };
+      return { db: { transaction: vi.fn(async (fn: (tx: unknown) => unknown) => fn(tx)) }, tx, forUpdate };
+    };
+
+    beforeEach(() => {
+      mockAgentService.getById.mockResolvedValue({ ...makeAgent(), adapterConfig: managedConfig });
+      mockAgentInstructionsService.updateBundle.mockResolvedValue({
+        bundle: { mode: "managed", rootPath: null, entryFile: "AGENTS.md", files: [] }, adapterConfig: managedConfig });
+    });
+
+    it("W1: passes the authorized target, config-only mode, a persist callback and the actor to the locked service", async () => {
+      const res = await requestApp(await createApp(), url => request(url).patch(bundlePath).send({ clearLegacyPromptTemplate: true }));
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(mockAgentInstructionsService.updateBundle).toHaveBeenCalledOnce();
+      const [agent, body, options] = mockAgentInstructionsService.updateBundle.mock.calls[0]!;
+      expect(agent).toMatchObject({ id: agentId });
+      expect(body).toEqual({ clearLegacyPromptTemplate: true });
+      expect(options).toEqual({ expectedTarget: expect.objectContaining({ mode: "managed" }), expectedConfigMode: "managed",
+        persist: expect.any(Function), isInstanceAdmin: true, actor: { actorType: "user", actorId: "local-board", runId: null } });
+      expect(mockAgentService.update).not.toHaveBeenCalled();
+      expect(mockLogActivity).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ action: "agent.instructions_bundle_updated" }));
+    });
+
+    it("W1: the persist callback normalizes and updates on the locked transaction with the bundle PATCH source", async () => {
+      await requestApp(await createApp(), url => request(url).patch(bundlePath).send({ clearLegacyPromptTemplate: true }));
+      const persist = mockAgentInstructionsService.updateBundle.mock.calls[0]![2].persist as (tx: unknown, agent: unknown, config: Record<string, unknown>) => Promise<void>;
+      mockSecretServiceFactory.mockClear();
+      const tx = { bundleTransaction: true };
+      await persist(tx, { ...makeAgent(), adapterConfig: managedConfig }, { ...managedConfig, instructionsRootPath: "/x" });
+      expect(mockSecretServiceFactory).toHaveBeenCalledTimes(1);
+      expect(mockSecretServiceFactory.mock.calls[0]![0]).toBe(tx);
+      expect(mockAgentService.update).toHaveBeenCalledWith(agentId, { adapterConfig: { ...managedConfig, instructionsRootPath: "/x" } },
+        { recordRevision: expect.objectContaining({ source: "instructions_bundle_patch", createdByUserId: "local-board" }) });
+    });
+
+    it("never takes the instance-admin flag from the request body, query or headers", async () => {
+      const app = await createApp(sessionBoard(false));
+      const res = await requestApp(app, url => request(url).patch(`${bundlePath}?isInstanceAdmin=true&admin=1`)
+        .set("x-paperclip-instance-admin", "true").set("x-instance-admin", "true")
+        .send({ clearLegacyPromptTemplate: true, isInstanceAdmin: true, admin: true }));
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(mockAgentInstructionsService.updateBundle.mock.calls[0]![2].isInstanceAdmin).toBe(false);
+      expect(mockAgentInstructionsService.updateBundle.mock.calls[0]![1]).toEqual({ clearLegacyPromptTemplate: true });
+      mockAgentInstructionsService.updateBundle.mockClear();
+      await requestApp(await createApp(sessionBoard(true)), url => request(url).patch(bundlePath).send({ clearLegacyPromptTemplate: true }));
+      expect(mockAgentInstructionsService.updateBundle.mock.calls[0]![2].isInstanceAdmin).toBe(true);
+    });
+
+    it("returns the service's copy 409 unchanged and records no activity", async () => {
+      const { conflict } = await vi.importActual<typeof import("../errors.js")>("../errors.js");
+      mockAgentInstructionsService.updateBundle.mockRejectedValueOnce(conflict(
+        "A previous instructions copy for this agent did not finish. An instance administrator must resolve it.", { code: "INSTRUCTION_BUNDLE_COPY_INCOMPLETE" }));
+      const res = await requestApp(await createApp(sessionBoard(false)), url => request(url).patch(bundlePath).send({ clearLegacyPromptTemplate: true }));
+      expect(res.status, JSON.stringify(res.body)).toBe(409);
+      expect(JSON.stringify(res.body)).toContain("INSTRUCTION_BUNDLE_COPY_INCOMPLETE");
+      expect(mockAgentService.update).not.toHaveBeenCalled();
+      expect(mockLogActivity).not.toHaveBeenCalled();
+    });
+
+    it("W4: the instructions-path PATCH locks the row, normalizes on the transaction and refuses a changed bundle", async () => {
+      const existing = { ...makeAgent(), adapterConfig: managedConfig };
+      mockAgentService.getById.mockResolvedValue(existing);
+      let locked: Record<string, unknown> | undefined = existing;
+      const { db, tx, forUpdate } = lockingDb(() => locked);
+      const pathUrl = `/api/agents/${agentId}/instructions-path`;
+      const ok = await requestApp(await createApp(boardActor(), db), url => request(url).patch(pathUrl).send({ path: "/srv/paperclip/prompts/AGENTS.md" }));
+      expect(ok.status, JSON.stringify(ok.body)).toBe(200);
+      expect(forUpdate).toHaveBeenCalledOnce();
+      expect(mockSecretServiceFactory.mock.calls.some((call) => call[0] === tx)).toBe(true);
+      expect(mockAgentService.update).toHaveBeenCalledWith(agentId, expect.anything(),
+        { recordRevision: expect.objectContaining({ source: "instructions_path_patch" }) });
+      mockAgentService.update.mockClear();
+      mockLogActivity.mockClear();
+      locked = { ...existing, adapterConfig: { instructionsBundleMode: "external", instructionsRootPath: "/srv/paperclip/elsewhere", instructionsEntryFile: "AGENTS.md" } };
+      const refused = await requestApp(await createApp(boardActor(), db), url => request(url).patch(pathUrl).send({ path: "/srv/paperclip/prompts/AGENTS.md" }));
+      expect(refused.status, JSON.stringify(refused.body)).toBe(409);
+      expect(refused.body.error).toBe("The instructions bundle mode changed; reload and retry");
+      expect(mockAgentService.update).not.toHaveBeenCalled();
+      expect(mockLogActivity).not.toHaveBeenCalled();
+    });
+
+    it("W3: the legacy prompt clear after an entry commit is a read-modify-write of the locked row", async () => {
+      mockAgentService.getById.mockResolvedValue({ ...makeAgent(), adapterConfig: { ...managedConfig, promptTemplate: "old" } });
+      const lockedConfig = { instructionsBundleMode: "external", instructionsRootPath: "/srv/paperclip/switched", instructionsEntryFile: "AGENTS.md",
+        promptTemplate: "old", bootstrapPromptTemplate: "boot" };
+      const { db, forUpdate } = lockingDb(() => ({ ...makeAgent(), adapterConfig: lockedConfig }));
+      const res = await requestApp(await createApp(boardActor(), db), url => request(url).put(`${bundlePath}/file`)
+        .send({ path: "AGENTS.md", content: "x\n", baseRevisionId: null, clearLegacyPromptTemplate: true }));
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(forUpdate).toHaveBeenCalledOnce();
+      // The switch committed meanwhile survives: only the legacy keys are removed from the locked row.
+      expect(mockAgentService.update).toHaveBeenCalledWith(agentId, { adapterConfig: {
+        instructionsBundleMode: "external", instructionsRootPath: "/srv/paperclip/switched", instructionsEntryFile: "AGENTS.md" } });
     });
   });
 });
