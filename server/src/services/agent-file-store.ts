@@ -224,6 +224,50 @@ export async function snapshotAgentFiles(root: string, enforceLimits = true): Pr
   return (await inspectAgentDirectory(root, enforceLimits)).snapshot;
 }
 
+type ApplyTree = Map<string, { value: SnapshotEntry; root: string }>;
+
+/** The tree a write-back would leave: the current tree, minus the run's
+ * removed paths, plus its changed paths from the source, with parent folders. */
+function applyFinalTree(baseline: DirectorySnapshot, incoming: DirectorySnapshot, current: DirectorySnapshot,
+  root: string, sourceDir: string): ApplyTree {
+  const changed = [...new Set([...baseline.entries, ...incoming.entries].map(([name]) => name))]
+    .filter(name => JSON.stringify(baseline.entries.get(name)) !== JSON.stringify(incoming.entries.get(name)));
+  const finalEntries: ApplyTree = new Map([...current.entries].map(([name, value]) => [name, { value, root }]));
+  for (const name of changed) if (!incoming.entries.has(name)) finalEntries.delete(name);
+  for (const [name, value] of incoming.entries) {
+    if (JSON.stringify(baseline.entries.get(name)) === JSON.stringify(value)) continue;
+    if (value.kind !== "dir") for (const child of finalEntries.keys()) if (child.startsWith(`${name}/`)) finalEntries.delete(child);
+    finalEntries.set(name, { value, root: sourceDir });
+    for (let parent = path.posix.dirname(name); parent !== "."; parent = path.posix.dirname(parent)) {
+      if (finalEntries.get(parent)?.value.kind !== "dir") finalEntries.set(parent, { value: { kind: "dir" }, root: sourceDir });
+    }
+  }
+  // An unchanged file created by another run can keep a removed folder
+  // alive. Count those surviving parent directories in quota preflight.
+  for (const name of finalEntries.keys()) {
+    for (let parent = path.posix.dirname(name); parent !== "."; parent = path.posix.dirname(parent)) {
+      if (!finalEntries.has(parent)) finalEntries.set(parent, { value: { kind: "dir" }, root });
+    }
+  }
+  return finalEntries;
+}
+
+/** Enforce the per-file and directory limits on a write-back's resulting tree.
+ * sizeOf can supply a size for a file not yet on disk (a pending legacy head). */
+async function applyTreeUsage(finalEntries: ApplyTree,
+  sizeOf?: (name: string, item: { value: SnapshotEntry; root: string }) => number | undefined) {
+  let total = 0;
+  let fullFile: string | undefined;
+  for (const [name, item] of finalEntries) if (item.value.kind === "file") {
+    const size = sizeOf?.(name, item) ?? (await fs.stat(path.join(item.root, name))).size;
+    assertFileSize(size, name);
+    if (size >= MAX_AGENT_FILE_BYTES) fullFile ??= name;
+    total += size;
+  }
+  assertDirectorySize(total, finalEntries.size);
+  return { total, fullFile };
+}
+
 export function agentFileStore(db: Db) {
   async function locked<T>(companyId: string, agentId: string, actor: AuthorizationActor, write: boolean,
     fn: (tx: Tx, agent: Agent, root: string, bound: AuthorizationActor, recovered: RecoveredManagedBundle | null, adoption: AdoptionPlan) => Promise<T>,
@@ -362,25 +406,56 @@ export function agentFileStore(db: Db) {
               { code: AGENT_FILES_ENTRY_CONFLICT, path: entryPath });
           }
         }
-        await completeAgentFileAdoption(adoption);
-        if (incoming.entries.get(entryPath)?.kind !== "file") throw unprocessable("The configured instruction entry cannot be deleted");
-        if (!input.checkpoint || JSON.stringify(incoming.entries.get(entryPath)) !== JSON.stringify(input.baseline.entries.get(entryPath))) {
-          const entry = await readInstructionBytes(input.sourceDir, entryPath);
-          if (entry === null) throw unprocessable("The configured instruction entry cannot be deleted");
-          instructionBytes(entry);
-        }
+        const assertIncomingEntry = async () => {
+          if (incoming.entries.get(entryPath)?.kind !== "file") throw unprocessable("The configured instruction entry cannot be deleted");
+          if (!input.checkpoint || JSON.stringify(incoming.entries.get(entryPath)) !== JSON.stringify(input.baseline.entries.get(entryPath))) {
+            const entry = await readInstructionBytes(input.sourceDir, entryPath);
+            if (entry === null) throw unprocessable("The configured instruction entry cannot be deleted");
+            instructionBytes(entry);
+          }
+        };
         // Previously saved/imported bytes must remain readable, including when
         // over quota. Enforce limits on the incoming and resulting tree so a
         // run can delete files to recover instead of being locked out forever.
-        const current = input.checkpoint ? checkpointSnapshot(await cachedAgentFileManifest(root)) : await snapshotAgentFiles(root, false);
+        const captureCurrent = async () => input.checkpoint ? checkpointSnapshot(await cachedAgentFileManifest(root)) : await snapshotAgentFiles(root, false);
+        const assertNotStale = (current: DirectorySnapshot) => {
+          if (isStaleEntryWriteBack(entryPath, input.baseline, incoming, current)) {
+            throw conflict("The instruction entry changed after this working copy was prepared. The write-back was rejected and no files were saved.",
+              { code: AGENT_FILES_ENTRY_CONFLICT, path: entryPath });
+          }
+        };
+        // First adoption writes the legacy revision heads and the marker. Run
+        // the checks below against the tree as adoption would leave it, without
+        // writing it, so a rejected first write-back changes no file. The heads
+        // replace their disk paths (with any missing parent folders) and count
+        // with their own sizes. Only content identity (entryIdentity, hash only)
+        // and sizes are read here, never mode; the merge below uses a fresh
+        // snapshot taken after adoption. Once these pass, adoption completes
+        // and the same checks run again on disk, unchanged.
+        if (adoption.pending) {
+          await assertIncomingEntry();
+          const onDisk = await captureCurrent();
+          const pendingBytes = new Map(adoption.pending.map(head => [head.entryFile, head.bytes]));
+          const adoptedEntries = new Map<string, SnapshotEntry>(onDisk.entries);
+          for (const [name, bytes] of pendingBytes) {
+            adoptedEntries.set(name, { kind: "file", mode: 0, hash: fileHash(bytes) });
+            for (let parent = path.posix.dirname(name); parent !== "."; parent = path.posix.dirname(parent)) {
+              if (!adoptedEntries.has(parent)) adoptedEntries.set(parent, { kind: "dir" });
+            }
+          }
+          const adopted: DirectorySnapshot = { ...onDisk, entries: adoptedEntries };
+          assertNotStale(adopted);
+          await applyTreeUsage(applyFinalTree(input.baseline, incoming, adopted, root, input.sourceDir),
+            (name, item) => item.root === root ? pendingBytes.get(name)?.length : undefined);
+        }
+        await completeAgentFileAdoption(adoption);
+        await assertIncomingEntry();
+        const current = await captureCurrent();
         // Managed instruction saves take this same agent row lock, so canonical
         // content cannot change between this check and the merge below. A stale
         // entry rejects the whole write-back before any file is touched: no
         // partial apply, no preserved candidate. Report only the entry path.
-        if (isStaleEntryWriteBack(entryPath, input.baseline, incoming, current)) {
-          throw conflict("The instruction entry changed after this working copy was prepared. The write-back was rejected and no files were saved.",
-            { code: AGENT_FILES_ENTRY_CONFLICT, path: entryPath });
-        }
+        assertNotStale(current);
         // Rebase only the run's changed paths onto the current tree. This makes
         // same-file edits/deletions last-sync-wins while untouched files retain
         // changes from other runs. Ancestors may need recreating after a writer
@@ -400,32 +475,8 @@ export function agentFileStore(db: Db) {
           }
         }
         const applyBaseline = { ...input.baseline, entries };
-        const finalEntries = new Map([...current.entries].map(([name, value]) => [name, { value, root }]));
-        for (const name of changed) if (!incoming.entries.has(name)) finalEntries.delete(name);
-        for (const [name, value] of incoming.entries) {
-          if (JSON.stringify(input.baseline.entries.get(name)) === JSON.stringify(value)) continue;
-          if (value.kind !== "dir") for (const child of finalEntries.keys()) if (child.startsWith(`${name}/`)) finalEntries.delete(child);
-          finalEntries.set(name, { value, root: input.sourceDir });
-          for (let parent = path.posix.dirname(name); parent !== "."; parent = path.posix.dirname(parent)) {
-            if (finalEntries.get(parent)?.value.kind !== "dir") finalEntries.set(parent, { value: { kind: "dir" }, root: input.sourceDir });
-          }
-        }
-        // An unchanged file created by another run can keep a removed folder
-        // alive. Count those surviving parent directories in quota preflight.
-        for (const name of finalEntries.keys()) {
-          for (let parent = path.posix.dirname(name); parent !== "."; parent = path.posix.dirname(parent)) {
-            if (!finalEntries.has(parent)) finalEntries.set(parent, { value: { kind: "dir" }, root });
-          }
-        }
-        let total = 0;
-        let fullFile: string | undefined;
-        for (const [name, item] of finalEntries) if (item.value.kind === "file") {
-          const size = (await fs.stat(path.join(item.root, name))).size;
-          assertFileSize(size, name);
-          if (size >= MAX_AGENT_FILE_BYTES) fullFile ??= name;
-          total += size;
-        }
-        assertDirectorySize(total, finalEntries.size);
+        const finalEntries = applyFinalTree(input.baseline, incoming, current, root, input.sourceDir);
+        const { total, fullFile } = await applyTreeUsage(finalEntries);
         await mergeDirectoryWithBaseline({ ...input, baseline: applyBaseline, targetDir: root,
           ...(input.checkpoint ? { snapshots: { source: incoming, current } } : {}) });
         await audit(tx, agent, bound, { sourceRunId: actor.runId, contract: AGENT_FILES_CONTRACT });
