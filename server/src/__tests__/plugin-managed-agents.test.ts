@@ -26,7 +26,12 @@ import {
 import { buildHostServices } from "../services/plugin-host-services.js";
 import { agentService } from "../services/agents.js";
 import { agentInstructionRevisionService } from "../services/agent-instruction-revisions.js";
-import { agentInstructionsService } from "../services/agent-instructions.js";
+import {
+  agentInstructionsBundleMode,
+  agentInstructionsService,
+  resolveInstructionWriteTarget,
+  type UpdateBundleOptions,
+} from "../services/agent-instructions.js";
 import { pluginRegistryService } from "../services/plugin-registry.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
@@ -45,6 +50,20 @@ function createEventBusStub() {
 
 function issuePrefix(id: string) {
   return `T${id.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+}
+
+// updateBundle runs only under the agent row lock and persists through this
+// callback on the same transaction.
+async function lockedBundleOptions(agent: Parameters<typeof resolveInstructionWriteTarget>[0]): Promise<UpdateBundleOptions> {
+  return {
+    expectedTarget: await resolveInstructionWriteTarget(agent),
+    expectedConfigMode: agentInstructionsBundleMode(agent),
+    persist: async (tx, current, adapterConfig) => {
+      await agentService(tx as never).update(current.id, { adapterConfig });
+    },
+    isInstanceAdmin: false,
+    actor: { actorType: "system", actorId: "plugin-managed-agents-test" },
+  };
 }
 
 function manifest(): PaperclipPluginManifestV1 {
@@ -396,8 +415,7 @@ describeEmbeddedPostgres("plugin-managed agents", () => {
       expect(audit.every((row) => row.actorType === "plugin" && row.actorId === pluginId)).toBe(true);
       const bundles = agentInstructionsService(db);
       await bundles.writeFile(repeated.agent!, "CUSTOM.md", "# Alternate configured entry\n");
-      const switched = await bundles.updateBundle(repeated.agent!, { entryFile: "CUSTOM.md" });
-      await agentService(db).update(created.agentId!, { adapterConfig: switched.adapterConfig });
+      await bundles.updateBundle(repeated.agent!, { entryFile: "CUSTOM.md" }, await lockedBundleOptions(repeated.agent!));
       const resetEntry = await services.agents.managedReset({ companyId, agentKey: "wiki-maintainer" });
       expect(resetEntry.agent?.adapterConfig.instructionsEntryFile).toBe("AGENTS.md");
       expect(resetEntry.defaultDrift).toBeNull();
@@ -450,8 +468,7 @@ describeEmbeddedPostgres("plugin-managed agents", () => {
       await expect(revisions.commitPluginReset({ ...input, entryFile: "OTHER.md" }, actor)).rejects.toMatchObject({ status: 403 });
       const bundles = agentInstructionsService(db);
       await bundles.writeFile(created.agent!, "OTHER.md", "# Other entry\n");
-      const switched = await bundles.updateBundle(created.agent!, { entryFile: "OTHER.md" });
-      await agentService(db).update(target.agentId, { adapterConfig: switched.adapterConfig });
+      await bundles.updateBundle(created.agent!, { entryFile: "OTHER.md" }, await lockedBundleOptions(created.agent!));
       await expect(revisions.commitPluginReset(input, actor)).rejects.toMatchObject({ status: 409, details: { code: "INSTRUCTION_ENTRY_CHANGED" } });
       await agentService(db).update(target.agentId, { adapterConfig: created.agent!.adapterConfig });
       const results = await Promise.allSettled([
