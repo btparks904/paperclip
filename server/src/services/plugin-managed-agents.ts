@@ -412,6 +412,7 @@ export function pluginManagedAgentService(
       recordRevision: {
         source: `plugin:${optionsForRevisionSource()}:managed-agent-instructions`,
       },
+      instructionConfigWrite: { keys: "all" },
     });
     return (updated as Agent | null) ?? { ...agent, adapterConfig };
   }
@@ -672,6 +673,7 @@ export function pluginManagedAgentService(
         recordRevision: {
           source: `plugin:${options.pluginKey}:managed-agent-reset`,
         },
+        instructionConfigWrite: { keys: "all" },
       });
       if (!updated) throw notFound("Managed agent not found");
       const updatedAgent = updated as Agent;

@@ -74,7 +74,7 @@ describe("instructions bundle copy-and-switch", () => {
     const normalized = await secretService(txDb).normalizeAdapterConfigForPersistence(current.companyId, adapterConfig,
       { strictMode: false, adapterType: current.adapterType ?? "process" });
     await agentService(txDb).update(current.id, { adapterConfig: normalized },
-      { recordRevision: { createdByAgentId: null, createdByUserId: userId, source } });
+      { recordRevision: { createdByAgentId: null, createdByUserId: userId, source }, instructionConfigWrite: { keys: "all" } });
   };
   async function optionsFor(stale: Awaited<ReturnType<typeof loadAgent>>, overrides: Partial<UpdateBundleOptions> = {}): Promise<UpdateBundleOptions> {
     return {

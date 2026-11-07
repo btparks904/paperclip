@@ -73,6 +73,11 @@ import { agentInstructionRevisionService } from "../services/agent-instruction-r
 import { agentInstructionWorkingCopyService } from "../services/agent-instruction-working-copies.js";
 import { authorizeInstructionRead } from "../services/agent-instruction-authorization.js";
 import { instructionPath } from "../services/agent-instruction-files.js";
+import {
+  AGENT_INSTRUCTION_CONFIG_KEY_SET,
+  AGENT_INSTRUCTION_CONFIG_KEYS,
+  type AgentInstructionConfigKey,
+} from "../services/agent-instruction-keys.js";
 import { agentInstructionsBundleMode, deriveBundleState, resolveInstructionWriteTarget, resolveRecoveredManagedBundle } from "../services/agent-instructions.js";
 import {
   agentService,
@@ -527,14 +532,8 @@ export function agentRoutes(
     return DEFAULT_INSTRUCTIONS_PATH_KEYS[adapterType] ?? null;
   }
   const KNOWN_INSTRUCTIONS_PATH_KEYS = new Set(["instructionsFilePath", "agentsMdPath"]);
-  const KNOWN_INSTRUCTIONS_BUNDLE_KEYS = [
-    "instructionsBundleMode",
-    "instructionsRootPath",
-    "instructionsEntryFile",
-    "instructionsFilePath",
-    "agentsMdPath",
-  ] as const;
-  const KNOWN_INSTRUCTIONS_BUNDLE_KEY_SET: ReadonlySet<string> = new Set(KNOWN_INSTRUCTIONS_BUNDLE_KEYS);
+  const KNOWN_INSTRUCTIONS_BUNDLE_KEYS = AGENT_INSTRUCTION_CONFIG_KEYS;
+  const KNOWN_INSTRUCTIONS_BUNDLE_KEY_SET = AGENT_INSTRUCTION_CONFIG_KEY_SET;
 
   const router = Router();
   const svc = agentService(db);
@@ -2748,6 +2747,7 @@ export function agentRoutes(
 
     const updated = await svc.update(agent.id, { adapterConfig: nextAdapterConfig }, {
       allowPendingApprovalConfigUpdate: true,
+      instructionConfigWrite: { keys: "all" },
     });
     return (updated as T | null) ?? { ...agent, adapterConfig: nextAdapterConfig };
   }
@@ -2921,6 +2921,7 @@ export function agentRoutes(
             createdByUserId: actor.actorType === "user" ? actor.actorId : null,
             source,
           },
+          instructionConfigWrite: { keys: "all" },
         },
       );
     };
@@ -5121,6 +5122,7 @@ export function agentRoutes(
             createdByUserId: actor.actorType === "user" ? actor.actorId : null,
             source: "instructions_path_patch",
           },
+          instructionConfigWrite: { keys: "all" },
         },
       );
     });
@@ -5538,6 +5540,9 @@ export function agentRoutes(
     const touchesAdapterConfiguration =
       hasOwn(patchData, "adapterType") ||
       hasOwn(patchData, "adapterConfig");
+    // Instruction keys this PATCH sets on purpose (D-R4). The others are kept
+    // as the locked row has them.
+    let instructionConfigWrite: { keys: "all" | AgentInstructionConfigKey[]; expected: Record<string, unknown> } | undefined;
     if (touchesAdapterConfiguration) {
       assertExternalInstructionsAdmin(req, existing);
       const existingAdapterConfig = asRecord(existing.adapterConfig) ?? {};
@@ -5620,6 +5625,24 @@ export function agentRoutes(
         ...existing,
         adapterConfig: patchData.adapterConfig,
       });
+      // Replace mode sets every instruction key, clearing the omitted ones
+      // (authorized above). Merge mode sets the keys named in the body and the
+      // keys this route derives from them. Either way, the locked row must still
+      // hold the instruction state these checks authorized against.
+      const explicitInstructionKeys = requestedAdapterConfig
+        ? KNOWN_INSTRUCTIONS_BUNDLE_KEYS.filter((key) => hasOwn(requestedAdapterConfig, key))
+        : [];
+      if (requestedAdapterConfig && (replaceAdapterConfig || explicitInstructionKeys.length > 0)) {
+        const nextAdapterConfig = patchData.adapterConfig as Record<string, unknown>;
+        instructionConfigWrite = {
+          keys: replaceAdapterConfig
+            ? "all"
+            : KNOWN_INSTRUCTIONS_BUNDLE_KEYS.filter((key) =>
+              explicitInstructionKeys.includes(key)
+              || JSON.stringify(nextAdapterConfig[key] ?? null) !== JSON.stringify(existingAdapterConfig[key] ?? null)),
+          expected: existingAdapterConfig,
+        };
+      }
     }
     if (existing.runtimeConfig.aiConnection && requestedRuntimeConfig && !requestedRuntimeConfig.aiConnection) requestedRuntimeConfig.aiConnection = existing.runtimeConfig.aiConnection;
     const nextAiBinding = aiConnectionBindingSchema.safeParse(requestedRuntimeConfig?.aiConnection ?? existing.runtimeConfig.aiConnection).data;
@@ -5655,6 +5678,7 @@ export function agentRoutes(
 
     const actor = getActorInfo(req);
     const agent = await svc.update(id, patchData, {
+      instructionConfigWrite,
       recordRevision: {
         createdByAgentId: actor.agentId,
         createdByUserId: actor.actorType === "user" ? actor.actorId : null,

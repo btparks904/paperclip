@@ -55,6 +55,11 @@ import {
   readBuiltInAgentMarker,
 } from "./built-in-agent-metadata.js";
 import { issueThreadInteractionService } from "./issue-thread-interactions.js";
+import {
+  carryForwardInstructionConfig,
+  instructionConfigEqual,
+  type AgentInstructionConfigKey,
+} from "./agent-instruction-keys.js";
 
 function hashToken(token: string) {
   return createHash("sha256").update(token).digest("hex");
@@ -118,11 +123,27 @@ interface ClaudeLoginContext {
   inheritedFromAgentId?: string | null;
 }
 
+/**
+ * The instruction keys a configuration write sets on purpose. Without it,
+ * updateAgent keeps each of the five instruction keys as the locked agent row
+ * has them, so a writer that rebuilt adapterConfig from an earlier read cannot
+ * revert an instruction change committed after that read. `keys: "all"` is for
+ * writers that compute the whole instruction configuration. `expected` is the
+ * instruction state the caller authorized against: when the locked row
+ * differs, the write is refused with 409 AGENT_CONFIG_CHANGED and nothing is
+ * written.
+ */
+interface InstructionConfigWrite {
+  keys: "all" | readonly AgentInstructionConfigKey[];
+  expected?: Record<string, unknown>;
+}
+
 interface UpdateAgentOptions {
   recordRevision?: RevisionMetadata;
   allowBuiltInAgentMetadata?: boolean;
   allowPendingApprovalConfigUpdate?: boolean;
   claudeLogin?: ClaudeLoginContext;
+  instructionConfigWrite?: InstructionConfigWrite;
 }
 
 interface CreateAgentOptions {
@@ -784,13 +805,37 @@ export function agentService(db: Db) {
       : null;
 
     const shouldRecordRevision = Boolean(options?.recordRevision) && hasConfigPatchFields(normalizedPatch);
-    const beforeConfig = shouldRecordRevision ? buildConfigSnapshot(existing) : null;
 
     type AgentUpdateResult = Awaited<ReturnType<typeof getById>>;
     const applyUpdate = async (txDb: Db): Promise<AgentUpdateResult> => {
+      // Lock the row first and read it under the lock. The instruction keys and
+      // the revision's "before" state come from this read, not from `existing`,
+      // which another transaction may have changed since. A caller that already
+      // holds the lock in this transaction takes it again without waiting.
+      const [lockedRow] = await txDb.select({ id: agents.id }).from(agents).where(eq(agents.id, id)).for("update");
+      if (!lockedRow) return null;
+      const locked = await agentService(txDb).getById(id);
+      if (!locked) return null;
+      const lockedAdapterConfig = isPlainRecord(locked.adapterConfig) ? locked.adapterConfig : {};
+      const instructionWrite = options?.instructionConfigWrite;
+      if (instructionWrite?.expected && !instructionConfigEqual(instructionWrite.expected, lockedAdapterConfig)) {
+        throw conflict("The agent's instructions configuration changed. Reload and try again.", {
+          code: "AGENT_CONFIG_CHANGED",
+        });
+      }
+      const values = { ...normalizedPatch };
+      if (isPlainRecord(values.adapterConfig)) {
+        values.adapterConfig = carryForwardInstructionConfig(
+          values.adapterConfig,
+          lockedAdapterConfig,
+          instructionWrite?.keys ?? [],
+        );
+      }
+      const beforeConfig = shouldRecordRevision ? buildConfigSnapshot(locked) : null;
+
       const updated = await txDb
         .update(agents)
-        .set({ ...normalizedPatch, updatedAt: new Date() })
+        .set({ ...values, updatedAt: new Date() })
         .where(eq(agents.id, id))
         .returning()
         .then((rows) => rows[0] ?? null);

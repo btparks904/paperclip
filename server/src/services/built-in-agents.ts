@@ -1129,6 +1129,7 @@ export function builtInAgentService(db: Db) {
     }, {
       allowBuiltInAgentMetadata: true,
       recordRevision: { source: `built-in-bundle:${mode}:instructions` },
+      instructionConfigWrite: { keys: "all" },
     });
     if (!updated) throw notFound("Built-in agent not found");
     await upsertManagedResourceBinding({
