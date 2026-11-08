@@ -1119,7 +1119,7 @@ describe("agent instructions bundle routes", () => {
         expect(mockSecretService.normalizeAdapterConfigForPersistence).toHaveBeenCalledWith("company-1", repaired,
           { strictMode: false, adapterType: "codex_local" });
         expect(mockAgentService.update).toHaveBeenCalledWith(agentId, { adapterConfig: repaired },
-          { recordRevision: expect.objectContaining({ source: "instructions_bundle_file_put", createdByUserId: "local-board" }) });
+          { recordRevision: expect.objectContaining({ source: "instructions_bundle_file_put", createdByUserId: "local-board" }), instructionConfigWrite: { keys: "all" } });
         expect(mockLogActivity).not.toHaveBeenCalled();
       });
     });
@@ -1166,7 +1166,7 @@ describe("agent instructions bundle routes", () => {
       expect(mockSecretServiceFactory).toHaveBeenCalledTimes(1);
       expect(mockSecretServiceFactory.mock.calls[0]![0]).toBe(tx);
       expect(mockAgentService.update).toHaveBeenCalledWith(agentId, { adapterConfig: { ...managedConfig, instructionsRootPath: "/x" } },
-        { recordRevision: expect.objectContaining({ source: "instructions_bundle_patch", createdByUserId: "local-board" }) });
+        { recordRevision: expect.objectContaining({ source: "instructions_bundle_patch", createdByUserId: "local-board" }), instructionConfigWrite: { keys: "all" } });
     });
 
     it("never takes the instance-admin flag from the request body, query or headers", async () => {
@@ -1206,7 +1206,7 @@ describe("agent instructions bundle routes", () => {
       expect(mockAgentInstructionsService.assertNoCopyIntentForRoot).toHaveBeenCalledWith(tx, expect.objectContaining({ id: agentId }), "/srv/paperclip/prompts", true);
       expect(mockSecretServiceFactory.mock.calls.some((call) => call[0] === tx)).toBe(true);
       expect(mockAgentService.update).toHaveBeenCalledWith(agentId, expect.anything(),
-        { recordRevision: expect.objectContaining({ source: "instructions_path_patch" }) });
+        { recordRevision: expect.objectContaining({ source: "instructions_path_patch" }), instructionConfigWrite: { keys: "all" } });
       mockAgentService.update.mockClear();
       mockLogActivity.mockClear();
       locked = { ...existing, adapterConfig: { instructionsBundleMode: "external", instructionsRootPath: "/srv/paperclip/elsewhere", instructionsEntryFile: "AGENTS.md" } };

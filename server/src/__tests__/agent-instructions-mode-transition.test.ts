@@ -206,7 +206,7 @@ describe("instruction writes across bundle mode transitions", () => {
       const normalized = await secretService(txDb).normalizeAdapterConfigForPersistence(agent.companyId, adapterConfig,
         { strictMode, adapterType: agent.adapterType });
       await agentService(txDb).update(agent.id, { adapterConfig: normalized },
-        { recordRevision: { createdByAgentId: null, createdByUserId: userId, source: "instructions_bundle_file_put" } });
+        { recordRevision: { createdByAgentId: null, createdByUserId: userId, source: "instructions_bundle_file_put" }, instructionConfigWrite: { keys: "all" } });
     };
     const repairConfig = makeRepair();
     const recoveredOptions = (): AgentFileWriteOptions => ({ allowRecoveredManaged: true, repairConfig });

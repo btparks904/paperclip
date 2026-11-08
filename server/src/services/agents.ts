@@ -55,6 +55,11 @@ import {
   readBuiltInAgentMarker,
 } from "./built-in-agent-metadata.js";
 import { issueThreadInteractionService } from "./issue-thread-interactions.js";
+import {
+  carryForwardInstructionConfig,
+  instructionConfigEqual,
+  type AgentInstructionConfigKey,
+} from "./agent-instruction-keys.js";
 
 function hashToken(token: string) {
   return createHash("sha256").update(token).digest("hex");
@@ -118,11 +123,29 @@ interface ClaudeLoginContext {
   inheritedFromAgentId?: string | null;
 }
 
+/**
+ * The instruction keys a configuration write sets on purpose. Without it,
+ * updateAgent keeps each of the five instruction keys as the locked agent row
+ * has them, so a writer that rebuilt adapterConfig from an earlier read cannot
+ * revert an instruction change committed after that read. `keys: "all"` is for
+ * writers that compute the whole instruction configuration. `expected` is the
+ * instruction state the caller authorized against: when the locked row
+ * differs, the write is refused with 409 AGENT_CONFIG_CHANGED and nothing is
+ * written.
+ */
+interface InstructionConfigWrite {
+  keys: "all" | readonly AgentInstructionConfigKey[];
+  expected?: Record<string, unknown>;
+}
+
 interface UpdateAgentOptions {
   recordRevision?: RevisionMetadata;
   allowBuiltInAgentMetadata?: boolean;
   allowPendingApprovalConfigUpdate?: boolean;
   claudeLogin?: ClaudeLoginContext;
+  instructionConfigWrite?: InstructionConfigWrite;
+  /** Options for the secret normalization that runs inside the update transaction. */
+  secretNormalization?: { strictMode?: boolean };
 }
 
 interface CreateAgentOptions {
@@ -749,21 +772,13 @@ export function agentService(db: Db) {
     if (data.permissions !== undefined) {
       normalizedPatch.permissions = normalizeAgentPermissions(data.permissions);
     }
+    // Secret normalization runs inside the update transaction (below), so a
+    // rejected update leaves no secret row behind.
+    const normalizeSecrets = Object.prototype.hasOwnProperty.call(normalizedPatch, "adapterConfig") &&
+      isPlainRecord(normalizedPatch.adapterConfig);
     if (
-      Object.prototype.hasOwnProperty.call(normalizedPatch, "adapterConfig") &&
-      isPlainRecord(normalizedPatch.adapterConfig)
-    ) {
-      const normalizedAdapterConfig = await secretsSvc.normalizeAdapterConfigForPersistence(
-        existing.companyId,
-        normalizedPatch.adapterConfig,
-        { adapterType: (normalizedPatch.adapterType ?? existing.adapterType) as string },
-      );
-      normalizedPatch.adapterConfig = normalizePaperclipRunnerAdapterConfig(
-        (normalizedPatch.adapterType ?? existing.adapterType) as string,
-        normalizedAdapterConfig,
-      );
-    } else if (
-      Object.prototype.hasOwnProperty.call(normalizedPatch, "adapterType")
+      !normalizeSecrets
+      && Object.prototype.hasOwnProperty.call(normalizedPatch, "adapterType")
       && isPlainRecord(existing.adapterConfig)
     ) {
       normalizedPatch.adapterConfig = normalizePaperclipRunnerAdapterConfig(
@@ -771,26 +786,72 @@ export function agentService(db: Db) {
         existing.adapterConfig,
       );
     }
-    // Run the server-enforced binding invariant when the patch touches the
-    // adapter config. The update, approval, and rollback paths keep an existing
-    // fixed binding but reject a newly introduced binding, because they carry no
-    // stored-session claim.
-    const bindingDecision = Object.prototype.hasOwnProperty.call(normalizedPatch, "adapterConfig")
-      ? assertClaudeOAuthBindingInvariant({
-          adapterType: (normalizedPatch.adapterType ?? existing.adapterType) as string,
-          nextConfig: normalizedPatch.adapterConfig,
-          priorConfig: existing.adapterConfig,
-        })
-      : null;
 
     const shouldRecordRevision = Boolean(options?.recordRevision) && hasConfigPatchFields(normalizedPatch);
-    const beforeConfig = shouldRecordRevision ? buildConfigSnapshot(existing) : null;
 
     type AgentUpdateResult = Awaited<ReturnType<typeof getById>>;
     const applyUpdate = async (txDb: Db): Promise<AgentUpdateResult> => {
+      // Lock the row first and read it under the lock. The instruction keys and
+      // the revision's "before" state come from this read, not from `existing`,
+      // which another transaction may have changed since. A caller that already
+      // holds the lock in this transaction takes it again without waiting.
+      const [lockedRow] = await txDb.select({ id: agents.id }).from(agents).where(eq(agents.id, id)).for("update");
+      if (!lockedRow) return null;
+      const locked = await agentService(txDb).getById(id);
+      if (!locked) return null;
+      const lockedAdapterConfig = isPlainRecord(locked.adapterConfig) ? locked.adapterConfig : {};
+      // After the agent row lock, as in the other transaction-bound callers.
+      if (normalizeSecrets) {
+        const adapterType = (normalizedPatch.adapterType ?? existing.adapterType) as string;
+        const txSecrets = secretService(txDb);
+        const normalizeOptions = { adapterType, strictMode: options?.secretNormalization?.strictMode };
+        let normalizedAdapterConfig = await txSecrets.normalizeAdapterConfigForPersistence(
+          existing.companyId,
+          normalizedPatch.adapterConfig as Record<string, unknown>,
+          normalizeOptions,
+        );
+        // A caller that hands normalization to this transaction (the generic
+        // PATCH) used to normalize once itself before this second pass. Keep
+        // both passes so the stored references are canonical exactly as before.
+        if (options?.secretNormalization) {
+          normalizedAdapterConfig = await txSecrets.normalizeAdapterConfigForPersistence(
+            existing.companyId,
+            normalizedAdapterConfig,
+            normalizeOptions,
+          );
+        }
+        normalizedPatch.adapterConfig = normalizePaperclipRunnerAdapterConfig(adapterType, normalizedAdapterConfig);
+      }
+      // Run the server-enforced binding invariant when the patch touches the
+      // adapter config. The update, approval, and rollback paths keep an existing
+      // fixed binding but reject a newly introduced binding, because they carry no
+      // stored-session claim.
+      const bindingDecision = Object.prototype.hasOwnProperty.call(normalizedPatch, "adapterConfig")
+        ? assertClaudeOAuthBindingInvariant({
+            adapterType: (normalizedPatch.adapterType ?? existing.adapterType) as string,
+            nextConfig: normalizedPatch.adapterConfig,
+            priorConfig: existing.adapterConfig,
+          })
+        : null;
+      const instructionWrite = options?.instructionConfigWrite;
+      if (instructionWrite?.expected && !instructionConfigEqual(instructionWrite.expected, lockedAdapterConfig)) {
+        throw conflict("The agent's instructions configuration changed. Reload and try again.", {
+          code: "AGENT_CONFIG_CHANGED",
+        });
+      }
+      const values = { ...normalizedPatch };
+      if (isPlainRecord(values.adapterConfig)) {
+        values.adapterConfig = carryForwardInstructionConfig(
+          values.adapterConfig,
+          lockedAdapterConfig,
+          instructionWrite?.keys ?? [],
+        );
+      }
+      const beforeConfig = shouldRecordRevision ? buildConfigSnapshot(locked) : null;
+
       const updated = await txDb
         .update(agents)
-        .set({ ...normalizedPatch, updatedAt: new Date() })
+        .set({ ...values, updatedAt: new Date() })
         .where(eq(agents.id, id))
         .returning()
         .then((rows) => rows[0] ?? null);

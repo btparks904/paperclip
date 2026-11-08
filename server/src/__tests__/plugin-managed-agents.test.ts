@@ -59,7 +59,7 @@ async function lockedBundleOptions(agent: Parameters<typeof resolveInstructionWr
     expectedTarget: await resolveInstructionWriteTarget(agent),
     expectedConfigMode: agentInstructionsBundleMode(agent),
     persist: async (tx, current, adapterConfig) => {
-      await agentService(tx as never).update(current.id, { adapterConfig });
+      await agentService(tx as never).update(current.id, { adapterConfig }, { instructionConfigWrite: { keys: "all" } });
     },
     isInstanceAdmin: false,
     actor: { actorType: "system", actorId: "plugin-managed-agents-test" },
@@ -470,7 +470,7 @@ describeEmbeddedPostgres("plugin-managed agents", () => {
       await bundles.writeFile(created.agent!, "OTHER.md", "# Other entry\n");
       await bundles.updateBundle(created.agent!, { entryFile: "OTHER.md" }, await lockedBundleOptions(created.agent!));
       await expect(revisions.commitPluginReset(input, actor)).rejects.toMatchObject({ status: 409, details: { code: "INSTRUCTION_ENTRY_CHANGED" } });
-      await agentService(db).update(target.agentId, { adapterConfig: created.agent!.adapterConfig });
+      await agentService(db).update(target.agentId, { adapterConfig: created.agent!.adapterConfig }, { instructionConfigWrite: { keys: "all" } });
       const results = await Promise.allSettled([
         revisions.commitPluginReset(input, actor),
         revisions.commitPluginReset({ ...input, content: "# Concurrent reset\n" }, actor),
