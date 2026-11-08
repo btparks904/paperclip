@@ -2927,6 +2927,22 @@ export function agentRoutes(
     };
   }
 
+  // WS-2 (A4): the unlocked instruction-root pre-check of a create or hire,
+  // before the route's own secret normalization. svc.create repeats it under
+  // the destination lock; a record that appears in between is the tracked
+  // PG-3 window.
+  async function precheckNewAgentInstructionRoot(
+    req: Request,
+    agent: { id: string; companyId: string; name: string },
+    adapterConfig: Record<string, unknown>,
+  ) {
+    const root = deriveBundleState({ ...agent, adapterConfig }).rootPath;
+    if (!root) return;
+    await instructions.assertInstructionRootAvailable(db, { ...agent, adapterConfig }, root, {
+      isInstanceAdmin: isInstanceAdminActor(req), lock: false,
+    });
+  }
+
   // Server-side instance-admin determination (never from the request body,
   // query or headers); it only selects the detail level of a copy 409.
   function isInstanceAdminActor(req: Request): boolean {
@@ -4605,6 +4621,7 @@ export function agentRoutes(
       ),
       "add",
     );
+    await precheckNewAgentInstructionRoot(req, { id: hiredAgentId, companyId, name: hireInput.name }, desiredSkillAssignment.adapterConfig);
     const normalizedAdapterConfig = await normalizeMediatedAdapterConfigForPersistence({
       companyId,
       adapterType: hireInput.adapterType,
@@ -4906,6 +4923,7 @@ export function agentRoutes(
       ),
       "add",
     );
+    await precheckNewAgentInstructionRoot(req, { id: agentId, companyId, name: createInput.name }, desiredSkillAssignment.adapterConfig);
     const normalizedAdapterConfig = await normalizeMediatedAdapterConfigForPersistence({
       companyId,
       adapterType: createInput.adapterType,
@@ -5683,6 +5701,8 @@ export function agentRoutes(
     const agent = await svc.update(id, patchData, {
       instructionConfigWrite,
       secretNormalization: { strictMode: strictSecretsMode },
+      // WS-2: only the detail level of a root-guard 409.
+      instructionRootGuard: { isInstanceAdmin: isInstanceAdminActor(req) },
       recordRevision: {
         createdByAgentId: actor.agentId,
         createdByUserId: actor.actorType === "user" ? actor.actorId : null,

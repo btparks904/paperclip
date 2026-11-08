@@ -20,9 +20,11 @@ import type {
 import { conflict, forbidden, notFound, unprocessable } from "../errors.js";
 import {
   agentInstructionsBundleMode,
+  agentInstructionsService,
   deriveBundleState,
   resolveManagedInstructionsRoot,
 } from "./agent-instructions.js";
+import { assertAgentRowLockAllowed } from "./instruction-root-guard.js";
 import {
   instructionBytes,
   instructionPath,
@@ -87,6 +89,7 @@ export function agentInstructionRevisionService(db: Db) {
   ) {
     if (actor?.type === "agent" && actor.companyId !== target.companyId)
       throw notFound("Agent not found");
+    await assertAgentRowLockAllowed(tx, target.agentId);
     const [agent] = await tx
       .select()
       .from(agents)
@@ -106,7 +109,17 @@ export function agentInstructionRevisionService(db: Db) {
     }
     const state = deriveBundleState(agent);
     const entryFile = instructionPath(state.entryFile);
-    return { agent, entryFile, root: resolveManagedInstructionsRoot(agent) };
+    const root = resolveManagedInstructionsRoot(agent);
+    // WS-2 (A7): a configuration that does not bind its root yet is bound to
+    // the managed root by a commit (bindEntry), and its files there are adopted
+    // as current by every read. Refuse an unfinished copy there first.
+    const config = agent.adapterConfig as Record<string, unknown> | null;
+    if (!config?.instructionsRootPath || !config?.instructionsBundleMode) {
+      await agentInstructionsService(db).assertInstructionRootAvailable(tx, agent, root, {
+        isInstanceAdmin: actor?.type === "board" && actor.isInstanceAdmin === true,
+      });
+    }
+    return { agent, entryFile, root };
   }
   async function authorizeRead(
     tx: Tx,

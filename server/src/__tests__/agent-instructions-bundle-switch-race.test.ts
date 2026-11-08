@@ -8,7 +8,7 @@ import { randomUUID } from "node:crypto";
 import express from "express";
 import request from "supertest";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
-import { and, eq } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import {
   activityLog, agentConfigRevisions, agentInstructionHeads, agentInstructionRevisions, agents, authUsers, companies,
   companyMemberships, companySecrets, createDb, principalPermissionGrants, type Db,
@@ -745,47 +745,74 @@ describe("instructions bundle copy-and-switch", () => {
         await seedSource(otherManaged, { "AGENTS.md": "SENTINEL-OTHER-ENTRY\n", "notes/other.md": "SENTINEL-OTHER-NOTE\n" });
       });
 
-      it("both create before either scans: both refuse, nothing is written, no record remains", async () => {
-        let created = 0;
-        let bothCreated!: () => void;
-        const barrier = new Promise<void>((resolve) => { bothCreated = resolve; });
-        const real = fs.open.bind(fs);
-        vi.spyOn(fs, "open").mockImplementation((async (file: Parameters<typeof fs.open>[0], flags?: any, mode?: any) => {
-          const handle = await real(file, flags, mode);
-          if (flags === "wx" && String(file).startsWith(instructionCopyIntentsDirectory())) {
-            created += 1;
-            if (created === 2) bothCreated();
-            await Promise.race([barrier, sleep(5000)]);
+      // WS-2 (PR-A): the destination lock serializes two copies into one
+      // folder. The first copy holds the lock from before its first write to
+      // its commit; the second waits on it and only then scans the folder, so
+      // it never runs inside a copy in progress.
+      const advisoryWaiters = async () => {
+        const rows = await db.execute(sql`select count(*)::int as n from pg_locks where locktype = 'advisory' and not granted`);
+        return Number((rows as unknown as Array<{ n: number }>)[0]?.n ?? 0);
+      };
+      const waitUntil = async (predicate: () => Promise<boolean>) => {
+        for (let i = 0; i < 250; i += 1) { if (await predicate()) return true; await sleep(20); }
+        return false;
+      };
+      /** Starts B's copy at A's first destination write and records whether B waited on the lock meanwhile. */
+      function startSecondAtFirstWrite(failSecondWrite: boolean) {
+        const state = { b: null as Promise<Settled> | null, bSettled: false, bWaitedDuringCopy: false, aWrites: 0, filesWhileWaiting: [] as string[] };
+        spyOpen(async (file, flags) => {
+          if (!isDestWrite(file, flags)) return;
+          state.aWrites += 1;
+          if (state.aWrites === 1) {
+            state.b = patch({ mode: "external", rootPath: ext }, {}, undefined, other).then((result) => { state.bSettled = true; return result; });
+            state.bWaitedDuringCopy = await waitUntil(async () => (await advisoryWaiters()) > 0) && !state.bSettled;
           }
-          return handle;
-        }) as typeof fs.open);
-        const [a, b] = await Promise.all([patch({ mode: "external", rootPath: ext }), patch({ mode: "external", rootPath: ext }, {}, undefined, other)]);
-        expect(created).toBe(2);
-        expect(a).toMatchObject({ ok: false, status: 409, code: COPY_INCOMPLETE });
+          if (state.aWrites === 2) {
+            // The folder is incomplete here, and B is still waiting.
+            state.filesWhileWaiting = await ls(ext);
+            state.bWaitedDuringCopy &&= !state.bSettled && (await advisoryWaiters()) > 0;
+            if (failSecondWrite) throw errno("EIO");
+          }
+        });
+        return state;
+      }
+
+      it("a failed first copy: the second waited on the destination lock, then refuses with 409; nothing of its own is written", async () => {
+        const state = startSecondAtFirstWrite(true);
+        const a = await patch({ mode: "external", rootPath: ext });
+        vi.restoreAllMocks();
+        const b = await state.b!;
+        expect(state.bWaitedDuringCopy).toBe(true);
+        expect(a).toMatchObject({ ok: false });
+        // The lingering record of the failed copy refuses the second copy.
         expect(b).toMatchObject({ ok: false, status: 409, code: COPY_INCOMPLETE });
-        expect(await ls(ext)).toEqual([]);
-        expect(await intents()).toEqual([]);
+        expect(state.aWrites).toBe(2);
+        expect(state.filesWhileWaiting).toEqual(["AGENTS.md"]);
+        expect(await ls(ext)).toEqual(["AGENTS.md"]);
+        expect((await configOf(other)).instructionsBundleMode).toBe("managed");
+        expect((await configOf()).instructionsBundleMode).toBe("managed");
+        expect(await intents()).toHaveLength(1);
       });
 
-      it("one scans before the other creates: the later one refuses and writes nothing; the earlier one copies", async () => {
-        let bAtPersist!: () => void; const bReady = new Promise<void>((resolve) => { bAtPersist = resolve; });
-        let aScanned!: () => void; const aPast = new Promise<void>((resolve) => { aScanned = resolve; });
-        let bFinished!: () => void; const bDone = new Promise<void>((resolve) => { bFinished = resolve; });
-        let first = true;
-        spyOpen(async (file, flags) => {
-          if (isDestWrite(file, flags) && first) { first = false; aScanned(); await bDone; }
-        });
-        const b = patch({ mode: "external", rootPath: ext }, {
-          persist: async (tx, current, adapterConfig) => { bAtPersist(); await aPast; await persistOn()(tx, current, adapterConfig); },
-        }, undefined, other).then((result) => { bFinished(); return result; });
-        await bReady;
+      it("a finished first copy: the second waited until the first committed, then adopted the finished folder (interim PR-B shared-root gap)", async () => {
+        const state = startSecondAtFirstWrite(false);
         const a = await patch({ mode: "external", rootPath: ext });
-        const bResult = await b;
-        expect(bResult).toMatchObject({ ok: false, status: 409, code: COPY_INCOMPLETE });
+        const b = await state.b!;
+        vi.restoreAllMocks();
+        expect(state.bWaitedDuringCopy).toBe(true);
         expect(a.ok).toBe(true);
+        expect(state.filesWhileWaiting).toEqual(["AGENTS.md"]);
+        // The second copy saw only the finished folder. A transient 409 is also
+        // fail-closed: the lock can pass to B between A's commit and A's
+        // record removal.
+        if (b.ok) {
+          expect((await configOf(other)).instructionsRootPath).toBe(ext);
+        } else {
+          expect(b).toMatchObject({ status: 409, code: COPY_INCOMPLETE });
+          expect((await configOf(other)).instructionsBundleMode).toBe("managed");
+        }
         expect(await ls(ext)).toEqual(["AGENTS.md", NOTE]);
         expect(await read(ext, "AGENTS.md")).toBe(ENTRY);
-        expect((await configOf(other)).instructionsBundleMode).toBe("managed");
         expect(await intents()).toEqual([]);
       });
     });

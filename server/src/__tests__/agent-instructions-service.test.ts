@@ -38,6 +38,9 @@ function lockedBundle(agent: TestAgent) {
   const tx = {
     select: () => ({ from: () => ({ where: () => Object.assign(Promise.resolve([]), { for: async () => [agent] }) }) }),
     insert: () => ({ values: async () => undefined }),
+    // WS-2: the destination advisory lock and its held-lock marker run as SQL
+    // on the transaction; no rows means no lock is held yet.
+    execute: async () => [],
   };
   const db = { transaction: async (fn: (t: typeof tx) => Promise<unknown>) => fn(tx) };
   const options = async (): Promise<UpdateBundleOptions> => ({

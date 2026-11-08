@@ -9,6 +9,7 @@ import { instructionPath, instructionPathKey, matchesInstructionEntry, assertIns
 import { conflict, notFound, unprocessable } from "../errors.js";
 import { resolveHomeAwarePath, resolvePaperclipInstanceRoot } from "../home-paths.js";
 import { logger } from "../middleware/logger.js";
+import { assertInstructionDestinationKey, lockInstructionDestination } from "./instruction-root-guard.js";
 
 const ENTRY_FILE_DEFAULT = "AGENTS.md";
 const MODE_KEY = "instructionsBundleMode";
@@ -854,9 +855,18 @@ export function agentInstructionsService(db?: Db) {
   async function ensureWritableBundle(
     agent: AgentLike,
     options?: { clearLegacyPromptTemplate?: boolean },
+    tx?: InstructionTx,
   ): Promise<{ adapterConfig: Record<string, unknown>; state: BundleState }> {
     const derived = deriveBundleState(agent);
     const current = await recoverManagedBundleState(agent, derived);
+    // WS-2 (A8): a save that binds a root the configuration does not name yet
+    // (none, or a recovered managed root) refuses an unfinished copy there
+    // before the caller writes the first folder or byte into it.
+    const bindRoot = current.rootPath && current.mode ? current.rootPath : resolveManagedInstructionsRoot(agent);
+    if (!derived.rootPath || path.resolve(derived.rootPath) !== path.resolve(bindRoot)) {
+      if (tx) await assertInstructionRootAvailable(tx, agent, bindRoot, { isInstanceAdmin: false, createParent: true });
+      else if (db) throw unprocessable("Binding an instructions root requires the agent's locked transaction");
+    }
     if (current.rootPath && current.mode) {
       const adapterConfig = buildPersistedBundleConfig(derived, current, options);
       return {
@@ -1156,7 +1166,29 @@ export function agentInstructionsService(db?: Db) {
    * matching record refuses; recovery stays with the operator.
    */
   async function assertNoCopyIntentForRoot(tx: InstructionTx, agent: AgentLike, rootPath: string, isInstanceAdmin: boolean) {
+    await assertInstructionRootAvailable(tx, agent, rootPath, { isInstanceAdmin });
+  }
+
+  /**
+   * WS-2 root guard, for every writer that activates or first writes an
+   * instruction root. On the caller's transaction, after its agent row lock,
+   * it takes the destination lock for rootPath (instruction-root-guard.ts),
+   * then refuses (409) when any copy record matches the folder. Same
+   * classifier as above, with the destination treated as populated, so nothing
+   * is removed and every matching record refuses. With lock: false it only
+   * classifies (the create pre-check that runs before any lock); that result
+   * is advisory and must be repeated under the lock.
+   */
+  async function assertInstructionRootAvailable(
+    tx: InstructionTx | Db,
+    agent: AgentLike,
+    rootPath: string,
+    options: { isInstanceAdmin: boolean; createParent?: boolean; lock?: boolean },
+  ) {
     const resolved = path.resolve(rootPath);
+    if (options.lock !== false) {
+      await lockInstructionDestination(tx, resolved, { agentId: agent.id, createParent: options.createParent === true });
+    }
     const stat = await fs.stat(resolved, { bigint: true }).catch((error: NodeJS.ErrnoException) => {
       if (error.code === "ENOENT" || error.code === "ENOTDIR") return null;
       throw error;
@@ -1166,7 +1198,7 @@ export function agentInstructionsService(db?: Db) {
     const identity: DestinationIdentity = stat?.isDirectory()
       ? await captureDestinationIdentity(resolved)
       : await pathOnlyIdentity(resolved);
-    await classifyCopyIntents(tx, agent, { isInstanceAdmin }, identity, resolved, false, null);
+    await classifyCopyIntents(tx as InstructionTx, agent, { isInstanceAdmin: options.isInstanceAdmin }, identity, resolved, false, null);
   }
 
   async function updateBundle(
@@ -1200,7 +1232,12 @@ export function agentInstructionsService(db?: Db) {
         nextRootPath = resolvedRoot;
       }
       await assertInstructionPathSafe(nextRootPath, nextEntryFile);
+      // WS-2 (A1): the destination lock, before the first folder is created
+      // in it, so another writer of this folder waits for this transaction.
+      // The key is derived again after mkdir; a change refuses.
+      const destinationKey = await lockInstructionDestination(tx, nextRootPath, { agentId: current.id, createParent: true });
       await fs.mkdir(nextRootPath, { recursive: true });
+      await assertInstructionDestinationKey(nextRootPath, destinationKey);
       const identity = await captureDestinationIdentity(nextRootPath);
       const existingFiles = await listFilesRecursive(nextRootPath);
       // Exact compare by design (addendum 3 section 3): every other spelling
@@ -1271,6 +1308,7 @@ export function agentInstructionsService(db?: Db) {
     relativePath: string,
     content: string,
     options?: { clearLegacyPromptTemplate?: boolean },
+    tx?: InstructionTx,
   ): Promise<{
     bundle: AgentInstructionsBundle;
     file: AgentInstructionsFileDetail;
@@ -1295,7 +1333,7 @@ export function agentInstructionsService(db?: Db) {
       throw unprocessable("Entry edits require the canonical instruction commit service and baseRevisionId", { code: "INSTRUCTION_REVISION_REQUIRED" });
     }
     if (configured.mode !== "external") agentFilePath(relativePath);
-    const prepared = await ensureWritableBundle(agent, options);
+    const prepared = await ensureWritableBundle(agent, options, tx);
     instructionBytes(content);
     await assertInstructionPathSafe(prepared.state.rootPath!, relativePath);
     const absolutePath = resolvePathWithinRoot(prepared.state.rootPath!, relativePath);
@@ -1394,7 +1432,7 @@ export function agentInstructionsService(db?: Db) {
   ) {
     const writeOptions = options ? { clearLegacyPromptTemplate: options.clearLegacyPromptTemplate } : undefined;
     return withCurrentAgent(agent, relativePath, async (current, tx) => {
-      const result = await writeFileUnversioned(current, relativePath, content, writeOptions);
+      const result = await writeFileUnversioned(current, relativePath, content, writeOptions, tx);
       if (options?.persistConfig) {
         if (!tx) throw unprocessable("Configuration persistence requires the database-backed instructions service");
         await options.persistConfig(tx, current, result.adapterConfig);
@@ -1496,6 +1534,9 @@ export function agentInstructionsService(db?: Db) {
       const agent = args[0];
       const [owner] = await tx.select({ id: agents.id }).from(agents).where(and(eq(agents.id, agent.id), eq(agents.companyId, agent.companyId))).for("update");
       if (!owner) throw notFound("Agent not found");
+      // WS-2 (A5, A6): an unfinished copy in the managed root refuses before
+      // any folder is created, removed or written there.
+      await assertInstructionRootAvailable(tx, agent, resolveManagedInstructionsRoot(agent), { isInstanceAdmin: false, createParent: true });
       await assertUnversionedEntry(agent, args[2]?.entryFile ? normalizeRelativeFilePath(args[2].entryFile) : ENTRY_FILE_DEFAULT, tx);
       if (args[2]?.replaceExisting) {
         const [existingHead] = await tx.select({ id: agentInstructionHeads.revisionId }).from(agentInstructionHeads)
@@ -1511,6 +1552,7 @@ export function agentInstructionsService(db?: Db) {
     readFile,
     updateBundle,
     assertNoCopyIntentForRoot,
+    assertInstructionRootAvailable,
     writeFile,
     deleteFile,
     exportFiles,

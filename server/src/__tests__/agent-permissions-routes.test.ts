@@ -104,6 +104,7 @@ const mockSecretService = vi.hoisted(() => ({
 
 const mockAgentInstructionsService = vi.hoisted(() => ({
   materializeManagedBundle: vi.fn(),
+  assertInstructionRootAvailable: vi.fn(async () => undefined),
 }));
 const mockCompanySkillService = vi.hoisted(() => ({
   listRuntimeSkillEntries: vi.fn(),
@@ -188,6 +189,7 @@ function registerModuleMocks() {
       return config?.instructionsBundleMode === "external" ? "external" : "managed";
     },
     syncInstructionsBundleConfigFromFilePath: mockSyncInstructionsBundleConfigFromFilePath,
+    deriveBundleState: (agent: { adapterConfig?: Record<string, unknown> }) => ({ rootPath: (agent.adapterConfig?.instructionsRootPath as string | undefined) ?? null }),
   }));
 
   vi.doMock("../services/workspace-operations.js", () => ({
