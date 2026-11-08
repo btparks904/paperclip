@@ -12,24 +12,49 @@ import path from "node:path";
 import { randomUUID } from "node:crypto";
 import express from "express";
 import request from "supertest";
-import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { and, desc, eq, sql } from "drizzle-orm";
 import {
-  activityLog, agentConfigRevisions, agents, authUsers, companies, companyMemberships, createDb,
-  principalPermissionGrants, type Db,
+  activityLog, agentConfigRevisions, agentInstructionRevisions, agents, authUsers, companies, companyMemberships,
+  companySecrets, createDb, plugins, principalPermissionGrants, type Db,
 } from "@paperclipai/db";
 import { deriveBundleState, resolveManagedInstructionsRoot } from "../services/agent-instructions.js";
 import { agentService } from "../services/agents.js";
 import { companySkillService } from "../services/company-skills.js";
 import { builtInAgentService } from "../services/built-in-agents.js";
 import { agentRoutes } from "../routes/agents.js";
+import { buildHostServices } from "../services/plugin-host-services.js";
 import { errorHandler } from "../middleware/index.js";
 import { startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
+
+// F-1 fault injection: run a hook just before a named writer's update, after
+// its own read. Every other caller passes straight through to the real service.
+const updateHooks = vi.hoisted(() => ({ before: new Map<string, () => Promise<void>>() }));
+vi.mock("../services/agents.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../services/agents.js")>();
+  return {
+    ...actual,
+    agentService: (...args: Parameters<typeof actual.agentService>) => {
+      const svc = actual.agentService(...args);
+      return {
+        ...svc,
+        update: async (...updateArgs: Parameters<typeof svc.update>) => {
+          const source = (updateArgs[2] as { recordRevision?: { source?: string } } | undefined)?.recordRevision?.source;
+          const key = source ? [...updateHooks.before.keys()].find((suffix) => source.endsWith(suffix)) : undefined;
+          const hook = key ? updateHooks.before.get(key) : undefined;
+          if (key && hook) { updateHooks.before.delete(key); await hook(); }
+          return svc.update(...updateArgs);
+        },
+      };
+    },
+  };
+});
 
 const KEYS = ["instructionsBundleMode", "instructionsRootPath", "instructionsEntryFile", "instructionsFilePath", "agentsMdPath"] as const;
 type Config = Record<string, unknown>;
 const ENTRY = "SENTINEL-CARRY-FORWARD-ENTRY\n";
 const CONFIG_CHANGED = "AGENT_CONFIG_CHANGED";
+const RAW_API_KEY = "SENTINEL-SYNTHETIC-RAW-API-KEY-CARRY";
 
 /** The five instruction keys present in a config (absent keys omitted). */
 const keysOf = (config: unknown): Config => Object.fromEntries(
@@ -492,5 +517,386 @@ describe("updateAgent carries instruction settings forward from the locked row",
       expect(result).toBe("done");
       expect((await configOf()).model).toBe("nested");
     }, 20_000);
+  });
+
+  describe("F-1: stale reset writers (W-10, W-13, W-14)", () => {
+    const STOCK = { "notes/one.md": "STOCK-ONE\n", "notes/two.md": "STOCK-TWO\n", "notes/three.md": "STOCK-THREE\n" };
+    const PLUGIN_ENTRY = "PLUGIN-STOCK-ENTRY\n";
+    afterEach(() => { vi.restoreAllMocks(); updateHooks.before.clear(); });
+
+    /** Every file under a root with its content, or null when the root does not exist. */
+    async function filesUnder(root: string): Promise<Record<string, string> | null> {
+      const out: Record<string, string> = {};
+      const walk = async (dir: string): Promise<boolean> => {
+        let entries;
+        try { entries = await fs.readdir(dir, { withFileTypes: true }); } catch { return false; }
+        for (const entry of entries) {
+          const full = path.join(dir, entry.name);
+          if (entry.isDirectory()) await walk(full);
+          else out[path.relative(root, full)] = await fs.readFile(full, "utf8");
+        }
+        return true;
+      };
+      return (await walk(root)) ? Object.fromEntries(Object.entries(out).sort()) : null;
+    }
+    async function effects(id: string, roots: Record<string, string>) {
+      const files: Record<string, unknown> = {};
+      for (const [name, root] of Object.entries(roots)) files[name] = await filesUnder(root);
+      return {
+        keys: keysOf(await configOf(id)),
+        configRevisions: (await revisions(id)).length,
+        instructionRevisions: (await db.select({ id: agentInstructionRevisions.id }).from(agentInstructionRevisions)
+          .where(eq(agentInstructionRevisions.agentId, id))).length,
+        activity: await activityCount(),
+        files,
+      };
+    }
+    /** Commit a switch now (no lock may be held by the caller). */
+    const commitSwitch = (id: string, keys: Config) => db.transaction(async (tx) => {
+      const [row] = await tx.select().from(agents).where(eq(agents.id, id)).for("update");
+      await tx.update(agents).set({ adapterConfig: withKeys(row!.adapterConfig as Config, keys) }).where(eq(agents.id, id));
+    });
+    /** Queue a switch behind a lock the caller holds, and return once it is waiting. */
+    async function queueSwitch(id: string, keys: Config) {
+      const done = commitSwitch(id, keys);
+      for (let i = 0; i < 200; i += 1) {
+        const rows = await db.execute(sql`select count(*)::int as n from pg_stat_activity
+          where datname = current_database() and wait_event_type = 'Lock'`);
+        const n = Number((rows as unknown as Array<{ n: number }>)[0]?.n ?? (rows as any).rows?.[0]?.n ?? 0);
+        if (n > 0) return { done, waited: true };
+        await sleep(25);
+      }
+      return { done, waited: false };
+    }
+    /** After the real write of `file` under `root`, queue a switch while the write still holds the row lock. */
+    function switchAfterWrite(root: string, file: string, id: () => string, keys: () => Config) {
+      const realWrite = fs.writeFile.bind(fs);
+      const state: { queued?: Promise<{ done: Promise<void>; waited: boolean }> } = {};
+      vi.spyOn(fs, "writeFile").mockImplementation((async (target: any, data: any, options?: any) => {
+        await realWrite(target, data, options);
+        if (!state.queued && String(target) === path.join(root, file)) {
+          state.queued = queueSwitch(id(), keys());
+          await state.queued;
+        }
+      }) as typeof fs.writeFile);
+      return state;
+    }
+
+    async function seedPluginAgent() {
+      const pluginId = randomUUID();
+      const manifest: any = {
+        id: `paperclip.carry-forward-${pluginId.slice(0, 8)}`, apiVersion: 1, version: "0.1.0", displayName: "Carry", description: "Test plugin",
+        author: "Paperclip", categories: ["automation"], capabilities: ["agents.managed"], entrypoints: { worker: "./dist/worker.js" },
+        agents: [{ agentKey: "carry", displayName: "Carry Managed", role: "engineer", title: "t", capabilities: "c",
+          adapterType: "process", adapterConfig: { command: "carry" }, runtimeConfig: { heartbeat: { enabled: false } },
+          permissions: { canCreateAgents: false }, budgetMonthlyCents: 0,
+          instructions: { entryFile: "AGENTS.md", content: PLUGIN_ENTRY, files: STOCK } }],
+      };
+      await db.insert(plugins).values({ id: pluginId, pluginKey: manifest.id, packageName: "@paperclipai/carry", version: "0.1.0",
+        apiVersion: 1, categories: manifest.categories, manifestJson: manifest, status: "ready", installOrder: 1 });
+      const services = buildHostServices(db, pluginId, manifest.id, { forPlugin: () => ({ emit: async () => {}, subscribe: () => {} }) } as any,
+        undefined, { manifest });
+      const created = await services.agents.managedReconcile({ companyId, agentKey: "carry" });
+      const id = created.agentId!;
+      const managed = resolveManagedInstructionsRoot({ companyId, id, name: "x", adapterConfig: {} });
+      const ext = path.join(home, "ext-b", id);
+      await fs.mkdir(ext, { recursive: true });
+      await fs.writeFile(path.join(ext, "MAIN.md"), "B-ENTRY\n");
+      // Drift the stock files so a reset has something to write.
+      for (const file of Object.keys(STOCK)) await fs.writeFile(path.join(managed, file), "USER-EDIT\n");
+      await fs.writeFile(path.join(managed, "AGENTS.md"), "USER-ENTRY-EDIT\n");
+      const reset = () => services.agents.managedReset({ companyId, agentKey: "carry" });
+      return { id, managed, ext, reset, stateExt: () => cfg("external", ext, "MAIN.md") };
+    }
+    const outcome = (value: Promise<unknown>) => value.then((r: any) => ({ ok: true, status: r?.status ?? null }),
+      (e: any) => ({ ok: false, status: e?.status ?? null, code: e?.details?.code ?? null, message: String(e?.message ?? e) }));
+
+    it("W-13 mid-loop: a switch committed during the stock file writes stops the remaining writes; nothing reaches root B", async () => {
+      const agent = await seedPluginAgent();
+      const before = await effects(agent.id, { A: agent.managed, B: agent.ext });
+      const hook = switchAfterWrite(agent.managed, "notes/one.md", () => agent.id, agent.stateExt);
+      const result = await outcome(agent.reset());
+      const queued = await hook.queued!;
+      await queued.done;
+      const after = await effects(agent.id, { A: agent.managed, B: agent.ext });
+      char("F-1 W-13 mid-loop", { result, waited: queued.waited, before: norm(before), after: norm(after) });
+      expect(queued.waited).toBe(true);
+      expect(result.ok).toBe(false);
+      expect(result.status).toBe(409);
+      expect(after.keys).toEqual(agent.stateExt());
+      expect(after.files.B).toEqual(before.files.B);
+      expect(after.configRevisions).toBe(before.configRevisions);
+      // Residual (WS-2): the entry reset and the first stock write stay in root A.
+      expect(after.files.A).toMatchObject({ "AGENTS.md": PLUGIN_ENTRY, "notes/one.md": STOCK["notes/one.md"],
+        "notes/two.md": "USER-EDIT\n", "notes/three.md": "USER-EDIT\n" });
+    }, 30_000);
+
+    it("W-13 mid-loop, same-root entry-only switch: the remaining stock files still land in the active root, then the update refuses (residual)", async () => {
+      const agent = await seedPluginAgent();
+      await fs.writeFile(path.join(agent.managed, "OTHER.md"), "OTHER-ENTRY\n");
+      const entrySwitch = () => cfg("managed", agent.managed, "OTHER.md");
+      const before = await effects(agent.id, { A: agent.managed });
+      const hook = switchAfterWrite(agent.managed, "notes/one.md", () => agent.id, entrySwitch);
+      const result = await outcome(agent.reset());
+      const queued = await hook.queued!;
+      await queued.done;
+      const after = await effects(agent.id, { A: agent.managed });
+      char("F-1 W-13 mid-loop entry-only", { result, waited: queued.waited, before: norm(before), after: norm(after) });
+      expect(queued.waited).toBe(true);
+      expect(result).toMatchObject({ ok: false, status: 409, code: CONFIG_CHANGED });
+      expect(after.keys).toEqual(entrySwitch());
+      expect(after.configRevisions).toBe(before.configRevisions);
+      // Residual (WS-2): same root, so the target guard does not trip; the rest of the stock files land in the active root.
+      expect(after.files.A).toMatchObject({ ...STOCK, "OTHER.md": "OTHER-ENTRY\n" });
+    }, 30_000);
+
+    it("W-13 after the loop: a switch committed before the final update gives 409 AGENT_CONFIG_CHANGED and keeps root B", async () => {
+      const agent = await seedPluginAgent();
+      const before = await effects(agent.id, { A: agent.managed, B: agent.ext });
+      updateHooks.before.set(":managed-agent-instructions", () => commitSwitch(agent.id, agent.stateExt()));
+      const result = await outcome(agent.reset());
+      const after = await effects(agent.id, { A: agent.managed, B: agent.ext });
+      char("F-1 W-13 after loop", { result, before: norm(before), after: norm(after) });
+      expect(result).toMatchObject({ ok: false, status: 409, code: CONFIG_CHANGED });
+      expect(after.keys).toEqual(agent.stateExt());
+      expect(after.files.B).toEqual(before.files.B);
+      expect(after.configRevisions).toBe(before.configRevisions);
+    }, 30_000);
+
+    for (const variant of ["root switch", "agentsMdPath added (missing to present)"] as const) {
+      it(`W-14: a ${variant} committed after W-13's update gives 409 AGENT_CONFIG_CHANGED with no file change`, async () => {
+        const agent = await seedPluginAgent();
+        let filesAtHook: unknown = null;
+        let target: Config = {};
+        updateHooks.before.set(":managed-agent-reset", async () => {
+          filesAtHook = await effects(agent.id, { A: agent.managed, B: agent.ext });
+          const current = keysOf(await configOf(agent.id));
+          target = variant === "root switch" ? agent.stateExt() : { ...current, agentsMdPath: path.join(agent.managed, "LEGACY.md") };
+          await commitSwitch(agent.id, target);
+        });
+        const result = await outcome(agent.reset());
+        const after = await effects(agent.id, { A: agent.managed, B: agent.ext });
+        char(`F-1 W-14 ${variant}`, { result, atHook: norm(filesAtHook), after: norm(after) });
+        expect(result).toMatchObject({ ok: false, status: 409, code: CONFIG_CHANGED });
+        expect(after.keys).toEqual(target);
+        expect(after.files).toEqual((filesAtHook as any).files);
+        expect(after.configRevisions).toBe((filesAtHook as any).configRevisions);
+        expect(after.activity).toBe((filesAtHook as any).activity);
+      }, 30_000);
+    }
+
+    it("W-13 and W-14 without a concurrent switch: the reset succeeds and writes every stock file into root A", async () => {
+      const agent = await seedPluginAgent();
+      const result = await outcome(agent.reset());
+      const after = await effects(agent.id, { A: agent.managed, B: agent.ext });
+      char("F-1 plugin reset success", { result, after: norm(after) });
+      expect(result).toMatchObject({ ok: true, status: "reset" });
+      expect(after.keys).toMatchObject({ instructionsBundleMode: "managed", instructionsRootPath: agent.managed, instructionsEntryFile: "AGENTS.md" });
+      for (const [file, content] of Object.entries(STOCK)) expect((after.files.A as Record<string, string>)[file]).toBe(content);
+      expect((after.files.A as Record<string, string>)["AGENTS.md"]).toBe(PLUGIN_ENTRY);
+    }, 30_000);
+
+    const operator = { type: "board", userId: "local-board", source: "local_implicit" } as const;
+    async function seedBuiltIn() {
+      await agentService(db).create(companyId, { name: "CEO", role: "ceo", status: "idle", adapterType: "codex_local",
+        adapterConfig: { model: "gpt-5.4" }, runtimeConfig: {}, permissions: {} });
+      const builtIns = builtInAgentService(db);
+      const state = await builtIns.ensure(companyId, "reflection-coach");
+      const id = state.agent!.id;
+      const managed = resolveManagedInstructionsRoot({ companyId, id, name: "x", adapterConfig: {} });
+      const ext = path.join(home, "ext-b", id);
+      await fs.mkdir(ext, { recursive: true });
+      await fs.writeFile(path.join(ext, "MAIN.md"), "B-ENTRY\n");
+      await fs.writeFile(path.join(managed, "AGENTS.md"), "USER-EDIT\n");
+      return { id, managed, ext, reset: () => builtIns.reset(companyId, "reflection-coach", { resources: ["instructions"] }, operator as any) };
+    }
+
+    it("W-10 after the stock writes: a switch committed before the final update gives 409 AGENT_CONFIG_CHANGED and keeps root B", async () => {
+      const agent = await seedBuiltIn();
+      const target = cfg("external", agent.ext, "MAIN.md");
+      const before = await effects(agent.id, { A: agent.managed, B: agent.ext });
+      updateHooks.before.set("built-in-bundle:reset:instructions", () => commitSwitch(agent.id, target));
+      const result = await outcome(agent.reset());
+      const after = await effects(agent.id, { A: agent.managed, B: agent.ext });
+      char("F-1 W-10 after loop", { result, before: JSON.parse(JSON.stringify(norm(before)).split(agent.id).join("<BUILTIN>")),
+        after: JSON.parse(JSON.stringify(norm(after)).split(agent.id).join("<BUILTIN>")) });
+      expect(result).toMatchObject({ ok: false, status: 409, code: CONFIG_CHANGED });
+      expect(after.keys).toEqual(target);
+      expect(after.files.B).toEqual(before.files.B);
+      expect(after.configRevisions).toBe(before.configRevisions);
+    }, 30_000);
+
+    it("W-10 without a concurrent switch: the reset succeeds and restores the stock entry", async () => {
+      const agent = await seedBuiltIn();
+      const result = await outcome(agent.reset());
+      const after = await effects(agent.id, { A: agent.managed });
+      char("F-1 W-10 reset success", { result: { ok: result.ok }, keys: JSON.parse(JSON.stringify(norm(after.keys)).split(agent.id).join("<BUILTIN>")),
+        entryRestored: (after.files.A as Record<string, string>)["AGENTS.md"] !== "USER-EDIT\n" });
+      expect(result.ok).toBe(true);
+      expect(after.keys).toMatchObject({ instructionsBundleMode: "managed", instructionsRootPath: agent.managed });
+      expect((after.files.A as Record<string, string>)["AGENTS.md"]).not.toBe("USER-EDIT\n");
+    }, 30_000);
+  });
+
+  describe("F-2: secrets are normalized inside the update transaction", () => {
+    const secretCount = async () => (await db.select({ id: companySecrets.id }).from(companySecrets).where(eq(companySecrets.companyId, companyId))).length;
+    /** Everything a rejected PATCH must leave unchanged, including secret rows. */
+    const full = async () => ({ config: await configOf(), revisions: (await revisions()).length, activity: await activityCount(), secrets: await secretCount() });
+    /** A config with secret ids replaced, for comparing persisted shapes across runs. */
+    const shape = (config: Config) => JSON.parse(JSON.stringify(norm(config)).replace(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/g, "<ID>"));
+    const patch = (body: Record<string, unknown>, actor: () => Record<string, unknown> = actorAdmin) =>
+      request(app(actor)).patch(`/api/agents/${agentId}`).send(body);
+    const viewer = async () => {
+      const other = randomUUID();
+      await db.insert(authUsers).values({ id: other, name: "Viewer", email: `${other}@example.test`, createdAt: new Date(), updatedAt: new Date() });
+      await db.insert(companyMemberships).values([{ companyId, principalType: "user", principalId: other, membershipRole: "viewer" }]);
+      return () => ({ type: "board", userId: other, companyIds: [companyId], source: "session", isInstanceAdmin: false });
+    };
+    const withStrict = async <T>(fn: () => Promise<T>) => {
+      const previous = process.env.PAPERCLIP_SECRETS_STRICT_MODE;
+      process.env.PAPERCLIP_SECRETS_STRICT_MODE = "true";
+      try { return await fn(); } finally {
+        if (previous === undefined) delete process.env.PAPERCLIP_SECRETS_STRICT_MODE; else process.env.PAPERCLIP_SECRETS_STRICT_MODE = previous;
+      }
+    };
+    beforeEach(async () => {
+      await db.update(agents).set({ adapterType: "hermes_gateway", adapterConfig: { ...stateA(), model: "m0" } }).where(eq(agents.id, agentId));
+      await fs.mkdir(rootC, { recursive: true });
+    });
+
+    describe("F-2 rejections leave no secret row and change nothing", () => {
+      for (const mode of ["merge", "replace"] as const) {
+        it(`${mode} mode with a raw secret and a concurrent switch: 409 ${CONFIG_CHANGED}`, async () => {
+          const body = mode === "merge"
+            ? { adapterConfig: { instructionsFilePath: path.join(rootC, "AGENTS.md"), apiKey: RAW_API_KEY } }
+            : { adapterConfig: { ...stateC(), model: "m3", apiKey: RAW_API_KEY }, replaceAdapterConfig: true };
+          const hold = holdSwitch(stateB());
+          await sleep(50);
+          const res = patch(body).then((r) => r);
+          await hold.done;
+          const before = await full();
+          const settled = await res;
+          const after = await full();
+          char(`F-2 ${mode} 409 raw secret`, { status: settled.status, waited: hold.waited(), secretsBefore: before.secrets, secretsAfter: after.secrets });
+          expect(hold.waited()).toBe(true);
+          expect(settled.status, JSON.stringify(settled.body)).toBe(409);
+          expect(JSON.stringify(settled.body)).toContain(CONFIG_CHANGED);
+          expect(after).toEqual(before);
+          expect(after.secrets).toBe(0);
+          expect(keysOf(after.config)).toEqual(stateB());
+        });
+      }
+      it("an unauthorized viewer PATCH with a raw secret: 403 and no secret row", async () => {
+        const actor = await viewer();
+        const before = await full();
+        const res = await patch({ adapterConfig: { apiKey: RAW_API_KEY } }, actor);
+        const after = await full();
+        char("F-2 viewer 403 raw secret", { status: res.status, secretsBefore: before.secrets, secretsAfter: after.secrets });
+        expect(res.status).toBe(403);
+        expect(after).toEqual(before);
+      });
+      it("an authorized strict-mode PATCH with a raw sensitive env value: 422 and no secret row", async () => {
+        const before = await full();
+        const res = await withStrict(() => patch({ adapterConfig: { apiKey: RAW_API_KEY, env: { OPENAI_API_KEY: { type: "plain", value: "SENTINEL-PLAIN-TOKEN" } } } }));
+        const after = await full();
+        char("F-2 strict 422", { status: res.status, error: res.body?.error, secretsAfter: after.secrets });
+        expect(res.status).toBe(422);
+        expect(String(res.body?.error)).toContain("Strict secret mode requires secret references for sensitive key: OPENAI_API_KEY");
+        expect(after).toEqual(before);
+      });
+      it("a constraint failure with a raw secret keeps its validation error", async () => {
+        await db.update(agents).set({ adapterType: "opencode_local", adapterConfig: { ...stateA(), model: "openai/gpt-5" } }).where(eq(agents.id, agentId));
+        const before = await full();
+        const res = await patch({ adapterConfig: { model: "not-a-provider-model", env: { API_TOKEN: { type: "plain", value: "SENTINEL-PLAIN-TOKEN" } } } });
+        const after = await full();
+        char("F-2 constraint 422", { status: res.status, error: res.body?.error, secretsAfter: after.secrets });
+        expect(res.status).toBe(422);
+        expect(String(res.body?.error)).toContain("Invalid opencode_local adapterConfig");
+        expect(after).toEqual(before);
+      });
+      it("an updateAgent rejection after normalization (direct service D-R4) rolls the secret back", async () => {
+        const stale = await configOf();
+        const hold = holdSwitch(stateB());
+        await sleep(50);
+        const write = agentService(db).update(agentId, { adapterConfig: { ...stale, apiKey: RAW_API_KEY } },
+          { instructionConfigWrite: { keys: "all", expected: stale } }).then(() => null, (e) => e?.details?.code ?? String(e));
+        await hold.done;
+        const before = await full();
+        const code = await write;
+        const after = await full();
+        char("F-2 service 409 raw secret", { code, secretsAfter: after.secrets });
+        expect(code).toBe(CONFIG_CHANGED);
+        expect(after).toEqual(before);
+        expect(after.secrets).toBe(0);
+      });
+      it("rollback of an outer transaction removes a secret created inside it", async () => {
+        const before = await full();
+        const result = await db.transaction(async (tx) => {
+          await agentService(tx as unknown as Db).update(agentId, { adapterConfig: { ...(await configOf()), apiKey: RAW_API_KEY } });
+          throw new Error("SENTINEL-OUTER-ROLLBACK");
+        }).then(() => "committed", (e) => String(e?.message));
+        const after = await full();
+        expect(result).toBe("SENTINEL-OUTER-ROLLBACK");
+        expect(after).toEqual(before);
+      });
+    });
+
+    describe("F-2 success", () => {
+      it("a new raw secret creates exactly one secret row and is stored as the base canonical reference", async () => {
+        const res = await patch({ adapterConfig: { apiKey: RAW_API_KEY } });
+        const final = await configOf();
+        char("F-2 success new raw secret", { status: res.status, secrets: await secretCount(), config: shape(final) });
+        expect(res.status, JSON.stringify(res.body)).toBe(200);
+        expect(await secretCount()).toBe(1);
+        // The canonical reference shape stored at the base (8a99046a).
+        expect(final.apiKey).toEqual({ type: "secret_ref", secretId: expect.any(String), version: "latest",
+          projectionClass: "unclassified", projectionAllowlistKey: null });
+        expect(JSON.stringify(final)).not.toContain(RAW_API_KEY);
+        expect(JSON.stringify(res.body)).not.toContain(RAW_API_KEY);
+      });
+      it("an existing secret reference is kept and creates no row", async () => {
+        await patch({ adapterConfig: { apiKey: RAW_API_KEY } });
+        const ref = (await configOf()).apiKey;
+        const res = await patch({ adapterConfig: { apiKey: ref, model: "m4" } });
+        const final = await configOf();
+        char("F-2 success existing ref", { status: res.status, secrets: await secretCount(), same: JSON.stringify(final.apiKey) === JSON.stringify(ref), config: shape(final) });
+        expect(res.status, JSON.stringify(res.body)).toBe(200);
+        expect(await secretCount()).toBe(1);
+        expect(final.apiKey).toEqual(ref);
+      });
+      it("a repeated equivalent raw-secret PATCH (characterized against the base)", async () => {
+        await patch({ adapterConfig: { apiKey: RAW_API_KEY } });
+        const res = await patch({ adapterConfig: { apiKey: RAW_API_KEY } });
+        const final = await configOf();
+        char("F-2 success repeated raw", { status: res.status, secrets: await secretCount(), config: shape(final) });
+        expect(res.status, JSON.stringify(res.body)).toBe(200);
+        expect(JSON.stringify(final)).not.toContain(RAW_API_KEY);
+      });
+      it("a redacted env value keeps the stored value", async () => {
+        await db.update(agents).set({ adapterConfig: { ...stateA(), model: "m0", env: { OPENAI_API_KEY: { type: "plain", value: "SENTINEL-STORED-ENV" } } } }).where(eq(agents.id, agentId));
+        const res = await patch({ adapterConfig: { env: { OPENAI_API_KEY: { type: "plain", value: "***REDACTED***" } }, model: "m5" } });
+        const final = await configOf();
+        char("F-2 success redacted env", { status: res.status, secrets: await secretCount(), env: final.env, model: final.model });
+        expect(res.status, JSON.stringify(res.body)).toBe(200);
+        expect(final.env).toEqual({ OPENAI_API_KEY: { type: "plain", value: "SENTINEL-STORED-ENV" } });
+      });
+      it("strict mode accepts a secret reference and normalizes a raw secret field", async () => {
+        const res = await withStrict(() => patch({ adapterConfig: { apiKey: RAW_API_KEY, env: { PLAIN_SETTING: { type: "plain", value: "ok" } } } }));
+        const final = await configOf();
+        char("F-2 success strict", { status: res.status, secrets: await secretCount(), config: shape(final) });
+        expect(res.status, JSON.stringify(res.body)).toBe(200);
+        expect(await secretCount()).toBe(1);
+        expect(JSON.stringify(final)).not.toContain(RAW_API_KEY);
+      });
+      it("a transaction-bound caller commits its secret with its update", async () => {
+        await db.transaction(async (tx) => {
+          await agentService(tx as unknown as Db).update(agentId, { adapterConfig: { ...(await configOf()), apiKey: RAW_API_KEY } });
+        });
+        const final = await configOf();
+        char("F-2 success nested", { secrets: await secretCount(), config: shape(final) });
+        expect(await secretCount()).toBe(1);
+        expect(final.apiKey).toMatchObject({ type: "secret_ref" });
+      });
+    });
   });
 });

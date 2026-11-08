@@ -19,7 +19,7 @@ import { conflict, forbidden, notFound } from "../errors.js";
 import { agentService } from "./agents.js";
 import { approvalService } from "./approvals.js";
 import { logActivity } from "./activity-log.js";
-import { agentInstructionsBundleMode, agentInstructionsService } from "./agent-instructions.js";
+import { agentInstructionsBundleMode, agentInstructionsService, resolveInstructionWriteTarget } from "./agent-instructions.js";
 import { agentInstructionRevisionService } from "./agent-instruction-revisions.js";
 
 const MANAGED_AGENT_ENTITY_TYPE = "managed_agent";
@@ -382,6 +382,9 @@ export function pluginManagedAgentService(
     if (!declared) return agent;
 
     let adapterConfig: Record<string, unknown>;
+    // A reset copies the instruction keys of `refreshed`; the update and every
+    // file write must still find that configuration and root under the lock.
+    let resetExpected: Record<string, unknown> | undefined;
     if (materializeOptions.replaceExisting) {
       const revisions = agentInstructionRevisionService(db);
       const target = { companyId, agentId: agent.id };
@@ -392,9 +395,11 @@ export function pluginManagedAgentService(
       if (receipt.materialization === "pending") throw conflict("Instruction revision saved; retry reset to repair its disk copy", { revisionId: receipt.revision.id });
       const refreshed = await agentSvc.getById(agent.id);
       if (!refreshed) throw notFound("Managed agent not found");
+      const expectedTarget = await resolveInstructionWriteTarget(refreshed);
       for (const [file, content] of Object.entries(declared.files)) {
-        if (file !== declared.entryFile) await instructions.writeFile(refreshed, file, content);
+        if (file !== declared.entryFile) await instructions.writeFile(refreshed, file, content, { expectedTarget });
       }
+      resetExpected = refreshed.adapterConfig;
       // A stock reset owns declared instruction paths, not the agent's other
       // persistent files (including a formerly configured entry).
       adapterConfig = { ...refreshed.adapterConfig };
@@ -412,7 +417,7 @@ export function pluginManagedAgentService(
       recordRevision: {
         source: `plugin:${optionsForRevisionSource()}:managed-agent-instructions`,
       },
-      instructionConfigWrite: { keys: "all" },
+      instructionConfigWrite: { keys: "all", expected: resetExpected },
     });
     return (updated as Agent | null) ?? { ...agent, adapterConfig };
   }
@@ -673,7 +678,8 @@ export function pluginManagedAgentService(
         recordRevision: {
           source: `plugin:${options.pluginKey}:managed-agent-reset`,
         },
-        instructionConfigWrite: { keys: "all" },
+        // The four keys above come from this result, so it must still match the locked row.
+        instructionConfigWrite: { keys: "all", expected: withInstructions.adapterConfig },
       });
       if (!updated) throw notFound("Managed agent not found");
       const updatedAgent = updated as Agent;

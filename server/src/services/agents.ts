@@ -144,6 +144,8 @@ interface UpdateAgentOptions {
   allowPendingApprovalConfigUpdate?: boolean;
   claudeLogin?: ClaudeLoginContext;
   instructionConfigWrite?: InstructionConfigWrite;
+  /** Options for the secret normalization that runs inside the update transaction. */
+  secretNormalization?: { strictMode?: boolean };
 }
 
 interface CreateAgentOptions {
@@ -770,21 +772,13 @@ export function agentService(db: Db) {
     if (data.permissions !== undefined) {
       normalizedPatch.permissions = normalizeAgentPermissions(data.permissions);
     }
+    // Secret normalization runs inside the update transaction (below), so a
+    // rejected update leaves no secret row behind.
+    const normalizeSecrets = Object.prototype.hasOwnProperty.call(normalizedPatch, "adapterConfig") &&
+      isPlainRecord(normalizedPatch.adapterConfig);
     if (
-      Object.prototype.hasOwnProperty.call(normalizedPatch, "adapterConfig") &&
-      isPlainRecord(normalizedPatch.adapterConfig)
-    ) {
-      const normalizedAdapterConfig = await secretsSvc.normalizeAdapterConfigForPersistence(
-        existing.companyId,
-        normalizedPatch.adapterConfig,
-        { adapterType: (normalizedPatch.adapterType ?? existing.adapterType) as string },
-      );
-      normalizedPatch.adapterConfig = normalizePaperclipRunnerAdapterConfig(
-        (normalizedPatch.adapterType ?? existing.adapterType) as string,
-        normalizedAdapterConfig,
-      );
-    } else if (
-      Object.prototype.hasOwnProperty.call(normalizedPatch, "adapterType")
+      !normalizeSecrets
+      && Object.prototype.hasOwnProperty.call(normalizedPatch, "adapterType")
       && isPlainRecord(existing.adapterConfig)
     ) {
       normalizedPatch.adapterConfig = normalizePaperclipRunnerAdapterConfig(
@@ -792,17 +786,6 @@ export function agentService(db: Db) {
         existing.adapterConfig,
       );
     }
-    // Run the server-enforced binding invariant when the patch touches the
-    // adapter config. The update, approval, and rollback paths keep an existing
-    // fixed binding but reject a newly introduced binding, because they carry no
-    // stored-session claim.
-    const bindingDecision = Object.prototype.hasOwnProperty.call(normalizedPatch, "adapterConfig")
-      ? assertClaudeOAuthBindingInvariant({
-          adapterType: (normalizedPatch.adapterType ?? existing.adapterType) as string,
-          nextConfig: normalizedPatch.adapterConfig,
-          priorConfig: existing.adapterConfig,
-        })
-      : null;
 
     const shouldRecordRevision = Boolean(options?.recordRevision) && hasConfigPatchFields(normalizedPatch);
 
@@ -817,6 +800,39 @@ export function agentService(db: Db) {
       const locked = await agentService(txDb).getById(id);
       if (!locked) return null;
       const lockedAdapterConfig = isPlainRecord(locked.adapterConfig) ? locked.adapterConfig : {};
+      // After the agent row lock, as in the other transaction-bound callers.
+      if (normalizeSecrets) {
+        const adapterType = (normalizedPatch.adapterType ?? existing.adapterType) as string;
+        const txSecrets = secretService(txDb);
+        const normalizeOptions = { adapterType, strictMode: options?.secretNormalization?.strictMode };
+        let normalizedAdapterConfig = await txSecrets.normalizeAdapterConfigForPersistence(
+          existing.companyId,
+          normalizedPatch.adapterConfig as Record<string, unknown>,
+          normalizeOptions,
+        );
+        // A caller that hands normalization to this transaction (the generic
+        // PATCH) used to normalize once itself before this second pass. Keep
+        // both passes so the stored references are canonical exactly as before.
+        if (options?.secretNormalization) {
+          normalizedAdapterConfig = await txSecrets.normalizeAdapterConfigForPersistence(
+            existing.companyId,
+            normalizedAdapterConfig,
+            normalizeOptions,
+          );
+        }
+        normalizedPatch.adapterConfig = normalizePaperclipRunnerAdapterConfig(adapterType, normalizedAdapterConfig);
+      }
+      // Run the server-enforced binding invariant when the patch touches the
+      // adapter config. The update, approval, and rollback paths keep an existing
+      // fixed binding but reject a newly introduced binding, because they carry no
+      // stored-session claim.
+      const bindingDecision = Object.prototype.hasOwnProperty.call(normalizedPatch, "adapterConfig")
+        ? assertClaudeOAuthBindingInvariant({
+            adapterType: (normalizedPatch.adapterType ?? existing.adapterType) as string,
+            nextConfig: normalizedPatch.adapterConfig,
+            priorConfig: existing.adapterConfig,
+          })
+        : null;
       const instructionWrite = options?.instructionConfigWrite;
       if (instructionWrite?.expected && !instructionConfigEqual(instructionWrite.expected, lockedAdapterConfig)) {
         throw conflict("The agent's instructions configuration changed. Reload and try again.", {

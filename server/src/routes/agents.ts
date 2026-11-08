@@ -5615,12 +5615,15 @@ export function agentRoutes(
           rawEffectiveAdapterConfig,
         ),
       );
-      const normalizedEffectiveAdapterConfig = await normalizeMediatedAdapterConfigForPersistence({
-        companyId: existing.companyId,
-        adapterType: requestedAdapterType,
-        adapterConfig: effectiveAdapterConfig,
-      });
-      patchData.adapterConfig = syncInstructionsBundleConfigFromFilePath(existing, normalizedEffectiveAdapterConfig);
+      // Secrets are normalized inside the update transaction (with strict mode,
+      // below), so a rejected PATCH, including an unauthorized one, persists no
+      // secret. Secret normalization touches only env and secret fields, which
+      // these constraint and runner checks do not read.
+      await assertAdapterConfigConstraints(existing.companyId, requestedAdapterType, effectiveAdapterConfig);
+      patchData.adapterConfig = syncInstructionsBundleConfigFromFilePath(
+        existing,
+        normalizePaperclipRunnerAdapterConfig(requestedAdapterType ?? "", effectiveAdapterConfig),
+      );
       assertExternalInstructionsAdmin(req, {
         ...existing,
         adapterConfig: patchData.adapterConfig,
@@ -5679,6 +5682,7 @@ export function agentRoutes(
     const actor = getActorInfo(req);
     const agent = await svc.update(id, patchData, {
       instructionConfigWrite,
+      secretNormalization: { strictMode: strictSecretsMode },
       recordRevision: {
         createdByAgentId: actor.agentId,
         createdByUserId: actor.actorType === "user" ? actor.actorId : null,
