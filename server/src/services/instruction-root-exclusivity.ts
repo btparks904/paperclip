@@ -10,8 +10,21 @@
 // transaction under one fixed, transaction-scoped advisory lock
 // (INSTRUCTION_ROOT_ASSIGNMENT_LOCK). The lock is released at commit or
 // rollback, so two transactions cannot both pass the check for equivalent
-// roots. Lock order: the caller takes its agent row lock (L1) first, then this
-// lock. No caller takes an agent row lock after this lock.
+// roots.
+//
+// Lock order:
+//   1. The caller locks its agent row FOR NO KEY UPDATE (L1). Writers of one
+//      agent still serialize: NO KEY UPDATE conflicts with itself, with FOR
+//      UPDATE and with every UPDATE or DELETE of the row.
+//   2. A write that sets reports_to locks the parent row FOR KEY SHARE.
+//   3. This assignment lock.
+// After this lock, the transaction takes no explicit agent row lock. Its
+// inserts and updates still take implicit foreign-key KEY SHARE locks on the
+// agent rows they reference (for example created_by_agent_id on a revision,
+// or reports_to). KEY SHARE does not conflict with NO KEY UPDATE, so these
+// never wait on another instruction writer that holds L1 and waits for this
+// lock. They can still wait on a FOR UPDATE or DELETE holder, which is a
+// writer that never takes this lock.
 //
 // Path equivalence: each path becomes one comparison key.
 //   1. Resolve symbolic links with realpath.native on the nearest existing

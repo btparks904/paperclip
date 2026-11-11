@@ -700,7 +700,15 @@ describe("instructions bundle copy-and-switch", () => {
           pathKeyHash: fileHash(Buffer.from(intent.destination.pathKey)) } } };
       let release!: () => void;
       const gate = new Promise<void>((resolve) => { release = resolve; });
-      const open = db.transaction(async (tx) => { await tx.insert(activityLog).values(real); await gate; throw new Error("rollback"); }).catch(() => "rolled back");
+      // Like the real writer (recordCopyCompletion inside updateBundle), the
+      // completion insert runs while its transaction holds this agent's row
+      // FOR NO KEY UPDATE, until that transaction ends.
+      const open = db.transaction(async (tx) => {
+        await tx.select({ id: agents.id }).from(agents).where(eq(agents.id, agentId)).for("no key update");
+        await tx.insert(activityLog).values(real);
+        await gate;
+        throw new Error("rollback");
+      }).catch(() => "rolled back");
       await sleep(100);
       let settled = false;
       const pending = patch({ mode: "external", rootPath: ext }).then((result) => { settled = true; return result; });

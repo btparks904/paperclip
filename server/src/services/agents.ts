@@ -824,7 +824,12 @@ export function agentService(db: Db) {
       // the revision's "before" state come from this read, not from `existing`,
       // which another transaction may have changed since. A caller that already
       // holds the lock in this transaction takes it again without waiting.
-      const [lockedRow] = await txDb.select({ id: agents.id }).from(agents).where(eq(agents.id, id)).for("update");
+      // FOR NO KEY UPDATE: writers of this agent still serialize, and a
+      // foreign-key KEY SHARE lock on this row taken by a transaction that
+      // holds the instruction-root assignment lock (a revision attributed to
+      // this agent, or a child that reports to it) never waits on it. See the
+      // lock order in instruction-root-exclusivity.ts.
+      const [lockedRow] = await txDb.select({ id: agents.id }).from(agents).where(eq(agents.id, id)).for("no key update");
       if (!lockedRow) return null;
       const locked = await agentService(txDb).getById(id);
       if (!locked) return null;
@@ -1233,7 +1238,7 @@ export function agentService(db: Db) {
       const activatedAgent = await db.transaction(async (tx) => {
         const txDb = tx as unknown as Db;
         // WS-2 (A13): lock the agent row first (L1), as every other root writer does.
-        const [lockedRow] = await tx.select({ id: agents.id }).from(agents).where(eq(agents.id, id)).for("update");
+        const [lockedRow] = await tx.select({ id: agents.id }).from(agents).where(eq(agents.id, id)).for("no key update");
         if (!lockedRow) return null;
         const existing = await agentService(txDb).getById(id);
         if (!existing || existing.status !== "pending_approval") return null;

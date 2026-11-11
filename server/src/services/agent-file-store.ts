@@ -273,7 +273,11 @@ export function agentFileStore(db: Db) {
     fn: (tx: Tx, agent: Agent, root: string, bound: AuthorizationActor, recovered: RecoveredManagedBundle | null, adoption: AdoptionPlan) => Promise<T>,
     options?: { recoverManaged?: boolean; allowRecoveredManaged?: boolean; deferAdoption?: boolean }) {
     return db.transaction(async tx => {
-      const [agent] = await tx.select().from(agents).where(and(eq(agents.companyId, companyId), eq(agents.id, agentId))).for("update");
+      // FOR NO KEY UPDATE, like every instruction writer that can take the
+      // instruction-root assignment lock: writers of this agent still
+      // serialize, and a foreign-key KEY SHARE lock on this row (for example a
+      // revision attributed to this agent) never waits on it.
+      const [agent] = await tx.select().from(agents).where(and(eq(agents.companyId, companyId), eq(agents.id, agentId))).for("no key update");
       if (!agent) throw notFound("Agent not found");
       const bound = write ? await authorizeInstructionCommit(tx, actor, agent) : await authorizeInstructionRead(tx, actor, agent);
       // Re-evaluate recovery on the locked row, never on the caller's earlier read.

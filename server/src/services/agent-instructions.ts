@@ -1213,7 +1213,7 @@ export function agentInstructionsService(db?: Db) {
     const result = await db.transaction(async (tx) => {
       // Step 1: lock, then recheck what the route authorized (3.2).
       const [current] = await tx.select().from(agents)
-        .where(and(eq(agents.id, agent.id), eq(agents.companyId, agent.companyId))).for("update");
+        .where(and(eq(agents.id, agent.id), eq(agents.companyId, agent.companyId))).for("no key update");
       if (!current) throw notFound("Agent not found");
       await assertExpectedTarget(current, options.expectedTarget);
       if (agentInstructionsBundleMode(current) !== options.expectedConfigMode) throw conflict(MODE_CHANGED_MESSAGE);
@@ -1407,7 +1407,7 @@ export function agentInstructionsService(db?: Db) {
     }
     return db.transaction(async (tx) => {
       const [current] = await tx.select().from(agents)
-        .where(and(eq(agents.id, agent.id), eq(agents.companyId, agent.companyId))).for("update");
+        .where(and(eq(agents.id, agent.id), eq(agents.companyId, agent.companyId))).for("no key update");
       if (!current) throw notFound("Agent not found");
       assertExpectedBundleMode(current, expected?.mode);
       await assertExpectedTarget(current, expected?.target);
@@ -1534,7 +1534,7 @@ export function agentInstructionsService(db?: Db) {
     if (!db) throw unprocessable("Bundle initialization requires the database-backed instructions service");
     return db.transaction(async (tx) => {
       const agent = args[0];
-      const [owner] = await tx.select({ id: agents.id }).from(agents).where(and(eq(agents.id, agent.id), eq(agents.companyId, agent.companyId))).for("update");
+      const [owner] = await tx.select({ id: agents.id }).from(agents).where(and(eq(agents.id, agent.id), eq(agents.companyId, agent.companyId))).for("no key update");
       if (!owner) throw notFound("Agent not found");
       // WS-2 PR-W1: the first bind of the managed root is a root activation.
       const managedRoot = resolveManagedInstructionsRoot(agent);

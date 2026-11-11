@@ -9,10 +9,10 @@ import request from "supertest";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { and, eq, sql } from "drizzle-orm";
 import {
-  agents, approvals, authUsers, budgetPolicies, companies, companyMemberships, companySecrets, createDb, principalPermissionGrants, type Db,
+  agentConfigRevisions, agents, approvals, authUsers, budgetPolicies, companies, companyMemberships, companySecrets, createDb, principalPermissionGrants, type Db,
 } from "@paperclipai/db";
 import {
-  agentInstructionsBundleMode, agentInstructionsService, resolveInstructionWriteTarget, resolveManagedInstructionsRoot,
+  agentInstructionsBundleMode, agentInstructionsService, instructionCopyIntentsDirectory, resolveInstructionWriteTarget, resolveManagedInstructionsRoot,
   type InstructionConfigPersist, type UpdateBundleOptions,
 } from "../services/agent-instructions.js";
 import {
@@ -20,6 +20,7 @@ import {
   compareInstructionRootKeys, foldInstructionRootPath, instructionRootComparisonKey, resolveManagedAgentArea,
 } from "../services/instruction-root-exclusivity.js";
 import { agentService } from "../services/agents.js";
+import { agentFileStore, type AgentFileConfigRepair } from "../services/agent-file-store.js";
 import { approvalService } from "../services/approvals.js";
 import { secretService } from "../services/secrets.js";
 import { agentRoutes } from "../routes/agents.js";
@@ -626,24 +627,25 @@ describe("WS-2 PR-W1: exclusive instruction roots", () => {
       const gate = await holdAdvisory(GATE);
       let create: Promise<Outcome> | null = null;
       let parentChange: Promise<Outcome> | null = null;
-      let createAtInsert = false, parentWaitedOnRow = false, advisoryWhileParentWaits = -1;
+      let createAtInsert = false, parentQueuedOnLock = false, rowWaitersWhileParentQueued = -1;
       try {
         create = settle(agentService(db).create(companyId, { name: childName, adapterType: "hermes_gateway", reportsTo: parentId,
           adapterConfig: cfg("external", childRoot) }));
         // The create has passed its locked check and waits at the insert gate.
         createAtInsert = await waitFor(async () => (await advisoryWaiters()) === 1, 5_000);
         parentChange = settle(agentService(db).update(parentId, { adapterConfig: cfg("external", parentNext) }, { instructionConfigWrite: { keys: "all" } }));
-        // The parent must wait on its row (the create's KEY SHARE), never on the assignment lock.
-        parentWaitedOnRow = await waitFor(async () => (await rowLockWaiters()) >= 1, 5_000);
-        advisoryWhileParentWaits = await advisoryWaiters();
+        // The parent's NO KEY UPDATE row lock does not conflict with the create's KEY SHARE on
+        // it: the parent queues on the assignment lock, and no session waits on a row lock.
+        parentQueuedOnLock = await waitFor(async () => (await advisoryWaiters()) === 2, 5_000);
+        rowWaitersWhileParentQueued = await rowLockWaiters();
       } finally {
         gate.release();
         await gate.done;
       }
       const [createOutcome, parentOutcome] = [await create!, await parentChange!];
       expect(createAtInsert).toBe(true);
-      expect(parentWaitedOnRow).toBe(true);
-      expect(advisoryWhileParentWaits).toBe(1);
+      expect(parentQueuedOnLock).toBe(true);
+      expect(rowWaitersWhileParentQueued).toBe(0);
       expect(createOutcome, JSON.stringify(createOutcome)).toMatchObject({ ok: true });
       const child = (createOutcome as { value: { id: string } }).value;
       expect((await loadAgent(child.id))!.reportsTo).toBe(parentId);
@@ -669,24 +671,25 @@ describe("WS-2 PR-W1: exclusive instruction roots", () => {
       const assignment = await holdAdvisory(INSTRUCTION_ROOT_ASSIGNMENT_LOCK);
       let create: Promise<Outcome> | null = null;
       let parentChange: Promise<Outcome> | null = null;
-      let parentAtLock = false, createWaitedOnRow = false, advisoryWhileCreateWaits = -1;
+      let parentAtLock = false, createQueuedOnLock = false, rowWaitersWhileCreateQueued = -1;
       try {
         parentChange = settle(agentService(db).update(parentId, { adapterConfig: cfg("external", parentNext) }, { instructionConfigWrite: { keys: "all" } }));
-        // The parent holds its row FOR UPDATE and waits for the assignment lock.
+        // The parent holds its row (FOR NO KEY UPDATE) and waits for the assignment lock.
         parentAtLock = await waitFor(async () => (await advisoryWaiters()) === 1, 5_000);
         create = settle(agentService(db).create(companyId, { id: childId, name: `W1-child-${childId.slice(0, 8)}`, adapterType: "hermes_gateway",
           reportsTo: parentId, adapterConfig: cfg("external", childRoot) }));
-        // The create must wait on the parent row, before it asks for the assignment lock.
-        createWaitedOnRow = await waitFor(async () => (await rowLockWaiters()) >= 1, 5_000);
-        advisoryWhileCreateWaits = await advisoryWaiters();
+        // The create's KEY SHARE on the parent row does not conflict with the parent's NO KEY
+        // UPDATE lock: the create queues on the assignment lock, and no session waits on a row lock.
+        createQueuedOnLock = await waitFor(async () => (await advisoryWaiters()) === 2, 5_000);
+        rowWaitersWhileCreateQueued = await rowLockWaiters();
       } finally {
         assignment.release();
         await assignment.done;
       }
       const [parentOutcome, createOutcome] = [await parentChange!, await create!];
       expect(parentAtLock).toBe(true);
-      expect(createWaitedOnRow).toBe(true);
-      expect(advisoryWhileCreateWaits).toBe(1);
+      expect(createQueuedOnLock).toBe(true);
+      expect(rowWaitersWhileCreateQueued).toBe(0);
       expect(parentOutcome, JSON.stringify(parentOutcome)).toMatchObject({ ok: true });
       expect((await configOf(parentId)).instructionsRootPath).toBe(parentNext);
       if (conflict) {
@@ -706,31 +709,32 @@ describe("WS-2 PR-W1: exclusive instruction roots", () => {
      * orders, with deterministic barriers. "subject-first": the subject passes its locked check and
      * waits at the gate (before its reports_to key lock); then the parent starts. "parent-first":
      * the test holds the assignment lock; the parent locks its row and waits for it; then the
-     * subject starts. In both orders the second writer must wait on the parent row, not on the
-     * assignment lock. Every wait is bounded.
+     * subject starts. In both orders the second writer must queue on the assignment lock and no
+     * session may wait on a row lock: writers hold agent rows FOR NO KEY UPDATE, which the
+     * reports_to KEY SHARE lock does not conflict with. Every wait is bounded.
      */
     async function interleave(order: "subject-first" | "parent-first", subject: () => Promise<unknown>, parentNext: string) {
       const barrier = await holdAdvisory(order === "subject-first" ? GATE : INSTRUCTION_ROOT_ASSIGNMENT_LOCK);
       const changeParent = () => settle(agentService(db).update(parentId, { adapterConfig: cfg("external", parentNext) }, { instructionConfigWrite: { keys: "all" } }));
       let subjectRun: Promise<Outcome> | null = null;
       let parentRun: Promise<Outcome> | null = null;
-      let firstAtBarrier = false, secondWaitedOnRow = false, advisoryWhileWaiting = -1;
+      let firstAtBarrier = false, secondQueuedOnLock = false, rowWaitersWhileSecondQueued = -1;
       try {
         if (order === "subject-first") subjectRun = settle(subject());
         else parentRun = changeParent();
         firstAtBarrier = await waitFor(async () => (await advisoryWaiters()) === 1, 5_000);
         if (order === "subject-first") parentRun = changeParent();
         else subjectRun = settle(subject());
-        secondWaitedOnRow = await waitFor(async () => (await rowLockWaiters()) >= 1, 5_000);
-        advisoryWhileWaiting = await advisoryWaiters();
+        secondQueuedOnLock = await waitFor(async () => (await advisoryWaiters()) === 2, 5_000);
+        rowWaitersWhileSecondQueued = await rowLockWaiters();
       } finally {
         barrier.release();
         await barrier.done;
       }
-      const result = { subject: await subjectRun!, parent: await parentRun!, firstAtBarrier, secondWaitedOnRow, advisoryWhileWaiting };
+      const result = { subject: await subjectRun!, parent: await parentRun!, firstAtBarrier, secondQueuedOnLock, rowWaitersWhileSecondQueued };
       expect(result.firstAtBarrier).toBe(true);
-      expect(result.secondWaitedOnRow).toBe(true);
-      expect(result.advisoryWhileWaiting).toBe(1);
+      expect(result.secondQueuedOnLock).toBe(true);
+      expect(result.rowWaitersWhileSecondQueued).toBe(0);
       expect(await assignmentLockFree()).toBe(true);
       return result;
     }
@@ -805,6 +809,297 @@ describe("WS-2 PR-W1: exclusive instruction roots", () => {
         expect(parent, JSON.stringify(parent)).toMatchObject({ ok: true });
         expect((await configOf(parentId)).instructionsRootPath).toBe(parentNext);
       }
+    });
+
+    // Revision-actor cycle (PR #10 follow-up). An agent actor A saves into B's bundle, which
+    // first-binds B's managed root: the outer transaction locks B, takes the assignment lock,
+    // then the revision insert takes a KEY SHARE lock on A through created_by_agent_id. A
+    // concurrent root change of A locks A's row and waits for the assignment lock.
+    /** Persist as the routes do for an agent actor: attributed to that agent. */
+    const persistAs = (actorAgentId: string): InstructionConfigPersist => async (tx, current, adapterConfig) => {
+      const txDb = tx as unknown as Db;
+      const normalized = await secretService(txDb).normalizeAdapterConfigForPersistence(current.companyId, adapterConfig,
+        { strictMode: false, adapterType: current.adapterType ?? "process" });
+      await agentService(txDb).update(current.id, { adapterConfig: normalized },
+        { recordRevision: { createdByAgentId: actorAgentId, createdByUserId: null, source: "instructions_bundle_file_put" }, instructionConfigWrite: { keys: "all" } });
+    };
+    /** Agent actorId saves notes/a.md into targetId's bundle (first managed-root bind). */
+    const actorSave = async (actorId: string, targetId: string) =>
+      agentInstructionsService(db).writeFile((await loadAgent(targetId))!, "notes/a.md", `SENTINEL-${actorId.slice(0, 8)}\n`, { persistConfig: persistAs(actorId) });
+    const revisionsOf = async (target: string) => db.select().from(agentConfigRevisions).where(eq(agentConfigRevisions.agentId, target));
+    /** Like settle, but keeps the database error text and SQLSTATE that query wrappers put in cause. */
+    const settleDeep = (promise: Promise<unknown>): Promise<Outcome> => promise.then(
+      (value) => ({ ok: true as const, value }),
+      (error: any) => {
+        const chain: any[] = [];
+        for (let current = error; current && chain.length < 5; current = current.cause) chain.push(current);
+        const sqlState = chain.map((entry) => entry?.code).find((code) => typeof code === "string" && /^[0-9A-Z]{5}$/.test(code));
+        return { ok: false as const, status: error?.status, code: error?.details?.code ?? sqlState ?? error?.code,
+          message: chain.map((entry) => String(entry?.message ?? "")).join(" | "), details: error?.details ?? {} };
+      });
+    const isDeadlock = (outcome: Outcome) => {
+      if (outcome.ok) return false;
+      return /deadlock detected/i.test(outcome.message) || outcome.code === "40P01";
+    };
+    /**
+     * "assignment-first": the first writer takes the assignment lock and waits at the gate (after its
+     * locked check, before its agent row update and revision insert); the second then starts.
+     * "row-first": the test holds the assignment lock; the first writer locks its row and queues for
+     * it; the second locks its own row and queues behind. Released, the first runs first.
+     * Either way the second writer must queue on the assignment lock and no session may wait on a
+     * row lock. Every wait is bounded; outcomes are read after both transactions settle.
+     */
+    async function race(order: "assignment-first" | "row-first", first: () => Promise<unknown>, second: () => Promise<unknown>) {
+      const barrier = await holdAdvisory(order === "assignment-first" ? GATE : INSTRUCTION_ROOT_ASSIGNMENT_LOCK);
+      let firstRun: Promise<Outcome> | null = null;
+      let secondRun: Promise<Outcome> | null = null;
+      let firstQueued = false, secondQueued = false, rowWaitersWhileQueued = -1;
+      try {
+        firstRun = settleDeep(first());
+        firstQueued = await waitFor(async () => (await advisoryWaiters()) === 1, 5_000);
+        secondRun = settleDeep(second());
+        secondQueued = await waitFor(async () => (await advisoryWaiters()) === 2, 5_000);
+        rowWaitersWhileQueued = await rowLockWaiters();
+      } finally {
+        barrier.release();
+        await barrier.done;
+      }
+      const outcomes = { first: await firstRun!, second: await secondRun! };
+      expect(firstQueued).toBe(true);
+      expect(secondQueued).toBe(true);
+      expect(rowWaitersWhileQueued).toBe(0);
+      expect(isDeadlock(outcomes.first) || isDeadlock(outcomes.second), JSON.stringify(outcomes)).toBe(false);
+      expect(await assignmentLockFree()).toBe(true);
+      return outcomes;
+    }
+    async function seedPair() {
+      const actorId = randomUUID(), targetId = randomUUID();
+      await seedAgent(actorId, { model: "m0" }, { adapterType: "hermes_gateway" });
+      await seedAgent(targetId, { model: "m0" }, { name: `w1-gate-${targetId.slice(0, 8)}`, adapterType: "hermes_gateway" });
+      return { actorId, targetId };
+    }
+    const managedOf = (id: string) => resolveManagedInstructionsRoot({ id, companyId, name: "x", adapterConfig: {} });
+
+    it.each(["assignment-first", "row-first"] as const)(
+      "agent A first-binds B's bundle while the board changes A's root ($0): both commit, revision attributed to A",
+      async (order) => {
+        const { actorId, targetId } = await seedPair();
+        const actorNext = fresh("actor-next");
+        const { first, second } = await race(order, () => actorSave(actorId, targetId),
+          () => agentService(db).update(actorId, { adapterConfig: cfg("external", actorNext) }, { instructionConfigWrite: { keys: "all" } }));
+        expect(first, JSON.stringify(first)).toMatchObject({ ok: true });
+        expect(second, JSON.stringify(second)).toMatchObject({ ok: true });
+        expect((await configOf(targetId)).instructionsRootPath).toBe(managedOf(targetId));
+        expect(await fs.readFile(path.join(managedOf(targetId), "notes/a.md"), "utf8")).toBe(`SENTINEL-${actorId.slice(0, 8)}\n`);
+        const revisions = await revisionsOf(targetId);
+        expect(revisions.length).toBeGreaterThan(0);
+        for (const revision of revisions) {
+          expect(revision.createdByAgentId).toBe(actorId);
+          expect(revision.createdByUserId).toBeNull();
+        }
+        expect((await configOf(actorId)).instructionsRootPath).toBe(actorNext);
+      },
+    );
+
+    it.each(["assignment-first", "row-first"] as const)(
+      "reciprocal actors: A saves into B while B saves into A ($0): both commit with their own attribution",
+      async (order) => {
+        const { actorId: a, targetId: b } = await seedPair();
+        const { first, second } = await race(order, () => actorSave(a, b), () => actorSave(b, a));
+        expect(first, JSON.stringify(first)).toMatchObject({ ok: true });
+        expect(second, JSON.stringify(second)).toMatchObject({ ok: true });
+        expect((await configOf(b)).instructionsRootPath).toBe(managedOf(b));
+        expect((await configOf(a)).instructionsRootPath).toBe(managedOf(a));
+        expect((await revisionsOf(b)).every((revision) => revision.createdByAgentId === a)).toBe(true);
+        expect((await revisionsOf(a)).every((revision) => revision.createdByAgentId === b)).toBe(true);
+        expect((await revisionsOf(a)).length).toBeGreaterThan(0);
+      },
+    );
+
+    it("reporting parent and revision actor together: A saves into B while the board moves C under A with a new root and A changes its root", async () => {
+      const { actorId, targetId } = await seedPair();
+      const childId = randomUUID();
+      await seedAgent(childId, { model: "m0" }, { adapterType: "hermes_gateway" });
+      const childRoot = fresh("child"), actorNext = fresh("actor-next");
+      const gate = await holdAdvisory(GATE);
+      let save: Promise<Outcome> | null = null, move: Promise<Outcome> | null = null, change: Promise<Outcome> | null = null;
+      let queued = false, rowWaiters = -1;
+      try {
+        save = settleDeep(actorSave(actorId, targetId));
+        await waitFor(async () => (await advisoryWaiters()) === 1, 5_000);
+        move = settleDeep(agentService(db).update(childId, { reportsTo: actorId, adapterConfig: cfg("external", childRoot) }, { instructionConfigWrite: { keys: "all" } }));
+        change = settleDeep(agentService(db).update(actorId, { adapterConfig: cfg("external", actorNext) }, { instructionConfigWrite: { keys: "all" } }));
+        queued = await waitFor(async () => (await advisoryWaiters()) === 3, 5_000);
+        rowWaiters = await rowLockWaiters();
+      } finally {
+        gate.release();
+        await gate.done;
+      }
+      const outcomes = [await save!, await move!, await change!];
+      expect(queued).toBe(true);
+      expect(rowWaiters).toBe(0);
+      for (const outcome of outcomes) expect(outcome, JSON.stringify(outcome)).toMatchObject({ ok: true });
+      expect((await loadAgent(childId))!.reportsTo).toBe(actorId);
+      expect((await configOf(childId)).instructionsRootPath).toBe(childRoot);
+      expect((await configOf(actorId)).instructionsRootPath).toBe(actorNext);
+      expect((await revisionsOf(targetId)).every((revision) => revision.createdByAgentId === actorId)).toBe(true);
+    });
+
+    it.each(["assignment-first", "row-first"] as const)(
+      "the board moves A's bundle into B's managed area while A first-binds B ($0): the bundle switch is refused with nothing written",
+      async (order) => {
+        const { actorId, targetId } = await seedPair();
+        const before = await configOf(actorId);
+        const revisionsBefore = (await revisionsOf(actorId)).length;
+        const intoB = path.join(managedOf(targetId), "stolen");
+        const actor = (await loadAgent(actorId))!;
+        const options = await optionsFor(actor);
+        const { first, second } = await race(order, () => actorSave(actorId, targetId),
+          () => agentInstructionsService(db).updateBundle(actor, { mode: "external", rootPath: intoB }, options));
+        expect(first, JSON.stringify(first)).toMatchObject({ ok: true });
+        expect(second).toMatchObject({ ok: false, status: 409, code: INSTRUCTION_ROOT_IN_USE });
+        expect(await configOf(actorId)).toEqual(before);
+        expect((await revisionsOf(actorId)).length).toBe(revisionsBefore);
+        expect(await exists(intoB)).toBe(false);
+        expect(await fs.readdir(instructionCopyIntentsDirectory()).catch(() => [] as string[])).toEqual([]);
+        expect((await revisionsOf(targetId)).every((revision) => revision.createdByAgentId === actorId)).toBe(true);
+      },
+    );
+
+    it.each(["assignment-first", "row-first"] as const)(
+      "the board moves A's bundle to an independent root while A first-binds B ($0): both commit, files copied, no copy intent left",
+      async (order) => {
+        const { actorId, targetId } = await seedPair();
+        const actorRoot = managedOf(actorId);
+        await seed(actorRoot, { "AGENTS.md": ENTRY });
+        await db.update(agents).set({ adapterConfig: { ...cfg("managed", actorRoot), model: "m0" } }).where(eq(agents.id, actorId));
+        const independent = fresh("independent");
+        const actor = (await loadAgent(actorId))!;
+        const options = await optionsFor(actor);
+        const { first, second } = await race(order, () => actorSave(actorId, targetId),
+          () => agentInstructionsService(db).updateBundle(actor, { mode: "external", rootPath: independent }, options));
+        expect(first, JSON.stringify(first)).toMatchObject({ ok: true });
+        expect(second, JSON.stringify(second)).toMatchObject({ ok: true });
+        expect((await configOf(actorId)).instructionsRootPath).toBe(independent);
+        expect(await fs.readFile(path.join(independent, "AGENTS.md"), "utf8")).toBe(ENTRY);
+        expect(await fs.readdir(instructionCopyIntentsDirectory()).catch(() => [] as string[])).toEqual([]);
+        expect((await revisionsOf(targetId)).every((revision) => revision.createdByAgentId === actorId)).toBe(true);
+      },
+    );
+
+    it.each(["assignment-first", "row-first"] as const)(
+      "the board saves into A's unconfigured managed bundle (store repair binds A's root) while A first-binds B ($0): both commit",
+      async (order) => {
+        const { actorId, targetId } = await seedPair();
+        await seed(managedOf(actorId), { "AGENTS.md": ENTRY });
+        const repairAsBoard: AgentFileConfigRepair = async (tx, agent, adapterConfig) => {
+          await agentService(tx as unknown as Db).update(agent.id, { adapterConfig },
+            { recordRevision: { createdByAgentId: null, createdByUserId: userId, source: "instructions_bundle_file_put" }, instructionConfigWrite: { keys: "all" } });
+        };
+        const { first, second } = await race(order, () => actorSave(actorId, targetId),
+          () => agentFileStore(db).write({ companyId, agentId: actorId, path: "notes/b.md", bytes: Buffer.from("SENTINEL-STORE\n"), baseHash: null },
+            { type: "board", userId, source: "session" }, { repairConfig: repairAsBoard }));
+        expect(first, JSON.stringify(first)).toMatchObject({ ok: true });
+        expect(second, JSON.stringify(second)).toMatchObject({ ok: true });
+        expect((await configOf(actorId)).instructionsRootPath).toBe(managedOf(actorId));
+        expect(await fs.readFile(path.join(managedOf(actorId), "notes/b.md"), "utf8")).toBe("SENTINEL-STORE\n");
+        expect((await revisionsOf(targetId)).every((revision) => revision.createdByAgentId === actorId)).toBe(true);
+        expect((await revisionsOf(actorId)).every((revision) => revision.createdByUserId === userId && revision.createdByAgentId === null)).toBe(true);
+      },
+    );
+
+    // First managed-root bind (materializeManagedBundle, as the default-bundle route runs it:
+    // materialize, then persist the returned config). The materialize transaction locks A's row
+    // and takes the assignment lock, while A's save into B holds the assignment lock and then
+    // needs KEY SHARE on A for the revision actor. A FOR UPDATE owner lock would deadlock.
+    it.each(["assignment-first", "row-first"] as const)(
+      "the board materializes A's default bundle while A first-binds B ($0): both commit, A owns its managed root",
+      async (order) => {
+        const { actorId, targetId } = await seedPair();
+        const actor = (await loadAgent(actorId))!;
+        const actorManaged = managedOf(actorId);
+        const materializeAndPersist = async () => {
+          const materialized = await agentInstructionsService(db).materializeManagedBundle(actor, { "AGENTS.md": ENTRY },
+            { entryFile: "AGENTS.md", replaceExisting: false });
+          return agentService(db).update(actorId, { adapterConfig: materialized.adapterConfig },
+            { allowPendingApprovalConfigUpdate: true, instructionConfigWrite: { keys: "all" } });
+        };
+        const { first, second } = await race(order, () => actorSave(actorId, targetId), materializeAndPersist);
+        expect(first, JSON.stringify(first)).toMatchObject({ ok: true });
+        expect(second, JSON.stringify(second)).toMatchObject({ ok: true });
+        expect((await configOf(actorId)).instructionsRootPath).toBe(actorManaged);
+        expect((await configOf(actorId)).instructionsBundleMode).toBe("managed");
+        expect(await fs.readFile(path.join(actorManaged, "AGENTS.md"), "utf8")).toBe(ENTRY);
+        expect((await configOf(targetId)).instructionsRootPath).toBe(managedOf(targetId));
+        expect(await fs.readFile(path.join(managedOf(targetId), "notes/a.md"), "utf8")).toBe(`SENTINEL-${actorId.slice(0, 8)}\n`);
+        const revisions = await revisionsOf(targetId);
+        expect(revisions.length).toBeGreaterThan(0);
+        for (const revision of revisions) {
+          expect(revision.createdByAgentId).toBe(actorId);
+          expect(revision.createdByUserId).toBeNull();
+        }
+        expect(await fs.readdir(instructionCopyIntentsDirectory()).catch(() => [] as string[])).toEqual([]);
+      },
+    );
+
+    // Hire approval activation (A13) of pending agent P, through approvalService.approve, while the
+    // board moves C under P with a new root. C's write pre-locks P FOR KEY SHARE before the
+    // assignment lock. With A13 at FOR NO KEY UPDATE neither waits on a row: the second writer
+    // queues on the assignment lock. A13 at FOR UPDATE conflicts with that KEY SHARE lock.
+    it.each(["assignment-first", "row-first"] as const)(
+      "hire approval activates pending P while the board moves C under P with a new root ($0): both commit, no row wait",
+      async (order) => {
+        const pendingId = randomUUID(), childId = randomUUID();
+        await seedAgent(pendingId, { model: "m0" }, { status: "pending_approval", adapterType: "hermes_gateway" });
+        await seedAgent(childId, { model: "m0" }, { name: `w1-gate-${childId.slice(0, 8)}`, adapterType: "hermes_gateway" });
+        const approvedRoot = fresh("approved"), childRoot = fresh("child");
+        const [approval] = await db.insert(approvals).values({ companyId, type: "hire_agent", status: "pending",
+          payload: { agentId: pendingId, adapterType: "hermes_gateway", adapterConfig: { ...cfg("external", approvedRoot), model: "m0" } } }).returning();
+        hireHook.notifyHireApproved.mockClear();
+        const approve = () => approvalService(db).approve(approval!.id, userId);
+        const moveChild = () => agentService(db).update(childId, { reportsTo: pendingId, adapterConfig: cfg("external", childRoot) },
+          { instructionConfigWrite: { keys: "all" } });
+        // assignment-first: C holds the assignment lock (paused at its gated update), then P activates.
+        // row-first: P holds its row and queues on the assignment lock, then C starts.
+        const { first, second } = order === "assignment-first" ? await race(order, moveChild, approve) : await race(order, approve, moveChild);
+        const [activation, move] = order === "assignment-first" ? [second, first] : [first, second];
+        expect(activation, JSON.stringify(activation)).toMatchObject({ ok: true, value: { applied: true } });
+        expect(move, JSON.stringify(move)).toMatchObject({ ok: true });
+        const [approvalAfter] = await db.select().from(approvals).where(eq(approvals.id, approval!.id));
+        expect(approvalAfter!.status).toBe("approved");
+        expect(approvalAfter!.decidedByUserId).toBe(userId);
+        const activated = (await loadAgent(pendingId))!;
+        expect(activated.status).toBe("idle");
+        expect(activated.reportsTo).toBeNull();
+        expect((activated.adapterConfig as Config).instructionsRootPath).toBe(approvedRoot);
+        expect(hireHook.notifyHireApproved).toHaveBeenCalledTimes(1);
+        expect((await loadAgent(childId))!.reportsTo).toBe(pendingId);
+        expect((await configOf(childId)).instructionsRootPath).toBe(childRoot);
+        expect(await fs.readdir(instructionCopyIntentsDirectory()).catch(() => [] as string[])).toEqual([]);
+      },
+    );
+
+    it("negative control: a session that holds A FOR UPDATE and then waits for the assignment lock deadlocks with A's save into B", async () => {
+      // The pre-correction lock: FOR UPDATE conflicts with the revision insert's KEY SHARE on A.
+      // PostgreSQL detects the cycle and aborts one side; this proves the harness sees the defect.
+      const { actorId, targetId } = await seedPair();
+      const gate = await holdAdvisory(GATE);
+      let save: Promise<Outcome> | null = null, holder: Promise<Outcome> | null = null;
+      try {
+        save = settleDeep(actorSave(actorId, targetId));
+        expect(await waitFor(async () => (await advisoryWaiters()) === 1, 5_000)).toBe(true);
+        holder = settleDeep(db.transaction(async (tx) => {
+          await tx.select({ id: agents.id }).from(agents).where(eq(agents.id, actorId)).for("update");
+          await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${INSTRUCTION_ROOT_ASSIGNMENT_LOCK}, 0))`);
+        }));
+        expect(await waitFor(async () => (await advisoryWaiters()) === 2, 5_000)).toBe(true);
+      } finally {
+        gate.release();
+        await gate.done;
+      }
+      const outcomes = [await save!, await holder!];
+      expect(outcomes.filter(isDeadlock), JSON.stringify(outcomes)).toHaveLength(1);
+      expect(await assignmentLockFree()).toBe(true);
     });
   });
 
