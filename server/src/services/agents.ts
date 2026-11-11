@@ -164,6 +164,17 @@ function configuredInstructionRoot(
   return root ? path.resolve(root) : null;
 }
 
+/**
+ * WS-2 PR-W1 lock order: agent rows, then the instruction-root assignment lock.
+ * A write that sets reports_to takes a KEY SHARE lock on the parent row through
+ * the foreign key. A caller that also takes the assignment lock calls this
+ * first, so that lock is never waited for after the assignment lock.
+ */
+async function lockReportingParentRow(txDb: Db, parentId: unknown): Promise<void> {
+  if (typeof parentId !== "string" || parentId.length === 0) return;
+  await txDb.select({ id: agents.id }).from(agents).where(eq(agents.id, parentId)).for("key share");
+}
+
 const ROOT_CHANGED_DURING_PREPARE = "The instructions root changed while the configuration was prepared; nothing was changed. Reload and retry.";
 
 interface CreateAgentOptions {
@@ -831,6 +842,7 @@ export function agentService(db: Db) {
         ))
         : undefined;
       if (prospectiveRoot && prospectiveRoot !== configuredInstructionRoot(locked, lockedAdapterConfig)) {
+        await lockReportingParentRow(txDb, normalizedPatch.reportsTo);
         await agentInstructionsService(txDb).assertExclusiveRoot(txDb, locked, prospectiveRoot, {
           isInstanceAdmin: options?.instructionRootGuard?.isInstanceAdmin === true,
         });
@@ -1037,9 +1049,7 @@ export function agentService(db: Db) {
           // Take it here, before the assignment lock, so a parent that holds
           // its own row and waits for the assignment lock cannot deadlock
           // with this create.
-          if (data.reportsTo) {
-            await tx.select({ id: agents.id }).from(agents).where(eq(agents.id, data.reportsTo)).for("key share");
-          }
+          await lockReportingParentRow(txDb, data.reportsTo);
           await agentInstructionsService(txDb).assertExclusiveRoot(txDb, { ...guardAgent, adapterConfig }, lockedRoot, { isInstanceAdmin: false });
         }
         const created = await tx
@@ -1238,6 +1248,7 @@ export function agentService(db: Db) {
         const existingConfig = isPlainRecord(existing.adapterConfig) ? existing.adapterConfig : {};
         const approvedRoot = isPlainRecord(patch.adapterConfig) ? configuredInstructionRoot(existing, patch.adapterConfig) : undefined;
         if (approvedRoot && approvedRoot !== configuredInstructionRoot(existing, existingConfig)) {
+          await lockReportingParentRow(txDb, patch.reportsTo);
           await agentInstructionsService(txDb).assertExclusiveRoot(txDb, existing, approvedRoot, { isInstanceAdmin: false });
         }
         if (

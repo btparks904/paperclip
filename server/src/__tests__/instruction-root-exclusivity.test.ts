@@ -7,9 +7,9 @@ import { randomUUID } from "node:crypto";
 import express from "express";
 import request from "supertest";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
-import { eq, sql } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import {
-  agents, authUsers, companies, companyMemberships, companySecrets, createDb, principalPermissionGrants, type Db,
+  agents, approvals, authUsers, budgetPolicies, companies, companyMemberships, companySecrets, createDb, principalPermissionGrants, type Db,
 } from "@paperclipai/db";
 import {
   agentInstructionsBundleMode, agentInstructionsService, resolveInstructionWriteTarget, resolveManagedInstructionsRoot,
@@ -20,10 +20,15 @@ import {
   compareInstructionRootKeys, foldInstructionRootPath, instructionRootComparisonKey, resolveManagedAgentArea,
 } from "../services/instruction-root-exclusivity.js";
 import { agentService } from "../services/agents.js";
+import { approvalService } from "../services/approvals.js";
 import { secretService } from "../services/secrets.js";
 import { agentRoutes } from "../routes/agents.js";
 import { errorHandler } from "../middleware/index.js";
 import { startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
+
+// The hire-approved hook is an outward effect: it must fire only for a committed decision.
+const hireHook = vi.hoisted(() => ({ notifyHireApproved: vi.fn() }));
+vi.mock("../services/hire-hook.js", () => hireHook);
 
 const ENTRY = "SENTINEL-WS2-W1-ENTRY\n";
 const RAW_API_KEY = "SENTINEL-SYNTHETIC-RAW-API-KEY-W1";
@@ -127,6 +132,12 @@ describe("WS-2 PR-W1: exclusive instruction roots", () => {
     const rows = await db.execute(sql`select count(*)::int as n from pg_locks where locktype = 'advisory' and not granted`);
     return Number((rows as unknown as Array<{ n: number }>)[0]?.n ?? 0);
   };
+  /** Sessions waiting on a row lock (tuple or transaction id), not on an advisory lock. */
+  const rowLockWaiters = async () => {
+    const rows = await db.execute(sql`select count(*)::int as n from pg_stat_activity
+      where datname = current_database() and wait_event_type = 'Lock' and wait_event in ('tuple', 'transactionid')`);
+    return Number((rows as unknown as Array<{ n: number }>)[0]?.n ?? 0);
+  };
   async function waitFor(predicate: () => Promise<boolean>, timeoutMs = 5_000) {
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
@@ -151,6 +162,8 @@ describe("WS-2 PR-W1: exclusive instruction roots", () => {
   afterAll(async () => { await database?.cleanup(); await fs.rm(home, { recursive: true, force: true }); });
   afterEach(() => { vi.restoreAllMocks(); });
   beforeEach(async () => {
+    hireHook.notifyHireApproved.mockReset();
+    hireHook.notifyHireApproved.mockResolvedValue(undefined);
     granted = []; companyId = randomUUID(); otherCompanyId = randomUUID(); agentId = randomUUID(); ownerId = randomUUID(); userId = randomUUID();
     await db.insert(companies).values([
       { id: companyId, name: "W1", issuePrefix: randomUUID().slice(0, 8) },
@@ -569,11 +582,6 @@ describe("WS-2 PR-W1: exclusive instruction roots", () => {
     // row lock before the assignment lock, or the two wait on each other.
     const GATE = "w1-test-insert-gate";
     const lockOf = (key: string) => sql`select pg_advisory_xact_lock(hashtextextended(${key}, 0))`;
-    const rowLockWaiters = async () => {
-      const rows = await db.execute(sql`select count(*)::int as n from pg_stat_activity
-        where datname = current_database() and wait_event_type = 'Lock' and wait_event in ('tuple', 'transactionid')`);
-      return Number((rows as unknown as Array<{ n: number }>)[0]?.n ?? 0);
-    };
     /** Holds an exclusive transaction-scoped advisory lock on key until release() is called. */
     async function holdAdvisory(key: string) {
       let release!: () => void;
@@ -594,14 +602,14 @@ describe("WS-2 PR-W1: exclusive instruction roots", () => {
       parentId = randomUUID();
       parentRoot = fresh("parent");
       await seedAgent(parentId, { ...cfg("external", parentRoot), model: "m0" }, { adapterType: "hermes_gateway" });
-      // Pauses the create at its insert: after its locked check, before the reports_to key lock.
+      // Pauses an insert or update of a gate-named agent: after its locked check, before the reports_to key lock.
       await db.execute(sql.raw(`create or replace function w1_test_insert_gate() returns trigger language plpgsql as $$
         begin
           if NEW.name like 'w1-gate-%' then perform pg_advisory_xact_lock_shared(hashtextextended('${GATE}', 0)); end if;
           return NEW;
         end $$`));
       await db.execute(sql.raw("drop trigger if exists w1_test_insert_gate on agents"));
-      await db.execute(sql.raw("create trigger w1_test_insert_gate before insert on agents for each row execute function w1_test_insert_gate()"));
+      await db.execute(sql.raw("create trigger w1_test_insert_gate before insert or update on agents for each row execute function w1_test_insert_gate()"));
     });
     afterEach(async () => {
       await db.execute(sql.raw("drop trigger if exists w1_test_insert_gate on agents"));
@@ -691,6 +699,257 @@ describe("WS-2 PR-W1: exclusive instruction roots", () => {
         expect((await configOf(childId)).instructionsRootPath).toBe(childRoot);
       }
       expect(await assignmentLockFree()).toBe(true);
+    });
+
+    /**
+     * Runs subject (the write under test) against a root change of the parent, in one of two
+     * orders, with deterministic barriers. "subject-first": the subject passes its locked check and
+     * waits at the gate (before its reports_to key lock); then the parent starts. "parent-first":
+     * the test holds the assignment lock; the parent locks its row and waits for it; then the
+     * subject starts. In both orders the second writer must wait on the parent row, not on the
+     * assignment lock. Every wait is bounded.
+     */
+    async function interleave(order: "subject-first" | "parent-first", subject: () => Promise<unknown>, parentNext: string) {
+      const barrier = await holdAdvisory(order === "subject-first" ? GATE : INSTRUCTION_ROOT_ASSIGNMENT_LOCK);
+      const changeParent = () => settle(agentService(db).update(parentId, { adapterConfig: cfg("external", parentNext) }, { instructionConfigWrite: { keys: "all" } }));
+      let subjectRun: Promise<Outcome> | null = null;
+      let parentRun: Promise<Outcome> | null = null;
+      let firstAtBarrier = false, secondWaitedOnRow = false, advisoryWhileWaiting = -1;
+      try {
+        if (order === "subject-first") subjectRun = settle(subject());
+        else parentRun = changeParent();
+        firstAtBarrier = await waitFor(async () => (await advisoryWaiters()) === 1, 5_000);
+        if (order === "subject-first") parentRun = changeParent();
+        else subjectRun = settle(subject());
+        secondWaitedOnRow = await waitFor(async () => (await rowLockWaiters()) >= 1, 5_000);
+        advisoryWhileWaiting = await advisoryWaiters();
+      } finally {
+        barrier.release();
+        await barrier.done;
+      }
+      const result = { subject: await subjectRun!, parent: await parentRun!, firstAtBarrier, secondWaitedOnRow, advisoryWhileWaiting };
+      expect(result.firstAtBarrier).toBe(true);
+      expect(result.secondWaitedOnRow).toBe(true);
+      expect(result.advisoryWhileWaiting).toBe(1);
+      expect(await assignmentLockFree()).toBe(true);
+      return result;
+    }
+    const orders = [
+      { order: "subject-first" as const, conflict: false },
+      { order: "subject-first" as const, conflict: true },
+      { order: "parent-first" as const, conflict: false },
+      { order: "parent-first" as const, conflict: true },
+    ];
+
+    it.each(orders)("root-changing PATCH that also sets reportsTo, versus the parent's root change ($order, conflict $conflict)", async ({ order, conflict }) => {
+      const childId = randomUUID();
+      await seedAgent(childId, { model: "m0" }, { name: `w1-gate-${childId.slice(0, 8)}`, adapterType: "hermes_gateway" });
+      const before = await configOf(childId);
+      // The conflicting write is always the one that runs second.
+      const shared = fresh("shared");
+      const childRoot = conflict && order === "parent-first" ? shared : fresh("child");
+      const parentNext = conflict && order === "subject-first" ? childRoot : (conflict ? shared : fresh("parent-next"));
+      const { subject, parent } = await interleave(order, () => agentService(db).update(childId,
+        { reportsTo: parentId, adapterConfig: cfg("external", childRoot) }, { instructionConfigWrite: { keys: "all" } }), parentNext);
+      const childRefused = conflict && order === "parent-first";
+      const parentRefused = conflict && order === "subject-first";
+      if (childRefused) {
+        expect(subject).toMatchObject({ ok: false, status: 409, code: INSTRUCTION_ROOT_IN_USE });
+        expect(await configOf(childId)).toEqual(before);
+        expect((await loadAgent(childId))!.reportsTo).toBeNull();
+      } else {
+        expect(subject, JSON.stringify(subject)).toMatchObject({ ok: true });
+        expect((await loadAgent(childId))!.reportsTo).toBe(parentId);
+        expect((await configOf(childId)).instructionsRootPath).toBe(childRoot);
+      }
+      if (parentRefused) {
+        expect(parent).toMatchObject({ ok: false, status: 409, code: INSTRUCTION_ROOT_IN_USE });
+        expect((await configOf(parentId)).instructionsRootPath).toBe(parentRoot);
+      } else {
+        expect(parent, JSON.stringify(parent)).toMatchObject({ ok: true });
+        expect((await configOf(parentId)).instructionsRootPath).toBe(parentNext);
+      }
+    });
+
+    it.each(orders)("hire approval whose payload sets reportsTo and a root, versus the parent's root change ($order, conflict $conflict)", async ({ order, conflict }) => {
+      const pendingId = randomUUID();
+      await seedAgent(pendingId, { model: "m0" }, { name: `w1-gate-${pendingId.slice(0, 8)}`, status: "pending_approval", adapterType: "hermes_gateway" });
+      const shared = fresh("shared");
+      const childRoot = conflict && order === "parent-first" ? shared : fresh("approved");
+      const parentNext = conflict && order === "subject-first" ? childRoot : (conflict ? shared : fresh("parent-next"));
+      const [approval] = await db.insert(approvals).values({ companyId, type: "hire_agent", status: "pending",
+        payload: { agentId: pendingId, adapterType: "hermes_gateway", reportsTo: parentId, adapterConfig: { ...cfg("external", childRoot), model: "m0" } } }).returning();
+      hireHook.notifyHireApproved.mockClear();
+      const { subject, parent } = await interleave(order, () => approvalService(db).approve(approval!.id, userId), parentNext);
+      const approvalRefused = conflict && order === "parent-first";
+      const parentRefused = conflict && order === "subject-first";
+      const [approvalAfter] = await db.select().from(approvals).where(eq(approvals.id, approval!.id));
+      if (approvalRefused) {
+        expect(subject).toMatchObject({ ok: false, status: 409, code: INSTRUCTION_ROOT_IN_USE });
+        expect(approvalAfter!.status).toBe("pending");
+        expect((await loadAgent(pendingId))!.status).toBe("pending_approval");
+        expect((await loadAgent(pendingId))!.reportsTo).toBeNull();
+        expect(hireHook.notifyHireApproved).not.toHaveBeenCalled();
+      } else {
+        expect(subject, JSON.stringify(subject)).toMatchObject({ ok: true, value: { applied: true } });
+        expect(approvalAfter!.status).toBe("approved");
+        expect((await loadAgent(pendingId))!.status).toBe("idle");
+        expect((await loadAgent(pendingId))!.reportsTo).toBe(parentId);
+        expect((await configOf(pendingId)).instructionsRootPath).toBe(childRoot);
+        expect(hireHook.notifyHireApproved).toHaveBeenCalledTimes(1);
+      }
+      if (parentRefused) {
+        expect(parent).toMatchObject({ ok: false, status: 409, code: INSTRUCTION_ROOT_IN_USE });
+        expect((await configOf(parentId)).instructionsRootPath).toBe(parentRoot);
+      } else {
+        expect(parent, JSON.stringify(parent)).toMatchObject({ ok: true });
+        expect((await configOf(parentId)).instructionsRootPath).toBe(parentNext);
+      }
+    });
+  });
+
+  describe("hire approval: the decision and the activation or creation commit together", () => {
+    const BUDGET = 700;
+    const approvalRow = async (id: string) => (await db.select().from(approvals).where(eq(approvals.id, id)))[0]!;
+    const budgetRows = async (agent: string) => db.select().from(budgetPolicies)
+      .where(eq(budgetPolicies.scopeId, agent));
+    async function insertApproval(status: "pending" | "revision_requested", payload: Record<string, unknown>) {
+      const [row] = await db.insert(approvals).values({ companyId, type: "hire_agent", status, payload }).returning();
+      return row!;
+    }
+    const overlappingConfig = () => ({ ...cfg("external", ownerRoot), model: "m0" });
+    const independentConfig = (label: string) => ({ ...cfg("external", fresh(label)), model: "m0" });
+
+    it.each(["pending", "revision_requested"] as const)(
+      "existing pending agent: a root 409 rolls the decision back (%s stays), nothing fires; a corrected payload then approves once",
+      async (status) => {
+        const pendingId = randomUUID();
+        await seedAgent(pendingId, { model: "m0" }, { status: "pending_approval", adapterType: "hermes_gateway" });
+        const before = await configOf(pendingId);
+        const approval = await insertApproval(status, { agentId: pendingId, adapterType: "hermes_gateway", budgetMonthlyCents: BUDGET,
+          adapterConfig: { ...overlappingConfig(), apiKey: RAW_API_KEY } });
+        const secretsBefore = await secretCount();
+        const refused = await settle(approvalService(db).approve(approval.id, userId, "first try"));
+        expect(refused).toMatchObject({ ok: false, status: 409, code: INSTRUCTION_ROOT_IN_USE });
+        const afterRefusal = await approvalRow(approval.id);
+        expect(afterRefusal.status).toBe(status);
+        expect(afterRefusal.decidedByUserId).toBeNull();
+        expect(afterRefusal.decidedAt).toBeNull();
+        expect((await loadAgent(pendingId))!.status).toBe("pending_approval");
+        expect(await configOf(pendingId)).toEqual(before);
+        expect(await secretCount()).toBe(secretsBefore);
+        expect(await budgetRows(pendingId)).toHaveLength(0);
+        expect(hireHook.notifyHireApproved).not.toHaveBeenCalled();
+
+        // The approval is still correctable: request a revision (pending only), resubmit a corrected payload, approve.
+        if (status === "pending") await approvalService(db).requestRevision(approval.id, userId, "pick another folder");
+        const corrected = independentConfig("corrected");
+        await approvalService(db).resubmit(approval.id, { agentId: pendingId, adapterType: "hermes_gateway", budgetMonthlyCents: BUDGET, adapterConfig: corrected });
+        const approved = await approvalService(db).approve(approval.id, userId, "second try");
+        expect(approved.applied).toBe(true);
+        expect((await approvalRow(approval.id)).status).toBe("approved");
+        expect((await loadAgent(pendingId))!.status).toBe("idle");
+        expect((await configOf(pendingId)).instructionsRootPath).toBe(corrected.instructionsRootPath);
+        expect(await budgetRows(pendingId)).toHaveLength(1);
+        expect(hireHook.notifyHireApproved).toHaveBeenCalledTimes(1);
+        expect(hireHook.notifyHireApproved).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ agentId: pendingId, sourceId: approval.id }));
+
+        // A repeated approve is a no-op: no second activation, budget write or hook.
+        const updatedAt = (await loadAgent(pendingId))!.updatedAt;
+        const again = await approvalService(db).approve(approval.id, userId, "again");
+        expect(again.applied).toBe(false);
+        expect((await loadAgent(pendingId))!.updatedAt).toEqual(updatedAt);
+        expect(await budgetRows(pendingId)).toHaveLength(1);
+        expect(hireHook.notifyHireApproved).toHaveBeenCalledTimes(1);
+      },
+    );
+
+    it("hire without an existing agent: a root 409 rolls the decision back and creates nothing; a corrected payload then creates once", async () => {
+      const name = `W1-hire-${randomUUID().slice(0, 8)}`;
+      const agentsBefore = await agentCount();
+      const secretsBefore = await secretCount();
+      const approval = await insertApproval("pending", { name, adapterType: "hermes_gateway", budgetMonthlyCents: BUDGET,
+        adapterConfig: { ...overlappingConfig(), apiKey: RAW_API_KEY } });
+      const refused = await settle(approvalService(db).approve(approval.id, userId));
+      expect(refused).toMatchObject({ ok: false, status: 409, code: INSTRUCTION_ROOT_IN_USE });
+      expect((await approvalRow(approval.id)).status).toBe("pending");
+      expect(await agentCount()).toBe(agentsBefore);
+      // The create runs inside the approval transaction, so its secret normalization rolls back too.
+      expect(await secretCount()).toBe(secretsBefore);
+      expect(hireHook.notifyHireApproved).not.toHaveBeenCalled();
+
+      await approvalService(db).requestRevision(approval.id, userId, "pick another folder");
+      const corrected = independentConfig("hire-corrected");
+      await approvalService(db).resubmit(approval.id, { name, adapterType: "hermes_gateway", budgetMonthlyCents: BUDGET, adapterConfig: corrected });
+      const approved = await approvalService(db).approve(approval.id, userId);
+      expect(approved.applied).toBe(true);
+      expect(await agentCount()).toBe(agentsBefore + 1);
+      const [created] = await db.select().from(agents).where(and(eq(agents.companyId, companyId), eq(agents.name, name)));
+      expect((created!.adapterConfig as Config).instructionsRootPath).toBe(corrected.instructionsRootPath);
+      expect(await budgetRows(created!.id)).toHaveLength(1);
+      expect(hireHook.notifyHireApproved).toHaveBeenCalledTimes(1);
+      expect(hireHook.notifyHireApproved).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ agentId: created!.id }));
+
+      const again = await approvalService(db).approve(approval.id, userId);
+      expect(again.applied).toBe(false);
+      expect(await agentCount()).toBe(agentsBefore + 1);
+      expect(hireHook.notifyHireApproved).toHaveBeenCalledTimes(1);
+    });
+
+    it.each([
+      { branch: "existing pending agent", withAgent: true },
+      { branch: "hire without an agent", withAgent: false },
+    ])("concurrent approvals of one decision ($branch): exactly one applies, one activation or creation, one hook", async ({ withAgent }) => {
+      const pendingId = randomUUID();
+      const name = `W1-concurrent-${randomUUID().slice(0, 8)}`;
+      if (withAgent) await seedAgent(pendingId, { model: "m0" }, { status: "pending_approval", adapterType: "hermes_gateway" });
+      const agentsBefore = await agentCount();
+      const root = independentConfig("concurrent");
+      const approval = await insertApproval("pending", withAgent
+        ? { agentId: pendingId, adapterType: "hermes_gateway", budgetMonthlyCents: BUDGET, adapterConfig: root }
+        : { name, adapterType: "hermes_gateway", budgetMonthlyCents: BUDGET, adapterConfig: root });
+      // Hold the approval row so both decisions queue on it, then release them together.
+      let release!: () => void;
+      const released = new Promise<void>((resolve) => { release = resolve; });
+      let held!: () => void;
+      const isHeld = new Promise<void>((resolve) => { held = resolve; });
+      const holder = db.transaction(async (tx) => {
+        await tx.select().from(approvals).where(eq(approvals.id, approval.id)).for("update");
+        held();
+        await released;
+      });
+      await isHeld;
+      let both: Promise<Outcome[]> | null = null;
+      let queued = false;
+      try {
+        both = Promise.all([settle(approvalService(db).approve(approval.id, userId)), settle(approvalService(db).approve(approval.id, userId))]);
+        queued = await waitFor(async () => (await rowLockWaiters()) >= 2, 5_000);
+      } finally {
+        release();
+        await holder;
+      }
+      const outcomes = await both!;
+      expect(queued).toBe(true);
+      for (const outcome of outcomes) expect(outcome, JSON.stringify(outcome)).toMatchObject({ ok: true });
+      const applied = outcomes.map((outcome) => (outcome as { value: { applied: boolean } }).value.applied).sort();
+      expect(applied).toEqual([false, true]);
+      expect((await approvalRow(approval.id)).status).toBe("approved");
+      expect(await agentCount()).toBe(withAgent ? agentsBefore : agentsBefore + 1);
+      const agentId = withAgent ? pendingId
+        : (await db.select().from(agents).where(and(eq(agents.companyId, companyId), eq(agents.name, name))))[0]!.id;
+      expect((await loadAgent(agentId))!.status).toBe("idle");
+      expect(await budgetRows(agentId)).toHaveLength(1);
+      expect(hireHook.notifyHireApproved).toHaveBeenCalledTimes(1);
+    });
+
+    it("non-hire approvals are unchanged: approve resolves them without any agent effect", async () => {
+      const agentsBefore = await agentCount();
+      const [row] = await db.insert(approvals).values({ companyId, type: "approve_ceo_strategy", status: "pending", payload: { plan: "SENTINEL" } }).returning();
+      const result = await approvalService(db).approve(row!.id, userId, "ok");
+      expect(result.applied).toBe(true);
+      expect((await approvalRow(row!.id)).status).toBe("approved");
+      expect(await agentCount()).toBe(agentsBefore);
+      expect(hireHook.notifyHireApproved).not.toHaveBeenCalled();
     });
   });
 
