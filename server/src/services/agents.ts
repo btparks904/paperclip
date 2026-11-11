@@ -1032,6 +1032,14 @@ export function agentService(db: Db) {
         const lockedRoot = configuredInstructionRoot(guardAgent, adapterConfig);
         if (lockedRoot !== requestedRoot) throw conflict(ROOT_CHANGED_DURING_PREPARE);
         if (lockedRoot) {
+          // Lock order: agent rows (L1), then the assignment lock. The insert
+          // takes a KEY SHARE lock on the reporting parent through reports_to.
+          // Take it here, before the assignment lock, so a parent that holds
+          // its own row and waits for the assignment lock cannot deadlock
+          // with this create.
+          if (data.reportsTo) {
+            await tx.select({ id: agents.id }).from(agents).where(eq(agents.id, data.reportsTo)).for("key share");
+          }
           await agentInstructionsService(txDb).assertExclusiveRoot(txDb, { ...guardAgent, adapterConfig }, lockedRoot, { isInstanceAdmin: false });
         }
         const created = await tx

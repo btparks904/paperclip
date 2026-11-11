@@ -562,6 +562,138 @@ describe("WS-2 PR-W1: exclusive instruction roots", () => {
     });
   });
 
+  describe("lock order: create with a reporting parent versus the parent's root change", () => {
+    // Codex P2 on PR #10. The create's insert takes a KEY SHARE lock on the
+    // parent row (reports_to). The parent's root change takes its own row
+    // FOR UPDATE, then the assignment lock. The create must take the parent
+    // row lock before the assignment lock, or the two wait on each other.
+    const GATE = "w1-test-insert-gate";
+    const lockOf = (key: string) => sql`select pg_advisory_xact_lock(hashtextextended(${key}, 0))`;
+    const rowLockWaiters = async () => {
+      const rows = await db.execute(sql`select count(*)::int as n from pg_stat_activity
+        where datname = current_database() and wait_event_type = 'Lock' and wait_event in ('tuple', 'transactionid')`);
+      return Number((rows as unknown as Array<{ n: number }>)[0]?.n ?? 0);
+    };
+    /** Holds an exclusive transaction-scoped advisory lock on key until release() is called. */
+    async function holdAdvisory(key: string) {
+      let release!: () => void;
+      const released = new Promise<void>((resolve) => { release = resolve; });
+      let held!: () => void;
+      const isHeld = new Promise<void>((resolve) => { held = resolve; });
+      const done = db.transaction(async (tx) => { await tx.execute(lockOf(key)); held(); await released; });
+      await isHeld;
+      return { release, done };
+    }
+    const assignmentLockFree = () => db.transaction(async (tx) => {
+      const rows = await tx.execute(sql`select pg_try_advisory_xact_lock(hashtextextended(${INSTRUCTION_ROOT_ASSIGNMENT_LOCK}, 0)) as ok`);
+      return Boolean((rows as unknown as Array<{ ok: boolean }>)[0]?.ok);
+    });
+    let parentId: string;
+    let parentRoot: string;
+    beforeEach(async () => {
+      parentId = randomUUID();
+      parentRoot = fresh("parent");
+      await seedAgent(parentId, { ...cfg("external", parentRoot), model: "m0" }, { adapterType: "hermes_gateway" });
+      // Pauses the create at its insert: after its locked check, before the reports_to key lock.
+      await db.execute(sql.raw(`create or replace function w1_test_insert_gate() returns trigger language plpgsql as $$
+        begin
+          if NEW.name like 'w1-gate-%' then perform pg_advisory_xact_lock_shared(hashtextextended('${GATE}', 0)); end if;
+          return NEW;
+        end $$`));
+      await db.execute(sql.raw("drop trigger if exists w1_test_insert_gate on agents"));
+      await db.execute(sql.raw("create trigger w1_test_insert_gate before insert on agents for each row execute function w1_test_insert_gate()"));
+    });
+    afterEach(async () => {
+      await db.execute(sql.raw("drop trigger if exists w1_test_insert_gate on agents"));
+      await db.execute(sql.raw("drop function if exists w1_test_insert_gate()"));
+    });
+
+    it.each([
+      { conflict: false, label: "independent roots: both succeed" },
+      { conflict: true, label: "the parent asks for the child's new root: the parent gets 409 and changes nothing" },
+    ])("create holds the assignment lock first, then the parent changes its root ($label)", async ({ conflict }) => {
+      const childRoot = fresh("child");
+      const parentNext = conflict ? childRoot : fresh("parent-next");
+      const childName = `w1-gate-${randomUUID().slice(0, 8)}`;
+      const gate = await holdAdvisory(GATE);
+      let create: Promise<Outcome> | null = null;
+      let parentChange: Promise<Outcome> | null = null;
+      let createAtInsert = false, parentWaitedOnRow = false, advisoryWhileParentWaits = -1;
+      try {
+        create = settle(agentService(db).create(companyId, { name: childName, adapterType: "hermes_gateway", reportsTo: parentId,
+          adapterConfig: cfg("external", childRoot) }));
+        // The create has passed its locked check and waits at the insert gate.
+        createAtInsert = await waitFor(async () => (await advisoryWaiters()) === 1, 5_000);
+        parentChange = settle(agentService(db).update(parentId, { adapterConfig: cfg("external", parentNext) }, { instructionConfigWrite: { keys: "all" } }));
+        // The parent must wait on its row (the create's KEY SHARE), never on the assignment lock.
+        parentWaitedOnRow = await waitFor(async () => (await rowLockWaiters()) >= 1, 5_000);
+        advisoryWhileParentWaits = await advisoryWaiters();
+      } finally {
+        gate.release();
+        await gate.done;
+      }
+      const [createOutcome, parentOutcome] = [await create!, await parentChange!];
+      expect(createAtInsert).toBe(true);
+      expect(parentWaitedOnRow).toBe(true);
+      expect(advisoryWhileParentWaits).toBe(1);
+      expect(createOutcome, JSON.stringify(createOutcome)).toMatchObject({ ok: true });
+      const child = (createOutcome as { value: { id: string } }).value;
+      expect((await loadAgent(child.id))!.reportsTo).toBe(parentId);
+      expect((await configOf(child.id)).instructionsRootPath).toBe(childRoot);
+      if (conflict) {
+        expect(parentOutcome).toMatchObject({ ok: false, status: 409, code: INSTRUCTION_ROOT_IN_USE });
+        expect((await configOf(parentId)).instructionsRootPath).toBe(parentRoot);
+      } else {
+        expect(parentOutcome, JSON.stringify(parentOutcome)).toMatchObject({ ok: true });
+        expect((await configOf(parentId)).instructionsRootPath).toBe(parentNext);
+      }
+      expect(await assignmentLockFree()).toBe(true);
+    });
+
+    it.each([
+      { conflict: false, label: "independent roots: both succeed" },
+      { conflict: true, label: "the child asks for the parent's new root: the create gets 409 and inserts nothing" },
+    ])("the parent holds its row first and waits for the assignment lock, then a child is created ($label)", async ({ conflict }) => {
+      const parentNext = fresh("parent-next");
+      const childRoot = conflict ? parentNext : fresh("child");
+      const childId = randomUUID();
+      const agentsBefore = await agentCount();
+      const assignment = await holdAdvisory(INSTRUCTION_ROOT_ASSIGNMENT_LOCK);
+      let create: Promise<Outcome> | null = null;
+      let parentChange: Promise<Outcome> | null = null;
+      let parentAtLock = false, createWaitedOnRow = false, advisoryWhileCreateWaits = -1;
+      try {
+        parentChange = settle(agentService(db).update(parentId, { adapterConfig: cfg("external", parentNext) }, { instructionConfigWrite: { keys: "all" } }));
+        // The parent holds its row FOR UPDATE and waits for the assignment lock.
+        parentAtLock = await waitFor(async () => (await advisoryWaiters()) === 1, 5_000);
+        create = settle(agentService(db).create(companyId, { id: childId, name: `W1-child-${childId.slice(0, 8)}`, adapterType: "hermes_gateway",
+          reportsTo: parentId, adapterConfig: cfg("external", childRoot) }));
+        // The create must wait on the parent row, before it asks for the assignment lock.
+        createWaitedOnRow = await waitFor(async () => (await rowLockWaiters()) >= 1, 5_000);
+        advisoryWhileCreateWaits = await advisoryWaiters();
+      } finally {
+        assignment.release();
+        await assignment.done;
+      }
+      const [parentOutcome, createOutcome] = [await parentChange!, await create!];
+      expect(parentAtLock).toBe(true);
+      expect(createWaitedOnRow).toBe(true);
+      expect(advisoryWhileCreateWaits).toBe(1);
+      expect(parentOutcome, JSON.stringify(parentOutcome)).toMatchObject({ ok: true });
+      expect((await configOf(parentId)).instructionsRootPath).toBe(parentNext);
+      if (conflict) {
+        expect(createOutcome).toMatchObject({ ok: false, status: 409, code: INSTRUCTION_ROOT_IN_USE });
+        expect(await loadAgent(childId)).toBeUndefined();
+        expect(await agentCount()).toBe(agentsBefore);
+      } else {
+        expect(createOutcome, JSON.stringify(createOutcome)).toMatchObject({ ok: true });
+        expect((await loadAgent(childId))!.reportsTo).toBe(parentId);
+        expect((await configOf(childId)).instructionsRootPath).toBe(childRoot);
+      }
+      expect(await assignmentLockFree()).toBe(true);
+    });
+  });
+
   describe("409 detail level", () => {
     it("non-admins get the sanitized 409; server-verified instance admins get the other agent's identifiers", async () => {
       const service = agentInstructionsService(db);
