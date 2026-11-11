@@ -104,6 +104,7 @@ const mockSecretService = vi.hoisted(() => ({
 
 const mockAgentInstructionsService = vi.hoisted(() => ({
   materializeManagedBundle: vi.fn(),
+  precheckExclusiveRoot: vi.fn(async () => undefined),
 }));
 const mockCompanySkillService = vi.hoisted(() => ({
   listRuntimeSkillEntries: vi.fn(),

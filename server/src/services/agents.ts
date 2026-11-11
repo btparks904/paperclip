@@ -60,6 +60,8 @@ import {
   instructionConfigEqual,
   type AgentInstructionConfigKey,
 } from "./agent-instruction-keys.js";
+import { agentInstructionsService, deriveBundleState } from "./agent-instructions.js";
+import path from "node:path";
 
 function hashToken(token: string) {
   return createHash("sha256").update(token).digest("hex");
@@ -146,7 +148,23 @@ interface UpdateAgentOptions {
   instructionConfigWrite?: InstructionConfigWrite;
   /** Options for the secret normalization that runs inside the update transaction. */
   secretNormalization?: { strictMode?: boolean };
+  /** WS-2 PR-W1: server-verified instance-admin determination; selects the detail of an exclusive-root 409 only. */
+  instructionRootGuard?: { isInstanceAdmin?: boolean };
 }
+
+/**
+ * WS-2 PR-W1: the instruction root a configuration activates, resolved the way
+ * the instructions service reads it (explicit root, else a legacy file path).
+ */
+function configuredInstructionRoot(
+  agent: { id: string; companyId: string; name: string },
+  adapterConfig: Record<string, unknown>,
+): string | null {
+  const root = deriveBundleState({ id: agent.id, companyId: agent.companyId, name: agent.name, adapterConfig }).rootPath;
+  return root ? path.resolve(root) : null;
+}
+
+const ROOT_CHANGED_DURING_PREPARE = "The instructions root changed while the configuration was prepared; nothing was changed. Reload and retry.";
 
 interface CreateAgentOptions {
   aiConnectionInstall?: { connectionId: string; createdByUserId: string | null };
@@ -800,6 +818,23 @@ export function agentService(db: Db) {
       const locked = await agentService(txDb).getById(id);
       if (!locked) return null;
       const lockedAdapterConfig = isPlainRecord(locked.adapterConfig) ? locked.adapterConfig : {};
+      // WS-2 PR-W1: a write that activates another instruction root takes the
+      // assignment lock (after the row lock above) and refuses a root that
+      // overlaps another agent, before secret normalization. The root comes
+      // from the patch with the locked instruction keys carried forward;
+      // normalization does not touch instruction keys, which is asserted below.
+      const prospectiveRoot = isPlainRecord(normalizedPatch.adapterConfig)
+        ? configuredInstructionRoot(locked, carryForwardInstructionConfig(
+          normalizedPatch.adapterConfig,
+          lockedAdapterConfig,
+          options?.instructionConfigWrite?.keys ?? [],
+        ))
+        : undefined;
+      if (prospectiveRoot && prospectiveRoot !== configuredInstructionRoot(locked, lockedAdapterConfig)) {
+        await agentInstructionsService(txDb).assertExclusiveRoot(txDb, locked, prospectiveRoot, {
+          isInstanceAdmin: options?.instructionRootGuard?.isInstanceAdmin === true,
+        });
+      }
       // After the agent row lock, as in the other transaction-bound callers.
       if (normalizeSecrets) {
         const adapterType = (normalizedPatch.adapterType ?? existing.adapterType) as string;
@@ -846,6 +881,10 @@ export function agentService(db: Db) {
           lockedAdapterConfig,
           instructionWrite?.keys ?? [],
         );
+      }
+      if (prospectiveRoot !== undefined && isPlainRecord(values.adapterConfig)
+        && configuredInstructionRoot(locked, values.adapterConfig) !== prospectiveRoot) {
+        throw conflict(ROOT_CHANGED_DURING_PREPARE);
       }
       const beforeConfig = shouldRecordRevision ? buildConfigSnapshot(locked) : null;
 
@@ -952,6 +991,18 @@ export function agentService(db: Db) {
       const normalizedPermissions = normalizeAgentPermissions(data.permissions, { context: "create" });
       const runtimeConfig = normalizeRuntimeConfigForNewAgent(data.runtimeConfig);
       const adapterType = data.adapterType ?? "process";
+      // WS-2 PR-W1: a create that names an instruction root checks it before
+      // the secret normalization below (unlocked), and again under the
+      // assignment lock inside the transaction. The normalization below commits
+      // on the global connection (PG-3), so a root claimed between the two
+      // checks leaves its secrets behind; that window is the tracked PG-3 item.
+      const guardAgent = { id: (data.id as string | undefined) ?? "", companyId, name: data.name };
+      const requestedRoot = isPlainRecord(data.adapterConfig) ? configuredInstructionRoot(guardAgent, data.adapterConfig) : null;
+      if (requestedRoot) {
+        await agentInstructionsService(db).assertExclusiveRoot(db, { ...guardAgent, adapterConfig: data.adapterConfig }, requestedRoot, {
+          isInstanceAdmin: false, lock: false,
+        });
+      }
       const rawAdapterConfig = isPlainRecord(data.adapterConfig)
         ? await secretsSvc.normalizeAdapterConfigForPersistence(companyId, data.adapterConfig, { adapterType })
         : {};
@@ -976,6 +1027,13 @@ export function agentService(db: Db) {
           claudeLogin: options?.claudeLogin,
           childAdapterConfig: adapterConfig,
         });
+        // WS-2 PR-W1: the locked check, after the parent row lock of the
+        // binding claim (L1) and before the insert.
+        const lockedRoot = configuredInstructionRoot(guardAgent, adapterConfig);
+        if (lockedRoot !== requestedRoot) throw conflict(ROOT_CHANGED_DURING_PREPARE);
+        if (lockedRoot) {
+          await agentInstructionsService(txDb).assertExclusiveRoot(txDb, { ...guardAgent, adapterConfig }, lockedRoot, { isInstanceAdmin: false });
+        }
         const created = await tx
           .insert(agents)
           .values({
@@ -1156,11 +1214,24 @@ export function agentService(db: Db) {
     activatePendingApproval: async (id: string, approvedPayload?: Record<string, unknown> | null) => {
       const activatedAgent = await db.transaction(async (tx) => {
         const txDb = tx as unknown as Db;
+        // WS-2 (A13): lock the agent row first (L1), as every other root writer does.
+        const [lockedRow] = await tx.select({ id: agents.id }).from(agents).where(eq(agents.id, id)).for("update");
+        if (!lockedRow) return null;
         const existing = await agentService(txDb).getById(id);
         if (!existing || existing.status !== "pending_approval") return null;
         const approvedPatch = approvedPayload ? configPatchFromApprovalPayload(approvedPayload) : {};
         let patch = { ...approvedPatch } as Partial<typeof agents.$inferInsert>;
         let approvalBindingDecision: ClaudeOAuthBindingInvariantDecision | null = null;
+        // WS-2 PR-W1: an approved payload that activates another instruction
+        // root takes the assignment lock and refuses a root that overlaps
+        // another agent, before secret normalization. Only the exclusivity
+        // check is added: the payload's instruction keys are still applied as
+        // approved (the PG-4 authorization gap is unchanged and tracked).
+        const existingConfig = isPlainRecord(existing.adapterConfig) ? existing.adapterConfig : {};
+        const approvedRoot = isPlainRecord(patch.adapterConfig) ? configuredInstructionRoot(existing, patch.adapterConfig) : undefined;
+        if (approvedRoot && approvedRoot !== configuredInstructionRoot(existing, existingConfig)) {
+          await agentInstructionsService(txDb).assertExclusiveRoot(txDb, existing, approvedRoot, { isInstanceAdmin: false });
+        }
         if (
           Object.prototype.hasOwnProperty.call(patch, "adapterConfig") &&
           isPlainRecord(patch.adapterConfig)
@@ -1194,6 +1265,10 @@ export function agentService(db: Db) {
           // The pending-approval activation replays the original hire
           // request, so the new-agent creation default applies.
           patch.permissions = normalizeAgentPermissions(patch.permissions, { context: "create" });
+        }
+        if (approvedRoot !== undefined && isPlainRecord(patch.adapterConfig)
+          && configuredInstructionRoot(existing, patch.adapterConfig) !== approvedRoot) {
+          throw conflict(ROOT_CHANGED_DURING_PREPARE);
         }
         const updated = await tx
           .update(agents)
