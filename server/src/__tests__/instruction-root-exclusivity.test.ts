@@ -1079,6 +1079,54 @@ describe("WS-2 PR-W1: exclusive instruction roots", () => {
       },
     );
 
+    // Instructions-path PATCH route (Codex P2 on b204944d). The route locks A's row in its own
+    // transaction (lockAgentForInstructionsChange), then updateAgent takes the assignment lock
+    // for the new root. A FOR UPDATE route lock would deadlock with A's first bind of B.
+    it.each(["assignment-first", "row-first"] as const)(
+      "the board moves A's instructions path through the route while A first-binds B ($0): both commit, attribution kept",
+      async (order) => {
+        const { actorId, targetId } = await seedPair();
+        const nextRoot = fresh("path-next");
+        // The real routes and error handler; a test-only hook before the handler keeps the
+        // server error so its SQLSTATE can be checked (the 500 body hides it).
+        const routeErrors: unknown[] = [];
+        const server = express();
+        server.use(express.json());
+        server.use((req, _res, next) => { (req as any).actor = actorAdmin(); next(); });
+        server.use("/api", agentRoutes(db as any));
+        server.use((err: unknown, _req: express.Request, _res: express.Response, next: express.NextFunction) => { routeErrors.push(err); next(err); });
+        server.use(errorHandler);
+        const pathPatch = async () => {
+          const res = await request(server).patch(`/api/agents/${actorId}/instructions-path`)
+            .send({ path: path.join(nextRoot, "AGENTS.md"), adapterConfigKey: "instructionsFilePath" });
+          if (res.status !== 200) throw routeErrors[0] ?? Object.assign(new Error(JSON.stringify(res.body)), { status: res.status });
+          return res.body;
+        };
+        const actorRevisionsBefore = (await revisionsOf(actorId)).length;
+        const { first, second } = await race(order, () => actorSave(actorId, targetId), pathPatch);
+        expect(first, JSON.stringify(first)).toMatchObject({ ok: true });
+        expect(second, JSON.stringify(second)).toMatchObject({ ok: true });
+        expect(routeErrors).toEqual([]);
+        expect((await configOf(actorId)).instructionsFilePath).toBe(path.join(nextRoot, "AGENTS.md"));
+        expect((await configOf(actorId)).instructionsRootPath).toBe(nextRoot);
+        const actorRevisions = await revisionsOf(actorId);
+        expect(actorRevisions.length).toBe(actorRevisionsBefore + 1);
+        for (const revision of actorRevisions) {
+          expect(revision.createdByUserId).toBe(userId);
+          expect(revision.createdByAgentId).toBeNull();
+        }
+        expect((await configOf(targetId)).instructionsRootPath).toBe(managedOf(targetId));
+        expect(await fs.readFile(path.join(managedOf(targetId), "notes/a.md"), "utf8")).toBe(`SENTINEL-${actorId.slice(0, 8)}\n`);
+        const targetRevisions = await revisionsOf(targetId);
+        expect(targetRevisions.length).toBeGreaterThan(0);
+        for (const revision of targetRevisions) {
+          expect(revision.createdByAgentId).toBe(actorId);
+          expect(revision.createdByUserId).toBeNull();
+        }
+        expect(await fs.readdir(instructionCopyIntentsDirectory()).catch(() => [] as string[])).toEqual([]);
+      },
+    );
+
     it("negative control: a session that holds A FOR UPDATE and then waits for the assignment lock deadlocks with A's save into B", async () => {
       // The pre-correction lock: FOR UPDATE conflicts with the revision insert's KEY SHARE on A.
       // PostgreSQL detects the cycle and aborts one side; this proves the harness sees the defect.

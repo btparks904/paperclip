@@ -2952,7 +2952,7 @@ export function agentRoutes(
     expectedTarget: Awaited<ReturnType<typeof resolveInstructionWriteTarget>>,
   ) {
     const [current] = await tx.select().from(agentsTable)
-      .where(and(eq(agentsTable.id, existing.id), eq(agentsTable.companyId, existing.companyId))).for("update");
+      .where(and(eq(agentsTable.id, existing.id), eq(agentsTable.companyId, existing.companyId))).for("no key update");
     if (!current) return null;
     const target = await resolveInstructionWriteTarget(current);
     if (target.mode !== expectedTarget.mode || target.rootPath !== expectedTarget.rootPath
