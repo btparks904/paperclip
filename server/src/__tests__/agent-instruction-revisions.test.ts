@@ -224,7 +224,7 @@ describe("canonical instruction revisions", () => {
     await fs.rm(path.dirname(path.join(root, entryFile)), { recursive: true });
     await fs.symlink(home, path.dirname(path.join(root, entryFile)));
     await expect(readInstructionBytes(root, entryFile)).rejects.toMatchObject({ status: 422 });
-    await db.update(agents).set({ adapterConfig: { instructionsBundleMode: "external", instructionsRootPath: home } }).where(eq(agents.id, agentId));
+    await db.update(agents).set({ adapterConfig: { instructionsBundleMode: "external", instructionsRootPath: path.join(home, "external-root") } }).where(eq(agents.id, agentId));
     await expect(save("external", first.revision.id)).rejects.toMatchObject({ details: { code: "INSTRUCTION_MANAGED_BUNDLE_REQUIRED" } });
     expect((await db.select().from(agentInstructionRevisions).where(eq(agentInstructionRevisions.agentId, agentId)))).toHaveLength(0);
   });
