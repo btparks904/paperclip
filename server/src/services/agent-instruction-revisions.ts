@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import path from "node:path";
 import { adoptAgentFiles, agentFileToken } from "./agent-file-store.js";
 import { and, desc, eq, getTableColumns, lt, or, sql } from "drizzle-orm";
 import {
@@ -34,6 +35,7 @@ import {
   authorizeInstructionCommit,
   authorizeInstructionRead,
 } from "./agent-instruction-authorization.js";
+import { assertExclusiveInstructionRoot } from "./instruction-root-exclusivity.js";
 import type { AuthorizationActor } from "./authorization.js";
 
 type Tx = Parameters<Parameters<Db["transaction"]>[0]>[0];
@@ -84,6 +86,7 @@ export function agentInstructionRevisionService(db: Db) {
     tx: Tx,
     target: InstructionTarget,
     actor?: AuthorizationActor,
+    rowLock: "update" | "no key update" = "update",
   ) {
     if (actor?.type === "agent" && actor.companyId !== target.companyId)
       throw notFound("Agent not found");
@@ -96,7 +99,7 @@ export function agentInstructionRevisionService(db: Db) {
           eq(agents.companyId, target.companyId),
         ),
       )
-      .for("update");
+      .for(rowLock);
     if (!agent) throw notFound("Agent not found");
     if (agentInstructionsBundleMode(agent) === "external") {
       throw unprocessable(
@@ -220,7 +223,11 @@ export function agentInstructionRevisionService(db: Db) {
     instructionPath(input.entryFile);
     const bytes = "content" in input ? instructionBytes(input.content) : null;
     const result = await db.transaction(async (tx) => {
-      const state = await lockTarget(tx, input, actor.type === "plugin" ? undefined : actor);
+      // FOR NO KEY UPDATE, like every instruction writer that can take the
+      // instruction-root assignment lock (WS-2 PR-W1): writers of this agent
+      // still serialize, and a foreign-key KEY SHARE lock on this row (for
+      // example a revision attributed to this agent) never waits on it.
+      const state = await lockTarget(tx, input, actor.type === "plugin" ? undefined : actor, "no key update");
       const bound = actor.type === "plugin"
         ? await authorizePluginReset(tx, actor, input, state.agent)
         : await authorizeInstructionCommit(tx, actor, state.agent);
@@ -234,6 +241,18 @@ export function agentInstructionRevisionService(db: Db) {
           "Configured instruction entry changed; read the current entry and retry",
           { code: "INSTRUCTION_ENTRY_CHANGED", entryFile: state.entryFile },
         );
+      // WS-2 PR-W1: a commit that binds the managed root (none or no mode
+      // configured yet, or a plugin entry reset that moves the root) is a root
+      // activation. It refuses a root that overlaps another agent before
+      // adoption, any file write and the identical-content replay bind.
+      const configuredRoot = state.agent.adapterConfig.instructionsRootPath;
+      if (!configuredRoot || !state.agent.adapterConfig.instructionsBundleMode
+        || (bound.type === "plugin" && configuredEntryFile !== input.entryFile && path.resolve(String(configuredRoot)) !== state.root)) {
+        await assertExclusiveInstructionRoot(tx as unknown as Db, state.agent, state.root, {
+          isInstanceAdmin: false,
+          deriveRoot: (other) => deriveBundleState(other).rootPath,
+        });
+      }
       await assertInstructionPathSafe(state.root, state.entryFile);
       const current = await currentFile(tx, input, state, bound);
       const restored =

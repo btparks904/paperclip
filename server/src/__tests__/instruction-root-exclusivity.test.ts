@@ -3,13 +3,13 @@
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import express from "express";
 import request from "supertest";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { and, eq, sql } from "drizzle-orm";
 import {
-  agentConfigRevisions, agents, approvals, authUsers, budgetPolicies, companies, companyMemberships, companySecrets, createDb, principalPermissionGrants, type Db,
+  activityLog, agentConfigRevisions, agents, approvals, authUsers, budgetPolicies, companies, companyMemberships, companySecrets, createDb, principalPermissionGrants, type Db,
 } from "@paperclipai/db";
 import {
   agentInstructionsBundleMode, agentInstructionsService, instructionCopyIntentsDirectory, resolveInstructionWriteTarget, resolveManagedInstructionsRoot,
@@ -129,6 +129,28 @@ describe("WS-2 PR-W1: exclusive instruction roots", () => {
     server.use(errorHandler);
     return server;
   };
+  /** The canonical entry commit route (PUT .../instructions-bundle/file on the entry). */
+  const putEntry = (server: express.Express, id: string, body: Record<string, unknown>) =>
+    request(server).put(`/api/agents/${id}/instructions-bundle/file`).send({ path: "AGENTS.md", ...body });
+  const sha256 = (value: string) => createHash("sha256").update(value).digest("hex");
+  const managedRootOf = (id: string) => resolveManagedInstructionsRoot({ id, companyId, name: "x", adapterConfig: {} });
+  /** The adoption marker lives outside the agent files: <managed area>/file-sync/adopted.json. */
+  const adoptionMarkerOf = (id: string) => path.join(resolveManagedAgentArea({ id, companyId }), "file-sync", "adopted.json");
+  const filesUpdatedAudit = async (id: string) => db.select().from(activityLog)
+    .where(and(eq(activityLog.entityId, id), eq(activityLog.action, "agent.files_updated")));
+  /** Every entry under root, with the sha256 of each file: a byte-exact snapshot of a folder. */
+  async function treeOf(root: string): Promise<Record<string, string>> {
+    const result: Record<string, string> = {};
+    async function walk(dir: string) {
+      for (const item of await fs.readdir(path.join(root, dir), { withFileTypes: true })) {
+        const rel = dir ? `${dir}/${item.name}` : item.name;
+        if (item.isDirectory()) { result[rel] = "dir"; await walk(rel); }
+        else result[rel] = createHash("sha256").update(await fs.readFile(path.join(root, rel))).digest("hex");
+      }
+    }
+    await walk("");
+    return result;
+  }
   const advisoryWaiters = async () => {
     const rows = await db.execute(sql`select count(*)::int as n from pg_locks where locktype = 'advisory' and not granted`);
     return Number((rows as unknown as Array<{ n: number }>)[0]?.n ?? 0);
@@ -386,6 +408,43 @@ describe("WS-2 PR-W1: exclusive instruction roots", () => {
       expect(outcome).toMatchObject({ ok: false, status: 409, code: INSTRUCTION_ROOT_IN_USE });
       expect(await exists(path.join(target, "notes"))).toBe(false);
     });
+
+    // Codex P2 on 3ac09f46. The canonical entry commit route first-binds the managed root in
+    // agent-instruction-revisions.ts. A legacy overlap (another agent's root, stored before this
+    // rule, equal to or containing this agent's managed root) must refuse before adoption, any
+    // file write and the identical-content replay bind, and change nothing.
+    const legacyOverlaps = [
+      { relation: "equal to A's managed root", legacyRoot: (id: string) => managedRootOf(id), entry: "AGENTS.md" },
+      { relation: "containing A's managed root (A's managed area)", legacyRoot: (id: string) => resolveManagedAgentArea({ id, companyId }), entry: "instructions/AGENTS.md" },
+    ];
+    it.each(legacyOverlaps.flatMap((overlap) => [
+      { ...overlap, replay: false, kind: "new content" },
+      { ...overlap, replay: true, kind: "identical-content replay" },
+    ]))("canonical entry commit route (first bind): a legacy root $relation refuses a $kind with 409 and changes nothing", async ({ legacyRoot, entry, replay }) => {
+      const a = randomUUID();
+      await seedAgent(a, { model: "m0" });
+      const bId = randomUUID();
+      const bRoot = legacyRoot(a);
+      await seedAgent(bId, cfg("external", bRoot));
+      const bBytes = `SENTINEL-B-${bId.slice(0, 8)}\n`;
+      await seed(bRoot, { [entry]: bBytes, "notes/b.md": "SENTINEL-B-NOTE\n" });
+      const before = {
+        tree: await treeOf(bRoot), a: await loadAgent(a), b: await loadAgent(bId), audit: await filesUpdatedAudit(a),
+        revisions: await db.select().from(agentConfigRevisions).where(eq(agentConfigRevisions.agentId, a)),
+      };
+      expect(await exists(adoptionMarkerOf(a))).toBe(false);
+      const res = await putEntry(app(), a, { content: replay ? bBytes : "SENTINEL-A-NEW\n", baseHash: sha256(bBytes) });
+      expect(res.status, JSON.stringify(res.body)).toBe(409);
+      expect(JSON.stringify(res.body)).toContain(INSTRUCTION_ROOT_IN_USE);
+      expect(await fs.readFile(path.join(bRoot, entry), "utf8")).toBe(bBytes);
+      expect(await treeOf(bRoot)).toEqual(before.tree);
+      expect(await loadAgent(a)).toEqual(before.a);
+      expect(await loadAgent(bId)).toEqual(before.b);
+      expect(await exists(adoptionMarkerOf(a))).toBe(false);
+      expect(await filesUpdatedAudit(a)).toEqual(before.audit);
+      expect(before.audit).toEqual([]);
+      expect(await db.select().from(agentConfigRevisions).where(eq(agentConfigRevisions.agentId, a))).toEqual(before.revisions);
+    });
   });
 
   describe("preserved success paths", () => {
@@ -459,6 +518,26 @@ describe("WS-2 PR-W1: exclusive instruction roots", () => {
       await seedAgent(b, { model: "m0" });
       const saved = await agentInstructionsService(db).writeFile((await loadAgent(b))!, "notes/a.md", "SENTINEL-NOTE\n");
       expect(saved.adapterConfig).toMatchObject({ instructionsBundleMode: "managed" });
+    });
+
+    it("canonical entry commit route: a first bind of an independent managed root succeeds and is audited", async () => {
+      const a = randomUUID();
+      await seedAgent(a, { model: "m0" });
+      const root = managedRootOf(a);
+      expect(await exists(root)).toBe(false);
+      const res = await putEntry(app(), a, { content: "SENTINEL-A-FIRST\n", baseRevisionId: null });
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(await configOf(a)).toMatchObject({ model: "m0", instructionsBundleMode: "managed", instructionsRootPath: root,
+        instructionsEntryFile: "AGENTS.md", instructionsFilePath: `${root}/AGENTS.md` });
+      expect(await fs.readFile(path.join(root, "AGENTS.md"), "utf8")).toBe("SENTINEL-A-FIRST\n");
+      expect(await exists(adoptionMarkerOf(a))).toBe(true);
+      const audit = await filesUpdatedAudit(a);
+      expect(audit).toHaveLength(1);
+      expect(audit[0]).toMatchObject({ actorType: "user", actorId: userId, agentId: null, details: { path: "AGENTS.md", contentHash: sha256("SENTINEL-A-FIRST\n") } });
+      // An identical replay of the bound root is still a no-op success.
+      const replay = await putEntry(app(), a, { content: "SENTINEL-A-FIRST\n", baseHash: sha256("SENTINEL-A-FIRST\n") });
+      expect(replay.status, JSON.stringify(replay.body)).toBe(200);
+      expect(await filesUpdatedAudit(a)).toHaveLength(1);
     });
   });
 
@@ -1124,6 +1203,58 @@ describe("WS-2 PR-W1: exclusive instruction roots", () => {
           expect(revision.createdByUserId).toBeNull();
         }
         expect(await fs.readdir(instructionCopyIntentsDirectory()).catch(() => [] as string[])).toEqual([]);
+      },
+    );
+
+    // Canonical entry commit route (Codex P2 on 3ac09f46). The commit locks A's row in
+    // agent-instruction-revisions.ts (lockTarget), then the first-bind guard takes the assignment
+    // lock. A's concurrent first bind of B holds the assignment lock and then needs KEY SHARE on A
+    // (created_by_agent_id). A FOR UPDATE commit lock would deadlock with it.
+    it.each(["assignment-first", "row-first"] as const)(
+      "the board commits A's entry through the route (A's first bind) while A first-binds B ($0): both commit, attribution kept",
+      async (order) => {
+        const { actorId, targetId } = await seedPair();
+        // The real routes and error handler; a test-only hook before the handler keeps the
+        // server error so its SQLSTATE can be checked (the 500 body hides it).
+        const routeErrors: unknown[] = [];
+        const server = express();
+        server.use(express.json());
+        server.use((req, _res, next) => { (req as any).actor = actorAdmin(); next(); });
+        server.use("/api", agentRoutes(db as any));
+        server.use((err: unknown, _req: express.Request, _res: express.Response, next: express.NextFunction) => { routeErrors.push(err); next(err); });
+        server.use(errorHandler);
+        const commit = async () => {
+          const res = await putEntry(server, actorId, { content: "SENTINEL-COMMIT\n", baseRevisionId: null });
+          if (res.status !== 200) throw routeErrors[0] ?? Object.assign(new Error(JSON.stringify(res.body)), { status: res.status });
+          return res.body;
+        };
+        const { first, second } = await race(order, () => actorSave(actorId, targetId), commit);
+        expect(first, JSON.stringify(first)).toMatchObject({ ok: true });
+        expect(second, JSON.stringify(second)).toMatchObject({ ok: true });
+        expect(routeErrors).toEqual([]);
+        // A: bound to its managed root by the commit, bytes written, audited to the board user.
+        expect(await configOf(actorId)).toMatchObject({ instructionsBundleMode: "managed", instructionsRootPath: managedOf(actorId),
+          instructionsFilePath: `${managedOf(actorId)}/AGENTS.md` });
+        expect(await fs.readFile(path.join(managedOf(actorId), "AGENTS.md"), "utf8")).toBe("SENTINEL-COMMIT\n");
+        const audit = await filesUpdatedAudit(actorId);
+        expect(audit).toHaveLength(1);
+        expect(audit[0]).toMatchObject({ actorType: "user", actorId: userId, agentId: null });
+        expect(await revisionsOf(actorId)).toEqual([]);
+        // B: first-bound by A's save, attributed to A.
+        expect((await configOf(targetId)).instructionsRootPath).toBe(managedOf(targetId));
+        expect(await fs.readFile(path.join(managedOf(targetId), "notes/a.md"), "utf8")).toBe(`SENTINEL-${actorId.slice(0, 8)}\n`);
+        const targetRevisions = await revisionsOf(targetId);
+        expect(targetRevisions.length).toBeGreaterThan(0);
+        for (const revision of targetRevisions) {
+          expect(revision.createdByAgentId).toBe(actorId);
+          expect(revision.createdByUserId).toBeNull();
+        }
+        // No row lock on either agent is left behind.
+        const rowLocks = await db.execute(sql`select count(*)::int as n from pg_locks l join pg_class c on c.oid = l.relation
+          where c.relname = 'agents' and l.locktype = 'tuple'`);
+        expect(Number((rowLocks as unknown as Array<{ n: number }>)[0]?.n ?? 0)).toBe(0);
+        const locked = await db.transaction(async (tx) => tx.execute(sql`select id from agents where id in (${actorId}, ${targetId}) for update nowait`));
+        expect((locked as unknown as unknown[]).length).toBe(2);
       },
     );
 
