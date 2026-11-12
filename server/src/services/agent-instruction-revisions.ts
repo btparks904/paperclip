@@ -138,7 +138,7 @@ export function agentInstructionRevisionService(db: Db) {
   }
   async function readForPluginReset(target: InstructionTarget, actor: PluginResetActor) {
     return db.transaction(async (tx) => {
-      const state = await lockTarget(tx, target);
+      const state = await lockTarget(tx, target, undefined, "no key update");
       const bound = await authorizePluginReset(tx, actor, target, state.agent);
       // Preserve the formerly configured entry before an explicit stock reset.
       await currentFile(tx, target, state, bound);
@@ -189,7 +189,7 @@ export function agentInstructionRevisionService(db: Db) {
     actor: AuthorizationActor,
   ): Promise<AgentInstructionSnapshot | null> {
     return db.transaction(async (tx) => {
-      const state = await lockTarget(tx, target, actor);
+      const state = await lockTarget(tx, target, actor, "no key update");
       const bound = await authorizeRead(tx, actor, target);
       const row = await currentFile(tx, target, state, bound);
       return row ? snapshot(row) : null;
@@ -199,7 +199,7 @@ export function agentInstructionRevisionService(db: Db) {
    * never seeds or writes, and is not exposed through HTTP or model tools. */
   async function readCommittedForRuntime(target: InstructionTarget): Promise<AgentInstructionSnapshot | null> {
     return db.transaction(async (tx) => {
-      const state = await lockTarget(tx, target);
+      const state = await lockTarget(tx, target, undefined, "no key update");
       const current = await currentFile(tx, target, state);
       return current ? snapshot(current) : null;
     });
@@ -207,7 +207,7 @@ export function agentInstructionRevisionService(db: Db) {
   /** Rebuild disk from the current committed head under the same lock as commits. Safe after restart. */
   async function materializeCurrent(target: InstructionTarget): Promise<void> {
     await db.transaction(async (tx) => {
-      const state = await lockTarget(tx, target);
+      const state = await lockTarget(tx, target, undefined, "no key update");
       await adoptAgentFiles(tx, state.agent);
     });
   }
@@ -331,7 +331,7 @@ export function agentInstructionRevisionService(db: Db) {
   ): Promise<AgentInstructionHistory> {
     const limit = Math.max(1, Math.min(100, target.limit ?? 50));
     return db.transaction(async (tx) => {
-      const state = await lockTarget(tx, target, actor);
+      const state = await lockTarget(tx, target, actor, "no key update");
       const bound = await authorizeRead(tx, actor, target);
       await currentFile(tx, target, state, bound);
       instructionPath(target.entryFile);

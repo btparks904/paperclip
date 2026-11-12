@@ -9,7 +9,7 @@ import request from "supertest";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { and, eq, sql } from "drizzle-orm";
 import {
-  activityLog, agentConfigRevisions, agents, approvals, authUsers, budgetPolicies, companies, companyMemberships, companySecrets, createDb, principalPermissionGrants, type Db,
+  activityLog, agentConfigRevisions, agentInstructionHeads, agentInstructionRevisions, agents, approvals, authUsers, budgetPolicies, companies, companyMemberships, companySecrets, createDb, principalPermissionGrants, type Db,
 } from "@paperclipai/db";
 import {
   agentInstructionsBundleMode, agentInstructionsService, instructionCopyIntentsDirectory, resolveInstructionWriteTarget, resolveManagedInstructionsRoot,
@@ -20,7 +20,8 @@ import {
   compareInstructionRootKeys, foldInstructionRootPath, instructionRootComparisonKey, resolveManagedAgentArea,
 } from "../services/instruction-root-exclusivity.js";
 import { agentService } from "../services/agents.js";
-import { agentFileStore, type AgentFileConfigRepair } from "../services/agent-file-store.js";
+import { AGENT_FILES_CONTRACT, agentFileStore, type AgentFileConfigRepair } from "../services/agent-file-store.js";
+import { agentInstructionRevisionService } from "../services/agent-instruction-revisions.js";
 import { approvalService } from "../services/approvals.js";
 import { secretService } from "../services/secrets.js";
 import { agentRoutes } from "../routes/agents.js";
@@ -169,6 +170,25 @@ describe("WS-2 PR-W1: exclusive instruction roots", () => {
     }
     return false;
   }
+  /** Holds the assignment lock in its own transaction (after optional work on it) until release(). */
+  async function holdAssignmentLock(work?: (tx: Parameters<Parameters<Db["transaction"]>[0]>[0]) => Promise<void>) {
+    let release!: () => void;
+    const released = new Promise<void>((resolve) => { release = resolve; });
+    let held!: () => void;
+    const isHeld = new Promise<void>((resolve) => { held = resolve; });
+    const done = db.transaction(async (tx) => {
+      await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${INSTRUCTION_ROOT_ASSIGNMENT_LOCK}, 0))`);
+      await work?.(tx);
+      held();
+      await released;
+    });
+    await isHeld;
+    return { release, done };
+  }
+  const assignmentLockIsFree = () => db.transaction(async (tx) => {
+    const rows = await tx.execute(sql`select pg_try_advisory_xact_lock(hashtextextended(${INSTRUCTION_ROOT_ASSIGNMENT_LOCK}, 0)) as ok`);
+    return Boolean((rows as unknown as Array<{ ok: boolean }>)[0]?.ok);
+  });
   /** The owner agent's root plus the ways another agent could name it or overlap it. */
   const overlapping = () => ({
     equal: ownerRoot,
@@ -444,6 +464,176 @@ describe("WS-2 PR-W1: exclusive instruction roots", () => {
       expect(await filesUpdatedAudit(a)).toEqual(before.audit);
       expect(before.audit).toEqual([]);
       expect(await db.select().from(agentConfigRevisions).where(eq(agentConfigRevisions.agentId, a))).toEqual(before.revisions);
+    });
+  });
+
+  // IF-1 (WS-2 integration run 2): a read of an agent that was never adopted
+  // runs first adoption, which creates the managed root and writes the legacy
+  // heads and the marker. When another agent's root overlaps that managed root
+  // or the marker folder (a legacy state that the W1 rule now prevents), the
+  // read must refuse under the assignment lock and write nothing.
+  describe("read-triggered first adoption (IF-1)", () => {
+    const LEGACY = "SENTINEL-A-LEGACY-HEAD\n";
+    async function seedLegacyHead(id: string, entryFile: string, content: string) {
+      const revisionId = randomUUID();
+      const bytes = Buffer.from(content);
+      await db.insert(agentInstructionRevisions).values({ id: revisionId, companyId, agentId: id, entryFile,
+        contentBase64: bytes.toString("base64"), contentHash: sha256(content), byteLength: bytes.length, source: "api" });
+      await db.insert(agentInstructionHeads).values({ companyId, agentId: id, entryFile, revisionId });
+    }
+    const areaOf = (id: string) => resolveManagedAgentArea({ id, companyId });
+    const target = (id: string) => ({ companyId, agentId: id });
+    /** Every read path that runs first adoption, as the routes and the runtime call it. */
+    const readers: Array<{ name: string; read: (id: string) => Promise<unknown> }> = [
+      { name: "GET instructions-bundle route", read: async (id) => {
+        const res = await request(app()).get(`/api/agents/${id}/instructions-bundle`);
+        if (res.status !== 200) throw Object.assign(new Error(JSON.stringify(res.body)), { status: res.status, details: res.body?.details ?? res.body });
+        return res.body;
+      } },
+      { name: "GET instructions-bundle/file route (entry)", read: async (id) => {
+        const res = await request(app()).get(`/api/agents/${id}/instructions-bundle/file`).query({ path: "AGENTS.md" });
+        if (res.status !== 200) throw Object.assign(new Error(JSON.stringify(res.body)), { status: res.status, details: res.body?.details ?? res.body });
+        return res.body;
+      } },
+      { name: "runtime read (readCommittedForRuntime)", read: (id) => agentInstructionRevisionService(db).readCommittedForRuntime(target(id)) },
+      { name: "materializeCurrent", read: (id) => agentInstructionRevisionService(db).materializeCurrent(target(id)) },
+      { name: "agent file store read", read: (id) => agentFileStore(db).read(companyId, id, "notes/b.md", actorAdmin() as any) },
+    ];
+    const codeOf = (outcome: Outcome) => outcome.ok ? null : (outcome.code ?? (outcome.details as { code?: string }).code ?? null);
+    /** The other agent's (B's) legacy root relative to A: it overlaps A's managed root or A's marker folder. */
+    const overlaps = [
+      { relation: "equal to A's managed root", bRoot: (a: string) => managedRootOf(a) },
+      { relation: "containing A's managed root (A's managed area)", bRoot: (a: string) => areaOf(a) },
+      { relation: "inside A's managed root", bRoot: (a: string) => path.join(managedRootOf(a), "legacy") },
+      { relation: "equal to A's marker folder", bRoot: (a: string) => path.join(areaOf(a), "file-sync") },
+    ];
+
+    it.each(overlaps.flatMap((overlap) => readers.map((reader) => ({ ...overlap, reader }))))(
+      "conflicting ownership: $reader.name on an unadopted agent whose root is $relation refuses with 409 and writes nothing",
+      async ({ bRoot, reader }) => {
+        const a = randomUUID();
+        await seedAgent(a, { model: "m0" });
+        await seedLegacyHead(a, "AGENTS.md", LEGACY);
+        const bId = randomUUID();
+        const root = bRoot(a);
+        await seedAgent(bId, cfg("external", root));
+        const bBytes = `SENTINEL-B-${bId.slice(0, 8)}\n`;
+        await seed(root, { "AGENTS.md": bBytes, "notes/b.md": "SENTINEL-B-NOTE\n" });
+        const before = { area: await treeOf(areaOf(a)), a: await loadAgent(a), b: await loadAgent(bId), audit: await filesUpdatedAudit(a) };
+        expect(await exists(adoptionMarkerOf(a))).toBe(false);
+        const outcome = await settle(reader.read(a));
+        expect(outcome, JSON.stringify(outcome)).toMatchObject({ ok: false, status: 409 });
+        expect(codeOf(outcome)).toBe(INSTRUCTION_ROOT_IN_USE);
+        // Nothing was created or written in A's managed area or in B's root.
+        expect(await exists(adoptionMarkerOf(a))).toBe(false);
+        expect(await fs.readFile(path.join(root, "AGENTS.md"), "utf8")).toBe(bBytes);
+        expect(await treeOf(areaOf(a))).toEqual(before.area);
+        expect(await loadAgent(a)).toEqual(before.a);
+        expect(await loadAgent(bId)).toEqual(before.b);
+        expect(await filesUpdatedAudit(a)).toEqual(before.audit);
+        expect(await assignmentLockIsFree()).toBe(true);
+      },
+    );
+
+    it("conflicting ownership: the marker-folder overlap refuses before A's managed root folder is created", async () => {
+      const a = randomUUID();
+      await seedAgent(a, { model: "m0" });
+      const bRoot = path.join(areaOf(a), "file-sync");
+      await seedAgent(randomUUID(), cfg("external", bRoot));
+      await seed(bRoot, { "AGENTS.md": "SENTINEL-B\n" });
+      const outcome = await settle(agentInstructionRevisionService(db).readCommittedForRuntime(target(a)));
+      expect(outcome).toMatchObject({ ok: false, status: 409, code: INSTRUCTION_ROOT_IN_USE });
+      expect(await exists(managedRootOf(a))).toBe(false);
+      expect(await fs.readdir(bRoot)).toEqual(["AGENTS.md"]);
+    });
+
+    it.each(readers)("legitimate adoption: $name adopts an unbound agent with a legacy head and no overlap", async ({ name, read }) => {
+      const a = randomUUID();
+      await seedAgent(a, { model: "m0" });
+      await seedLegacyHead(a, "AGENTS.md", LEGACY);
+      // An unrelated agent with its own separate root.
+      await seedAgent(randomUUID(), cfg("external", fresh("unrelated")));
+      const outcome = await settle(read(a));
+      if (name === "agent file store read") expect(outcome).toMatchObject({ ok: true, value: null });
+      else expect(outcome, JSON.stringify(outcome)).toMatchObject({ ok: true });
+      if (name === "GET instructions-bundle/file route (entry)") expect((outcome as { value: { content: string } }).value.content).toBe(LEGACY);
+      if (name === "runtime read (readCommittedForRuntime)") {
+        expect((outcome as { value: { revision: { contentHash: string } } }).value.revision.contentHash).toBe(sha256(LEGACY));
+      }
+      expect(await fs.readFile(path.join(managedRootOf(a), "AGENTS.md"), "utf8")).toBe(LEGACY);
+      expect(JSON.parse(await fs.readFile(adoptionMarkerOf(a), "utf8"))).toEqual({ schema: AGENT_FILES_CONTRACT });
+      expect(await assignmentLockIsFree()).toBe(true);
+    });
+
+    it("legitimate adoption: an agent with no legacy head gets its root folder and marker on first read", async () => {
+      const a = randomUUID();
+      await seedAgent(a, { model: "m0" });
+      expect(await settle(agentInstructionRevisionService(db).readCommittedForRuntime(target(a)))).toMatchObject({ ok: true, value: null });
+      expect(await exists(managedRootOf(a))).toBe(true);
+      expect(JSON.parse(await fs.readFile(adoptionMarkerOf(a), "utf8"))).toEqual({ schema: AGENT_FILES_CONTRACT });
+    });
+
+    it("valid marker: a read takes no assignment lock, returns the bytes and writes nothing", async () => {
+      await seed(path.dirname(adoptionMarkerOf(agentId)), { "adopted.json": JSON.stringify({ schema: AGENT_FILES_CONTRACT }) });
+      const before = { area: await treeOf(areaOf(agentId)), row: await loadAgent(agentId) };
+      const holder = await holdAssignmentLock();
+      let outcome: Outcome;
+      let waiters = -1;
+      try {
+        outcome = await settle((async () => {
+          const res = await request(app()).get(`/api/agents/${agentId}/instructions-bundle/file`).query({ path: "AGENTS.md" });
+          if (res.status !== 200) throw Object.assign(new Error(JSON.stringify(res.body)), { status: res.status });
+          return res.body;
+        })());
+        waiters = await advisoryWaiters();
+      } finally {
+        holder.release();
+        await holder.done;
+      }
+      expect(outcome!, JSON.stringify(outcome!)).toMatchObject({ ok: true, value: { content: ENTRY } });
+      expect(waiters).toBe(0);
+      expect(await treeOf(areaOf(agentId))).toEqual(before.area);
+      expect(await loadAgent(agentId)).toEqual(before.row);
+    });
+
+    it("valid marker: an already adopted agent stays readable when a legacy root overlaps it (no write, no new refusal)", async () => {
+      await seed(path.dirname(adoptionMarkerOf(agentId)), { "adopted.json": JSON.stringify({ schema: AGENT_FILES_CONTRACT }) });
+      await seedAgent(randomUUID(), cfg("external", path.join(managedRoot, "legacy")));
+      const before = await treeOf(areaOf(agentId));
+      const res = await request(app()).get(`/api/agents/${agentId}/instructions-bundle/file`).query({ path: "AGENTS.md" });
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(res.body.content).toBe(ENTRY);
+      expect(await treeOf(areaOf(agentId))).toEqual(before);
+    });
+
+    it("concurrency boundary: the ownership check runs after the assignment lock, so a root committed while the read waits is seen and refused", async () => {
+      const a = randomUUID();
+      await seedAgent(a, { model: "m0" });
+      await seedLegacyHead(a, "AGENTS.md", LEGACY);
+      const bRoot = managedRootOf(a);
+      const bBytes = "SENTINEL-B-LATE\n";
+      await seed(bRoot, { "AGENTS.md": bBytes });
+      // A writer that never checks (a legacy or out-of-band writer) commits B's overlapping
+      // root while holding the assignment lock; the read starts before that commit.
+      const bId = randomUUID();
+      const holder = await holdAssignmentLock(async (tx) => {
+        await tx.insert(agents).values({ id: bId, companyId, name: `T-${bId.slice(0, 4)}`, adapterConfig: cfg("external", bRoot) });
+      });
+      let read: Promise<Outcome> | null = null;
+      let queued = false;
+      try {
+        read = settle(agentInstructionRevisionService(db).readCommittedForRuntime(target(a)));
+        queued = await waitFor(async () => (await advisoryWaiters()) === 1, 5_000);
+      } finally {
+        holder.release();
+        await holder.done;
+      }
+      const outcome = await read!;
+      expect(queued).toBe(true);
+      expect(outcome, JSON.stringify(outcome)).toMatchObject({ ok: false, status: 409, code: INSTRUCTION_ROOT_IN_USE });
+      expect(await fs.readFile(path.join(bRoot, "AGENTS.md"), "utf8")).toBe(bBytes);
+      expect(await exists(adoptionMarkerOf(a))).toBe(false);
+      expect(await assignmentLockIsFree()).toBe(true);
     });
   });
 
@@ -1280,6 +1470,33 @@ describe("WS-2 PR-W1: exclusive instruction roots", () => {
       expect(outcomes.filter(isDeadlock), JSON.stringify(outcomes)).toHaveLength(1);
       expect(await assignmentLockFree()).toBe(true);
     });
+
+    // IF-1 fix: read-triggered first adoption now takes the assignment lock, so the read paths lock
+    // the agent row FOR NO KEY UPDATE. A's first-adoption read must not deadlock with A's save into B,
+    // which holds the assignment lock and then needs KEY SHARE on A (created_by_agent_id).
+    const adoptionReaders = [
+      { name: "runtime read", read: (id: string) => agentInstructionRevisionService(db).readCommittedForRuntime({ companyId, agentId: id }) },
+      { name: "GET instructions-bundle route", read: async (id: string) => {
+        const res = await request(app()).get(`/api/agents/${id}/instructions-bundle`);
+        if (res.status !== 200) throw Object.assign(new Error(JSON.stringify(res.body)), { status: res.status });
+        return res.body;
+      } },
+    ];
+    it.each((["assignment-first", "row-first"] as const).flatMap((order) => adoptionReaders.map((reader) => ({ order, ...reader }))))(
+      "A's first-adoption read ($name) while A first-binds B ($order): both commit, no deadlock, attribution kept",
+      async ({ order, read }) => {
+        const { actorId, targetId } = await seedPair();
+        const { first, second } = await race(order, () => actorSave(actorId, targetId), () => read(actorId));
+        expect(first, JSON.stringify(first)).toMatchObject({ ok: true });
+        expect(second, JSON.stringify(second)).toMatchObject({ ok: true });
+        expect(JSON.parse(await fs.readFile(path.join(resolveManagedAgentArea({ id: actorId, companyId }), "file-sync", "adopted.json"), "utf8")))
+          .toEqual({ schema: AGENT_FILES_CONTRACT });
+        expect((await configOf(targetId)).instructionsRootPath).toBe(managedOf(targetId));
+        const revisions = await revisionsOf(targetId);
+        expect(revisions.length).toBeGreaterThan(0);
+        for (const revision of revisions) expect(revision.createdByAgentId).toBe(actorId);
+      },
+    );
   });
 
   describe("hire approval: the decision and the activation or creation commit together", () => {

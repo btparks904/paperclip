@@ -12,6 +12,7 @@ import { authorizeInstructionCommit, authorizeInstructionRead } from "./agent-in
 import { assertInstructionPathSafe, instructionPath, instructionPathKey, matchesInstructionEntry, instructionBytes, materializeInstructionBytes, readInstructionBytes, MAX_INSTRUCTION_BYTES } from "./agent-instruction-files.js";
 import { agentInstructionsBundleMode, deriveBundleState, resolveManagedInstructionsRoot, resolveRecoveredManagedBundle, type RecoveredManagedBundle } from "./agent-instructions.js";
 import type { AuthorizationActor } from "./authorization.js";
+import { assertExclusiveInstructionRoot } from "./instruction-root-exclusivity.js";
 
 export type Tx = Parameters<Parameters<Db["transaction"]>[0]>[0];
 type Agent = typeof agents.$inferSelect;
@@ -118,7 +119,6 @@ async function planAgentFileAdoption(tx: Tx, agent: Agent, options?: { recovered
   const markerRoot = path.join(path.dirname(root), "file-sync");
   const marker = "adopted.json";
   await assertInstructionPathSafe(root, deriveBundleState(agent).entryFile);
-  await fs.mkdir(root, { recursive: true, mode: 0o700 });
   const filename = await assertInstructionPathSafe(markerRoot, marker);
   const adopted = await fs.readFile(filename, "utf8").catch((error: NodeJS.ErrnoException) => {
     if (error.code === "ENOENT") return null;
@@ -126,8 +126,20 @@ async function planAgentFileAdoption(tx: Tx, agent: Agent, options?: { recovered
   });
   if (adopted !== null) {
     if (JSON.parse(adopted).schema !== AGENT_FILES_CONTRACT) throw new Error("Unsupported agent file contract");
+    await fs.mkdir(root, { recursive: true, mode: 0o700 });
     return { root, markerRoot, marker, pending: null };
   }
+  // WS-2 PR-W1 (IF-1): first adoption creates the root and writes the legacy
+  // heads and the marker, also when a read triggers it. Refuse (409
+  // INSTRUCTION_ROOT_IN_USE) before any folder or file is created when the
+  // managed root or the marker folder overlaps another agent's root or
+  // managed area, for example a legacy root stored before the W1 rule. The
+  // check runs on tx under the assignment lock, after the caller's agent row
+  // lock (FOR NO KEY UPDATE; see instruction-root-exclusivity.ts). An
+  // already adopted agent (valid marker) takes no assignment lock.
+  await assertExclusiveInstructionRoot(tx as unknown as Db, agent, root, { isInstanceAdmin: false, deriveRoot: (other) => deriveBundleState(other).rootPath });
+  await assertExclusiveInstructionRoot(tx as unknown as Db, agent, markerRoot, { isInstanceAdmin: false, lock: false, deriveRoot: (other) => deriveBundleState(other).rootPath });
+  await fs.mkdir(root, { recursive: true, mode: 0o700 });
   const legacy = await tx.select({ entryFile: agentInstructionHeads.entryFile, contentBase64: agentInstructionRevisions.contentBase64 })
     .from(agentInstructionHeads).innerJoin(agentInstructionRevisions, eq(agentInstructionHeads.revisionId, agentInstructionRevisions.id))
     .where(and(eq(agentInstructionHeads.companyId, agent.companyId), eq(agentInstructionHeads.agentId, agent.id)));
