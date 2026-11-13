@@ -509,6 +509,9 @@ export function instructionActivationService(db: Db) {
     await fs.chmod(stagingRoot, 0o700);
     await syncDirectory(versions);
 
+    // Set as the last step inside the transaction callback. After that point an
+    // error can come from COMMIT itself, so the activation outcome is unknown.
+    let commitPending = false;
     try {
       // B: staging.
       const staged = await stage(sourceRoot, stagingRoot, s0, plan);
@@ -550,13 +553,21 @@ export function instructionActivationService(db: Db) {
           action: INSTRUCTION_GENERATION_ACTIVATED_ACTION, entityType: "agent", entityId: locked.id,
           details: { stagingId: generationId, operation: spec.kind, sourceGeneration, generation: generationId, entryFile: plan.entryFile },
         });
+        commitPending = true;
         return { outcome: "activated" as const, adoption, generationId, rootPath: stagingRoot, sourceGeneration,
           adapterConfig: updated!.adapterConfig as Record<string, unknown>, agent: updated!, result: plan.result };
       });
     } catch (error) {
-      // D4: Y and its receipt are retained; the old generation stays active.
-      logger.warn({ err: error, agentId: agent.id, stagingId: generationId },
-        "instructions generation was not activated; the staged folder and its receipt are retained");
+      // D4: Y and its receipt are retained. Nothing is retried.
+      if (commitPending) {
+        // The commit did not confirm. The generation may or may not be active.
+        logger.warn({ err: error, agentId: agent.id, stagingId: generationId, activationOutcome: "unknown" },
+          "instructions generation activation outcome is unknown: the error came after the activation transaction finished its work, so the commit may or may not have taken effect; the staged folder and its receipt are retained");
+      } else {
+        // The error came before the activation transaction finished its work, so this activation was not committed.
+        logger.warn({ err: error, agentId: agent.id, stagingId: generationId, activationOutcome: "not_activated" },
+          "instructions generation was not activated; the staged folder and its receipt are retained");
+      }
       throw error;
     }
   }

@@ -4,8 +4,8 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
-import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
-import { and, eq } from "drizzle-orm";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { and, eq, sql } from "drizzle-orm";
 import {
   activityLog, agentInstructionWorkingCopies, agents, authUsers, companies, companyMemberships, createDb,
   heartbeatRuns, principalPermissionGrants,
@@ -22,6 +22,7 @@ import {
   instructionActivationTestHooks, instructionGenerationStatus, instructionStagingReceiptsDirectory,
 } from "../services/instruction-generation-activation.js";
 import { agentService } from "../services/agents.js";
+import { logger } from "../middleware/logger.js";
 import { startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 
 const ENTRY = "SENTINEL-W2-ENTRY\n";
@@ -217,6 +218,61 @@ describe("versioned instruction generations (WS-2 PR-W2)", () => {
       expect((await loadAgent()).instructionBundleId).toBeNull();
       expect(await versions()).toHaveLength(1);
       expect(await receipts()).toContain(`${(await versions())[0]}.json`);
+    });
+
+    it("D4 reporting: an error at COMMIT is logged as an unknown activation outcome, not as 'not activated'", async () => {
+      await seedLegacyHome();
+      // A deferred constraint trigger fails at COMMIT, after the transaction callback finished its work.
+      const fn = `w2_commit_fail_${agentId.replace(/-/g, "")}`;
+      await db.execute(sql.raw(`CREATE FUNCTION ${fn}() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN
+        IF NEW.id = '${agentId}' AND NEW.instruction_bundle_id IS NOT NULL THEN RAISE EXCEPTION 'W2 simulated commit failure'; END IF;
+        RETURN NEW; END $$`));
+      await db.execute(sql.raw(`CREATE CONSTRAINT TRIGGER ${fn} AFTER UPDATE ON agents DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION ${fn}()`));
+      const warn = vi.spyOn(logger, "warn");
+      try {
+        const activityBefore = (await db.select().from(activityLog).where(eq(activityLog.companyId, companyId))).length;
+        const result = await settle(instructionActivationService(db).activate({
+          companyId, agentId, kind: "builtin_reset", isInstanceAdmin: true,
+          activity: { actorType: "user", actorId: userId }, identity: async () => ({}),
+          plan: async (_tx, current) => ({ overlay: new Map([["AGENTS.md", Buffer.from(ENTRY)]]), entryFile: deriveBundleState(current).entryFile }),
+        } as Parameters<ReturnType<typeof instructionActivationService>["activate"]>[0]));
+        // The error still propagates; nothing is retried.
+        expect(result.ok).toBe(false);
+        const messages = warn.mock.calls.map((call) => String(call[1]));
+        expect(messages.filter((m) => m.startsWith("instructions generation activation outcome is unknown"))).toHaveLength(1);
+        expect(messages.some((m) => m.startsWith("instructions generation was not activated"))).toBe(false);
+        expect(warn.mock.calls.find((call) => String(call[1]).includes("outcome is unknown"))?.[0]).toMatchObject({ activationOutcome: "unknown" });
+        // Here the database rolled the commit back. The staged folder and its receipt are retained.
+        const agent = await loadAgent();
+        expect(agent.instructionBundleId).toBeNull();
+        const staged = await versions();
+        expect(staged).toHaveLength(1);
+        expect(await receipts()).toContain(`${staged[0]}.json`);
+        expect(instructionGenerationStatus(agent, staged[0]!)).toBe("not_currently_active_outcome_unknown");
+        expect((await db.select().from(activityLog).where(eq(activityLog.companyId, companyId))).length).toBe(activityBefore);
+      } finally {
+        warn.mockRestore();
+        await db.execute(sql.raw(`DROP TRIGGER ${fn} ON agents`));
+        await db.execute(sql.raw(`DROP FUNCTION ${fn}()`));
+      }
+    });
+
+    it("D4 reporting: a refusal inside the activation transaction is logged as not activated", async () => {
+      await seedLegacyHome();
+      instructionActivationTestHooks.afterStaging = async () => {
+        await db.update(agents).set({ adapterConfig: cfg(legacyRoot(), "notes/personal.md") }).where(eq(agents.id, agentId));
+      };
+      const warn = vi.spyOn(logger, "warn");
+      try {
+        const result = await activateOverlay({ "AGENTS.md": ENTRY });
+        expect(result).toMatchObject({ ok: false, status: 409, code: "INSTRUCTION_GENERATION_CHANGED" });
+        const calls = warn.mock.calls.filter((call) => String(call[1]).startsWith("instructions generation"));
+        expect(calls).toHaveLength(1);
+        expect(String(calls[0]![1])).toMatch(/^instructions generation was not activated/);
+        expect(calls[0]![0]).toMatchObject({ activationOutcome: "not_activated" });
+      } finally {
+        warn.mockRestore();
+      }
     });
 
     it("D7: insufficient free space refuses before any receipt or folder", async () => {
