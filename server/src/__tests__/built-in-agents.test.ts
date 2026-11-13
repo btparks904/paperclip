@@ -31,7 +31,8 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { agentInstructionRevisionService } from "../services/agent-instruction-revisions.js";
-import { agentInstructionsService } from "../services/agent-instructions.ts";
+import { agentInstructionsService, resolveManagedInstructionsRoot } from "../services/agent-instructions.ts";
+import { instructionActivationTestHooks, instructionStagingReceiptsDirectory } from "../services/instruction-generation-activation.js";
 import { agentService } from "../services/agents.ts";
 import { approvalService } from "../services/approvals.ts";
 import {
@@ -830,7 +831,16 @@ describeEmbeddedPostgres("built-in agents", () => {
     expect(event).toMatchObject({ actorType: "system", action: "agent.files_updated" });
   });
 
-  it.each(["file", "database"])("retries a stock update after a %s failure without overwriting intervening edits", async (failure) => {
+  // WS-2 PR-W2 (D8): a stock update stages a new generation and activates it
+  // atomically. The injected failures hit that staging and that activation, so
+  // a failed attempt leaves the old generation active with nothing partial.
+  const activeAgent = async (id: string) => (await db.select().from(agents).where(eq(agents.id, id)))[0]!;
+  const instructionsBinding = async (companyId: string) => (await db.select().from(builtInManagedResources)
+    .where(and(eq(builtInManagedResources.companyId, companyId), eq(builtInManagedResources.resourceKind, "instructions"))))[0]!;
+  const readActive = async (id: string, file: string) => (await agentInstructionsService().readFile(await activeAgent(id), file)).content;
+  const receipts = async () => fs.readdir(instructionStagingReceiptsDirectory()).catch(() => [] as string[]);
+
+  it.each(["staging", "activation"])("retries a stock update after a %s failure without overwriting intervening edits", async (failure) => {
     const companyId = await seedCompany({ requireApproval: false });
     const svc = builtInAgentService(db);
     const created = await svc.ensure(companyId, "reflection-coach");
@@ -841,41 +851,54 @@ describeEmbeddedPostgres("built-in agents", () => {
     await db.update(builtInManagedResources).set({ stockHash: stockHash(oldFiles), stockVersion: "old",
       defaultsJson: { entryFile: "AGENTS.md", files: Object.keys(oldFiles) },
     }).where(and(eq(builtInManagedResources.companyId, companyId), eq(builtInManagedResources.resourceKind, "instructions")));
+    const generation = (await activeAgent(agent.id)).instructionBundleId;
+    const receiptsBefore = await receipts();
     const trigger = `stock_failure_${companyId.replaceAll("-", "")}`;
-    const remove = fs.rm.bind(fs);
-    const fault = failure === "file" ? vi.spyOn(fs, "rm").mockImplementation(async (file, options) => {
-      if (String(file).endsWith("/obsolete.txt")) throw new Error("injected stock file failure");
-      return remove(file, options);
-    }) : null;
-    if (failure === "database") {
+    if (failure === "staging") {
+      // A file failure while the new generation is being written.
+      instructionActivationTestHooks.duringStaging = async () => { throw new Error("injected stock staging failure"); };
+    } else {
+      // A database failure inside the activation transaction (the binding update).
       await db.execute(sql.raw(`CREATE FUNCTION ${trigger}() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN
         IF NEW.company_id = '${companyId}' AND NEW.resource_kind = 'instructions' AND NEW.stock_hash <> OLD.stock_hash THEN
           RAISE EXCEPTION 'injected stock binding failure'; END IF; RETURN NEW; END $$`));
       await db.execute(sql.raw(`CREATE TRIGGER ${trigger} BEFORE UPDATE ON built_in_managed_resources FOR EACH ROW EXECUTE FUNCTION ${trigger}()`));
     }
-    try { await expect(svc.ensure(companyId, "reflection-coach")).rejects.toThrow(); }
+    try {
+      const error = await svc.ensure(companyId, "reflection-coach").then(() => null, (caught: unknown) => caught as Error & { cause?: Error });
+      expect(`${error?.message} ${error?.cause?.message ?? ""}`).toMatch(/injected stock (staging|binding) failure/);
+    }
     finally {
-      fault?.mockRestore();
-      if (failure === "database") {
+      delete instructionActivationTestHooks.duringStaging;
+      if (failure === "activation") {
         await db.execute(sql.raw(`DROP TRIGGER ${trigger} ON built_in_managed_resources`));
         await db.execute(sql.raw(`DROP FUNCTION ${trigger}()`));
       }
     }
-    const [pending] = await db.select().from(builtInManagedResources).where(and(eq(builtInManagedResources.companyId, companyId), eq(builtInManagedResources.resourceKind, "instructions")));
-    expect(pending.defaultsJson.pendingInstructionsUpdate).toBeTruthy();
-    expect(pending.stockHash).toBe(stockHash(oldFiles));
-    const partial = (await agentInstructionsService().readFile(agent, "AGENTS.md")).content;
-    expect(partial).toContain("You are Reflection Coach");
+    // The old generation stays active with the old stock bytes; nothing partial is visible.
+    const failed = await instructionsBinding(companyId);
+    expect(failed.stockHash).toBe(stockHash(oldFiles));
+    expect(failed.defaultsJson.pendingInstructionsUpdate).toBeUndefined();
+    expect((await activeAgent(agent.id)).instructionBundleId).toBe(generation);
+    expect(await readActive(agent.id, "AGENTS.md")).toBe(oldFiles["AGENTS.md"]);
+    expect(await readActive(agent.id, "obsolete.txt")).toBe(oldFiles["obsolete.txt"]);
+    // The failed stage and its receipt are retained (D4).
+    expect((await receipts()).length).toBe(receiptsBefore.length + 1);
     // A real operator edit after the failed attempt must stop the retry.
     await writeInstructionEntry(agent, "AGENTS.md", "operator edit after failure");
     await svc.ensure(companyId, "reflection-coach");
-    expect((await agentInstructionsService().readFile(agent, "AGENTS.md")).content).toBe("operator edit after failure");
-    await writeInstructionEntry(agent, "AGENTS.md", partial);
+    expect(await readActive(agent.id, "AGENTS.md")).toBe("operator edit after failure");
+    expect((await instructionsBinding(companyId)).stockHash).toBe(stockHash(oldFiles));
+    expect((await activeAgent(agent.id)).instructionBundleId).toBe(generation);
+    await writeInstructionEntry(agent, "AGENTS.md", oldFiles["AGENTS.md"]);
     const retried = await svc.ensure(companyId, "reflection-coach");
     expect(retried.resources.find(resource => resource.resourceKind === "instructions")).toMatchObject({ stockStatus: "stock_current" });
-    await expect(agentInstructionsService().readFile(agent, "obsolete.txt")).rejects.toMatchObject({ status: 404 });
-    const [complete] = await db.select().from(builtInManagedResources).where(eq(builtInManagedResources.id, pending.id));
+    expect((await activeAgent(agent.id)).instructionBundleId).not.toBe(generation);
+    expect(await readActive(agent.id, "AGENTS.md")).toContain("You are Reflection Coach");
+    await expect(readActive(agent.id, "obsolete.txt")).rejects.toMatchObject({ status: 404 });
+    const complete = await instructionsBinding(companyId);
     expect(complete.defaultsJson.pendingInstructionsUpdate).toBeUndefined();
+    expect(complete.stockHash).not.toBe(stockHash(oldFiles));
   });
 
   it.each([false, true])("supersedes an interrupted stock version, including rollback=%s", async (rollback) => {
@@ -889,22 +912,40 @@ describeEmbeddedPostgres("built-in agents", () => {
     await writeInstructionEntry(agent, "AGENTS.md", interruptedFiles["AGENTS.md"]);
     await agentInstructionsService(db).writeFile(agent, "intermediate-only.txt", interruptedFiles["intermediate-only.txt"]);
     await agentInstructionsService(db).writeFile(agent, "personal.txt", "personal notes");
+    // A pending record written by a pre-W2 interrupted update (historical format).
+    const historicalPending = {
+      stockHash: stockHash(interruptedFiles),
+      baseHashes: { "AGENTS.md": fileHash(Buffer.from(oldFiles["AGENTS.md"])), "intermediate-only.txt": null },
+      nextHashes: Object.fromEntries(Object.entries(interruptedFiles).map(([file, text]) => [file, fileHash(Buffer.from(text))])),
+    };
     await db.update(builtInManagedResources).set({ stockHash: stockHash(oldFiles), stockVersion: "old",
-      defaultsJson: { entryFile: "AGENTS.md", files: Object.keys(oldFiles), pendingInstructionsUpdate: {
-        stockHash: stockHash(interruptedFiles),
-        baseHashes: { "AGENTS.md": fileHash(Buffer.from(oldFiles["AGENTS.md"])), "intermediate-only.txt": null },
-        nextHashes: Object.fromEntries(Object.entries(interruptedFiles).map(([file, text]) => [file, fileHash(Buffer.from(text))])),
-      } },
+      defaultsJson: { entryFile: "AGENTS.md", files: Object.keys(oldFiles), pendingInstructionsUpdate: historicalPending },
     }).where(and(eq(builtInManagedResources.companyId, companyId), eq(builtInManagedResources.resourceKind, "instructions")));
     await writeInstructionEntry(agent, "AGENTS.md", "intervening operator edit");
     await svc.ensure(companyId, "reflection-coach");
-    expect((await agentInstructionsService().readFile(agent, "AGENTS.md")).content).toBe("intervening operator edit");
+    expect(await readActive(agent.id, "AGENTS.md")).toBe("intervening operator edit");
+    expect((await instructionsBinding(companyId)).defaultsJson.pendingInstructionsUpdate).toEqual(historicalPending);
     await writeInstructionEntry(agent, "AGENTS.md", interruptedFiles["AGENTS.md"]);
+    // An activation failure while superseding keeps the old generation and the historical record.
+    const generation = (await activeAgent(agent.id)).instructionBundleId;
+    instructionActivationTestHooks.afterStaging = async () => { throw new Error("injected supersede activation failure"); };
+    try { await expect(svc.ensure(companyId, "reflection-coach")).rejects.toThrow(/injected supersede activation failure/); }
+    finally { delete instructionActivationTestHooks.afterStaging; }
+    expect((await activeAgent(agent.id)).instructionBundleId).toBe(generation);
+    expect(await readActive(agent.id, "AGENTS.md")).toBe(interruptedFiles["AGENTS.md"]);
+    expect(await readActive(agent.id, "intermediate-only.txt")).toBe(interruptedFiles["intermediate-only.txt"]);
+    expect((await instructionsBinding(companyId)).defaultsJson.pendingInstructionsUpdate).toEqual(historicalPending);
+    expect((await instructionsBinding(companyId)).stockHash).toBe(stockHash(oldFiles));
+    // The retry supersedes the interrupted version.
     const updated = await svc.ensure(companyId, "reflection-coach");
     expect(updated.resources.find(resource => resource.resourceKind === "instructions")).toMatchObject({ stockStatus: "stock_current" });
-    expect((await agentInstructionsService().readFile(agent, "AGENTS.md")).content).toBe(currentStock);
-    await expect(agentInstructionsService().readFile(agent, "intermediate-only.txt")).rejects.toMatchObject({ status: 404 });
-    expect((await agentInstructionsService().readFile(agent, "personal.txt")).content).toBe("personal notes");
+    expect(await readActive(agent.id, "AGENTS.md")).toBe(currentStock);
+    await expect(readActive(agent.id, "intermediate-only.txt")).rejects.toMatchObject({ status: 404 });
+    expect(await readActive(agent.id, "personal.txt")).toBe("personal notes");
+    expect((await instructionsBinding(companyId)).defaultsJson.pendingInstructionsUpdate).toBeUndefined();
+    // The superseded generation is retained unchanged.
+    const previousRoot = resolveManagedInstructionsRoot({ ...(await activeAgent(agent.id)), instructionBundleId: generation });
+    expect(await fs.readFile(path.join(previousRoot, "AGENTS.md"), "utf8")).toBe(interruptedFiles["AGENTS.md"]);
   });
 
   it("preserves Reflection Coach instruction drift on reconcile and restores it on reset", async () => {

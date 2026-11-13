@@ -36,12 +36,16 @@ function makeAgent(adapterConfig: Record<string, unknown>): TestAgent {
 // behavior is covered by agent-instructions-bundle-switch-race.test.ts.
 function lockedBundle(agent: TestAgent) {
   const persisted: Array<Record<string, unknown>> = [];
+  const generations: Array<string | null> = [];
   const tx = {
     select: () => ({ from: () => ({ where: () => Object.assign(Promise.resolve([]), { for: async () => [agent], limit: async () => [] }) }) }),
     insert: () => ({ values: async () => undefined }),
-    update: () => ({ set: (values: Record<string, unknown>) => ({ where: () => Object.assign(Promise.resolve(undefined), {
-      returning: async () => [{ ...agent, ...values, adapterConfig: persisted.at(-1) ?? agent.adapterConfig }],
-    }) }) }),
+    update: () => ({ set: (values: Record<string, unknown>) => ({ where: () => {
+      if ("instructionBundleId" in values) generations.push(values.instructionBundleId as string | null);
+      return Object.assign(Promise.resolve(undefined), {
+        returning: async () => [{ ...agent, ...values, adapterConfig: persisted.at(-1) ?? agent.adapterConfig }],
+      });
+    } }) }),
     execute: async () => [],
   };
   const db = { ...tx, transaction: async (fn: (t: typeof tx) => Promise<unknown>) => fn(tx) };
@@ -52,7 +56,7 @@ function lockedBundle(agent: TestAgent) {
     isInstanceAdmin: false,
     actor: { actorType: "system", actorId: "test" },
   });
-  return { svc: agentInstructionsService(db as never), options, persisted };
+  return { svc: agentInstructionsService(db as never), options, persisted, generations };
 }
 
 describe("agent instructions service", () => {
@@ -137,6 +141,10 @@ describe("agent instructions service", () => {
     expect(locked.persisted).toEqual([result.adapterConfig]);
 
     expect(result.bundle.mode).toBe("managed");
+    // WS-2 PR-W2: the switch into an empty managed folder activates a new generation.
+    expect(locked.generations).toHaveLength(1);
+    const generation = locked.generations[0]!;
+    expect(generation).toMatch(/^[0-9a-f-]{36}$/);
     expect(result.bundle.managedRootPath).toBe(
       path.join(
         paperclipHome,
@@ -146,9 +154,11 @@ describe("agent instructions service", () => {
         "company-1",
         "agents",
         "agent-1",
-        "instructions",
+        "instruction-versions",
+        generation,
       ),
     );
+    expect(result.bundle.managedRootPath).toBe(resolveManagedInstructionsRoot({ ...agent, instructionBundleId: generation }));
     expect(result.bundle.files.map((file) => file.path)).toEqual(["AGENTS.md", "docs/TOOLS.md"]);
     await expect(fs.readFile(path.join(result.bundle.managedRootPath, "AGENTS.md"), "utf8")).resolves.toBe("# External Agent\n");
     await expect(fs.readFile(path.join(result.bundle.managedRootPath, "docs", "TOOLS.md"), "utf8")).resolves.toBe("## Tools\n");

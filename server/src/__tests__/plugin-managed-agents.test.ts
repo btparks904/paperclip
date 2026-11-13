@@ -400,7 +400,13 @@ describeEmbeddedPostgres("plugin-managed agents", () => {
       await fs.writeFile(instructionsFilePath as string, edited);
       const reset = await services.agents.managedReset({ companyId, agentKey: "wiki-maintainer" });
       expect(reset.status).toBe("reset");
-      expect(await fs.readFile(instructionsFilePath as string, "utf8")).toBe(content);
+      // WS-2 PR-W2: the reset activates a new generation; resolve the entry from the activated row.
+      const activatedEntry = reset.agent?.adapterConfig.instructionsFilePath;
+      expect(typeof activatedEntry).toBe("string");
+      expect(activatedEntry).not.toBe(instructionsFilePath);
+      expect(await fs.readFile(activatedEntry as string, "utf8")).toBe(content);
+      // The previous generation is retained with the operator's edit.
+      expect(await fs.readFile(instructionsFilePath as string, "utf8")).toBe(edited);
       const history = await db.select().from(agentInstructionRevisions)
         .where(eq(agentInstructionRevisions.agentId, created.agentId!));
       expect(history).toHaveLength(0);
@@ -419,10 +425,12 @@ describeEmbeddedPostgres("plugin-managed agents", () => {
       const resetEntry = await services.agents.managedReset({ companyId, agentKey: "wiki-maintainer" });
       expect(resetEntry.agent?.adapterConfig.instructionsEntryFile).toBe("AGENTS.md");
       expect(resetEntry.defaultDrift).toBeNull();
-      expect(await fs.readFile(instructionsFilePath as string, "utf8")).toBe(content);
+      const resetEntryFile = resetEntry.agent?.adapterConfig.instructionsFilePath as string;
+      expect(await fs.readFile(resetEntryFile, "utf8")).toBe(content);
       const preserved = await db.select().from(agentInstructionRevisions).where(eq(agentInstructionRevisions.agentId, created.agentId!));
       expect(preserved).toHaveLength(0);
-      expect(await fs.readFile(path.join(path.dirname(instructionsFilePath as string), "CUSTOM.md"), "utf8")).toBe("# Alternate configured entry\n");
+      // The configured-entry file is carried forward into the activated generation.
+      expect(await fs.readFile(path.join(path.dirname(resetEntryFile), "CUSTOM.md"), "utf8")).toBe("# Alternate configured entry\n");
 
 
     } finally {
