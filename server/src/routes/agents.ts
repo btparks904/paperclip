@@ -263,6 +263,7 @@ import {
 } from "../services/native-runtime/provider-profile.js";
 import { managedAgentProfileService } from "../services/managed-agent-profiles.js";
 import { remoteAgentProfileService } from "../services/remote-agent-profiles.js";
+import { authorizeHireActivation } from "../services/hire-approval-authorization.js";
 
 const AGENT_SKILL_ASSIGNMENT_MODES = ["add", "remove", "replace"] as const;
 
@@ -5846,10 +5847,21 @@ export function agentRoutes(
 
     let agent: Awaited<ReturnType<typeof svc.getById>> | null = null;
     if (openApproval) {
-      await approvalsSvc.approve(openApproval.id, decidedByUserId);
+      await approvalsSvc.approve(openApproval.id, decidedByUserId, null, { decider: req.actor });
       agent = await svc.getById(id);
     } else {
-      const approval = await svc.activatePendingApproval(id);
+      // PG-4: the unlinked historical fallback is authorized like a linked
+      // activation (board, current agents:create, instance admin for an
+      // external root), inside the activation transaction.
+      const approval = await svc.activatePendingApproval(id, null, {
+        authorize: (txDb, locked) => authorizeHireActivation(txDb, req.actor, {
+          companyId: existing.companyId,
+          agent: locked,
+          payload: null,
+          requestedByAgentId: null,
+          approvalId: null,
+        }),
+      });
       if (!approval) {
         res.status(404).json({ error: "Agent not found" });
         return;

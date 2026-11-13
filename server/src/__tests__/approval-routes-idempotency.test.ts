@@ -259,7 +259,10 @@ describe("approval routes idempotent retries", () => {
       .send({ decidedByUserId: "forged-user", decisionNote: "ship it" });
 
     expect(res.status).toBe(200);
-    expect(mockApprovalService.approve).toHaveBeenCalledWith("approval-4", "user-1", "ship it");
+    expect(mockApprovalService.approve).toHaveBeenCalledWith("approval-4", "user-1", "ship it", {
+      // PG-4: the deciding board actor is passed for the in-transaction re-check.
+      decider: expect.objectContaining({ type: "board", userId: "user-1" }),
+    });
   });
 
   it("derives approval attribution from the authenticated actor on reject", async () => {

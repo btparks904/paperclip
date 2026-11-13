@@ -46,6 +46,9 @@ import {
 import { readBuiltInAgentMarker, withBuiltInAgentMarker } from "../services/built-in-agent-metadata.ts";
 import { issueThreadInteractionService } from "../services/issue-thread-interactions.ts";
 
+// PG-4: hire approvals are decided by an authorized board actor.
+const PG4_LOCAL_BOARD = { type: "board" as const, source: "local_implicit" as const };
+
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
 
@@ -352,7 +355,7 @@ describeEmbeddedPostgres("built-in agents", () => {
       })
       .where(eq(agents.id, result.state.agentId!));
 
-    await approvalService(db).approve(result.approval!.id, "board-user", "Approved built-in agent");
+    await approvalService(db).approve(result.approval!.id, "board-user", "Approved built-in agent", { decider: PG4_LOCAL_BOARD });
 
     await expect(builtIns.get(companyId, "briefs")).resolves.toMatchObject({
       status: "ready",
@@ -787,7 +790,7 @@ describeEmbeddedPostgres("built-in agents", () => {
       "missing",
     ]);
 
-    await approvalService(db).approve(approval.id, "board-user", "Approved Reflection Coach");
+    await approvalService(db).approve(approval.id, "board-user", "Approved Reflection Coach", { decider: PG4_LOCAL_BOARD });
     const approvedState = await builtInAgentService(db).get(companyId, "reflection-coach");
     expect(approvedState).toMatchObject({
       agent: {

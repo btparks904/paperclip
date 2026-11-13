@@ -16,6 +16,9 @@ import {
 import { agentService } from "../services/agents.ts";
 import { approvalService } from "../services/approvals.ts";
 
+// PG-4: hire approvals are decided by an authorized board actor.
+const PG4_LOCAL_BOARD = { type: "board" as const, source: "local_implicit" as const };
+
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
 
@@ -140,7 +143,7 @@ describeEmbeddedPostgres("pending approval agent config integrity", () => {
       })
       .where(eq(agents.id, pending.id));
 
-    await approvalSvc.approve(approval.id, "board-user", "Approved generic hire");
+    await approvalSvc.approve(approval.id, "board-user", "Approved generic hire", { decider: PG4_LOCAL_BOARD });
 
     await expect(agentSvc.getById(pending.id)).resolves.toMatchObject({
       status: "idle",

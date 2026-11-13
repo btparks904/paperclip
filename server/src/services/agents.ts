@@ -1235,7 +1235,18 @@ export function agentService(db: Db) {
       });
     },
 
-    activatePendingApproval: async (id: string, approvedPayload?: Record<string, unknown> | null) => {
+    activatePendingApproval: async (
+      id: string,
+      approvedPayload?: Record<string, unknown> | null,
+      options?: {
+        /**
+         * PG-4: the activation's authorization. It runs inside the activation
+         * transaction, after the agent row is locked and found pending and
+         * before anything is written; a throw rolls the activation back.
+         */
+        authorize?: (txDb: Db, existing: NonNullable<Awaited<ReturnType<typeof getById>>>) => Promise<void>;
+      },
+    ) => {
       const activatedAgent = await db.transaction(async (tx) => {
         const txDb = tx as unknown as Db;
         // WS-2 (A13): lock the agent row first (L1), as every other root writer does.
@@ -1243,14 +1254,16 @@ export function agentService(db: Db) {
         if (!lockedRow) return null;
         const existing = await agentService(txDb).getById(id);
         if (!existing || existing.status !== "pending_approval") return null;
+        if (options?.authorize) await options.authorize(txDb, existing);
         const approvedPatch = approvedPayload ? configPatchFromApprovalPayload(approvedPayload) : {};
         let patch = { ...approvedPatch } as Partial<typeof agents.$inferInsert>;
         let approvalBindingDecision: ClaudeOAuthBindingInvariantDecision | null = null;
         // WS-2 PR-W1: an approved payload that activates another instruction
         // root takes the assignment lock and refuses a root that overlaps
         // another agent, before secret normalization. Only the exclusivity
-        // check is added: the payload's instruction keys are still applied as
-        // approved (the PG-4 authorization gap is unchanged and tracked).
+        // check is added here. PG-4: both production callers pass an authorize
+        // hook, which has already refused a payload whose instruction keys
+        // differ from the current ones.
         const existingConfig = isPlainRecord(existing.adapterConfig) ? existing.adapterConfig : {};
         const approvedRoot = isPlainRecord(patch.adapterConfig) ? configuredInstructionRoot(existing, patch.adapterConfig) : undefined;
         if (approvedRoot && approvedRoot !== configuredInstructionRoot(existing, existingConfig)) {

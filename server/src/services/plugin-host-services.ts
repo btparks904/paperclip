@@ -2670,7 +2670,14 @@ export function buildHostServices(
         await requireActiveHumanMember(companyId, params.actorUserId);
 
         const { approval, applied } = params.action === "approve"
-          ? await approvalSvc.approve(params.approvalId, params.actorUserId, params.decisionNote ?? null)
+          ? await approvalSvc.approve(params.approvalId, params.actorUserId, params.decisionNote ?? null, {
+            // PG-4: the plugin decides on behalf of this verified member. A
+            // hire is re-authorized for that user inside the approval
+            // transaction from the user's company grants only: no session
+            // exists here, so instance-admin elevation is not inferred, and an
+            // external instruction root cannot be approved through a plugin.
+            decider: { type: "board", userId: params.actorUserId, isInstanceAdmin: false, ignoreInstanceAdmin: true },
+          })
           : await approvalSvc.reject(params.approvalId, params.actorUserId, params.decisionNote ?? null);
 
         await logPluginActivity({

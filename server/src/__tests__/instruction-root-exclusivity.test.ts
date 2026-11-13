@@ -28,6 +28,9 @@ import { agentRoutes } from "../routes/agents.js";
 import { errorHandler } from "../middleware/index.js";
 import { startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 
+// PG-4: hire approvals are decided by an authorized board actor.
+const PG4_LOCAL_BOARD = { type: "board" as const, source: "local_implicit" as const };
+
 // The hire-approved hook is an outward effect: it must fire only for a committed decision.
 const hireHook = vi.hoisted(() => ({ notifyHireApproved: vi.fn() }));
 vi.mock("../services/hire-hook.js", () => hireHook);
@@ -1044,32 +1047,27 @@ describe("WS-2 PR-W1: exclusive instruction roots", () => {
       }
     });
 
-    it.each(orders)("hire approval whose payload sets reportsTo and a root, versus the parent's root change ($order, conflict $conflict)", async ({ order, conflict }) => {
+    // PG-4: an approval refuses a linked payload that changes the pending agent's instruction root
+    // (409, nothing changed), so this W1 lock order is reached only by the activation service itself.
+    it.each(orders)("hire activation whose payload sets reportsTo and a root, versus the parent's root change ($order, conflict $conflict)", async ({ order, conflict }) => {
       const pendingId = randomUUID();
       await seedAgent(pendingId, { model: "m0" }, { name: `w1-gate-${pendingId.slice(0, 8)}`, status: "pending_approval", adapterType: "hermes_gateway" });
       const shared = fresh("shared");
       const childRoot = conflict && order === "parent-first" ? shared : fresh("approved");
       const parentNext = conflict && order === "subject-first" ? childRoot : (conflict ? shared : fresh("parent-next"));
-      const [approval] = await db.insert(approvals).values({ companyId, type: "hire_agent", status: "pending",
-        payload: { agentId: pendingId, adapterType: "hermes_gateway", reportsTo: parentId, adapterConfig: { ...cfg("external", childRoot), model: "m0" } } }).returning();
-      hireHook.notifyHireApproved.mockClear();
-      const { subject, parent } = await interleave(order, () => approvalService(db).approve(approval!.id, userId), parentNext);
+      const payload = { agentId: pendingId, adapterType: "hermes_gateway", reportsTo: parentId, adapterConfig: { ...cfg("external", childRoot), model: "m0" } };
+      const { subject, parent } = await interleave(order, () => agentService(db).activatePendingApproval(pendingId, payload), parentNext);
       const approvalRefused = conflict && order === "parent-first";
       const parentRefused = conflict && order === "subject-first";
-      const [approvalAfter] = await db.select().from(approvals).where(eq(approvals.id, approval!.id));
       if (approvalRefused) {
         expect(subject).toMatchObject({ ok: false, status: 409, code: INSTRUCTION_ROOT_IN_USE });
-        expect(approvalAfter!.status).toBe("pending");
         expect((await loadAgent(pendingId))!.status).toBe("pending_approval");
         expect((await loadAgent(pendingId))!.reportsTo).toBeNull();
-        expect(hireHook.notifyHireApproved).not.toHaveBeenCalled();
       } else {
-        expect(subject, JSON.stringify(subject)).toMatchObject({ ok: true, value: { applied: true } });
-        expect(approvalAfter!.status).toBe("approved");
+        expect(subject, JSON.stringify(subject)).toMatchObject({ ok: true, value: { activated: true } });
         expect((await loadAgent(pendingId))!.status).toBe("idle");
         expect((await loadAgent(pendingId))!.reportsTo).toBe(parentId);
         expect((await configOf(pendingId)).instructionsRootPath).toBe(childRoot);
-        expect(hireHook.notifyHireApproved).toHaveBeenCalledTimes(1);
       }
       if (parentRefused) {
         expect(parent).toMatchObject({ ok: false, status: 409, code: INSTRUCTION_ROOT_IN_USE });
@@ -1320,32 +1318,27 @@ describe("WS-2 PR-W1: exclusive instruction roots", () => {
     // assignment lock. With A13 at FOR NO KEY UPDATE neither waits on a row: the second writer
     // queues on the assignment lock. A13 at FOR UPDATE conflicts with that KEY SHARE lock.
     it.each(["assignment-first", "row-first"] as const)(
-      "hire approval activates pending P while the board moves C under P with a new root ($0): both commit, no row wait",
+      "hire activation activates pending P while the board moves C under P with a new root ($0): both commit, no row wait",
       async (order) => {
         const pendingId = randomUUID(), childId = randomUUID();
         await seedAgent(pendingId, { model: "m0" }, { status: "pending_approval", adapterType: "hermes_gateway" });
         await seedAgent(childId, { model: "m0" }, { name: `w1-gate-${childId.slice(0, 8)}`, adapterType: "hermes_gateway" });
         const approvedRoot = fresh("approved"), childRoot = fresh("child");
-        const [approval] = await db.insert(approvals).values({ companyId, type: "hire_agent", status: "pending",
-          payload: { agentId: pendingId, adapterType: "hermes_gateway", adapterConfig: { ...cfg("external", approvedRoot), model: "m0" } } }).returning();
-        hireHook.notifyHireApproved.mockClear();
-        const approve = () => approvalService(db).approve(approval!.id, userId);
+        // PG-4: reached only by the activation service (an approval refuses a linked root change).
+        const approve = () => agentService(db).activatePendingApproval(pendingId,
+          { agentId: pendingId, adapterType: "hermes_gateway", adapterConfig: { ...cfg("external", approvedRoot), model: "m0" } });
         const moveChild = () => agentService(db).update(childId, { reportsTo: pendingId, adapterConfig: cfg("external", childRoot) },
           { instructionConfigWrite: { keys: "all" } });
         // assignment-first: C holds the assignment lock (paused at its gated update), then P activates.
         // row-first: P holds its row and queues on the assignment lock, then C starts.
         const { first, second } = order === "assignment-first" ? await race(order, moveChild, approve) : await race(order, approve, moveChild);
         const [activation, move] = order === "assignment-first" ? [second, first] : [first, second];
-        expect(activation, JSON.stringify(activation)).toMatchObject({ ok: true, value: { applied: true } });
+        expect(activation, JSON.stringify(activation)).toMatchObject({ ok: true, value: { activated: true } });
         expect(move, JSON.stringify(move)).toMatchObject({ ok: true });
-        const [approvalAfter] = await db.select().from(approvals).where(eq(approvals.id, approval!.id));
-        expect(approvalAfter!.status).toBe("approved");
-        expect(approvalAfter!.decidedByUserId).toBe(userId);
         const activated = (await loadAgent(pendingId))!;
         expect(activated.status).toBe("idle");
         expect(activated.reportsTo).toBeNull();
         expect((activated.adapterConfig as Config).instructionsRootPath).toBe(approvedRoot);
-        expect(hireHook.notifyHireApproved).toHaveBeenCalledTimes(1);
         expect((await loadAgent(childId))!.reportsTo).toBe(pendingId);
         expect((await configOf(childId)).instructionsRootPath).toBe(childRoot);
         expect(await fs.readdir(instructionCopyIntentsDirectory()).catch(() => [] as string[])).toEqual([]);
@@ -1516,7 +1509,9 @@ describe("WS-2 PR-W1: exclusive instruction roots", () => {
     const independentConfig = (label: string) => ({ ...cfg("external", fresh(label)), model: "m0" });
 
     it.each(["pending", "revision_requested"] as const)(
-      "existing pending agent: a root 409 rolls the decision back (%s stays), nothing fires; a corrected payload then approves once",
+      // PG-4: a linked payload that changes the pending agent's root is now refused as stale (409)
+      // inside the decision transaction; the rollback guarantees are unchanged.
+      "existing pending agent: a root-changing payload's 409 rolls the decision back (%s stays), nothing fires; a corrected payload then approves once",
       async (status) => {
         const pendingId = randomUUID();
         await seedAgent(pendingId, { model: "m0" }, { status: "pending_approval", adapterType: "hermes_gateway" });
@@ -1524,8 +1519,8 @@ describe("WS-2 PR-W1: exclusive instruction roots", () => {
         const approval = await insertApproval(status, { agentId: pendingId, adapterType: "hermes_gateway", budgetMonthlyCents: BUDGET,
           adapterConfig: { ...overlappingConfig(), apiKey: RAW_API_KEY } });
         const secretsBefore = await secretCount();
-        const refused = await settle(approvalService(db).approve(approval.id, userId, "first try"));
-        expect(refused).toMatchObject({ ok: false, status: 409, code: INSTRUCTION_ROOT_IN_USE });
+        const refused = await settle(approvalService(db).approve(approval.id, userId, "first try", { decider: PG4_LOCAL_BOARD }));
+        expect(refused).toMatchObject({ ok: false, status: 409, code: "hire_approval_instruction_config_stale" });
         const afterRefusal = await approvalRow(approval.id);
         expect(afterRefusal.status).toBe(status);
         expect(afterRefusal.decidedByUserId).toBeNull();
@@ -1538,20 +1533,22 @@ describe("WS-2 PR-W1: exclusive instruction roots", () => {
 
         // The approval is still correctable: request a revision (pending only), resubmit a corrected payload, approve.
         if (status === "pending") await approvalService(db).requestRevision(approval.id, userId, "pick another folder");
-        const corrected = independentConfig("corrected");
+        // PG-4: the corrected payload keeps the agent's current (empty) instruction configuration.
+        const corrected = { model: "m1" };
         await approvalService(db).resubmit(approval.id, { agentId: pendingId, adapterType: "hermes_gateway", budgetMonthlyCents: BUDGET, adapterConfig: corrected });
-        const approved = await approvalService(db).approve(approval.id, userId, "second try");
+        const approved = await approvalService(db).approve(approval.id, userId, "second try", { decider: PG4_LOCAL_BOARD });
         expect(approved.applied).toBe(true);
         expect((await approvalRow(approval.id)).status).toBe("approved");
         expect((await loadAgent(pendingId))!.status).toBe("idle");
-        expect((await configOf(pendingId)).instructionsRootPath).toBe(corrected.instructionsRootPath);
+        expect((await configOf(pendingId)).instructionsRootPath).toBeUndefined();
+        expect((await configOf(pendingId)).model).toBe("m1");
         expect(await budgetRows(pendingId)).toHaveLength(1);
         expect(hireHook.notifyHireApproved).toHaveBeenCalledTimes(1);
         expect(hireHook.notifyHireApproved).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ agentId: pendingId, sourceId: approval.id }));
 
         // A repeated approve is a no-op: no second activation, budget write or hook.
         const updatedAt = (await loadAgent(pendingId))!.updatedAt;
-        const again = await approvalService(db).approve(approval.id, userId, "again");
+        const again = await approvalService(db).approve(approval.id, userId, "again", { decider: PG4_LOCAL_BOARD });
         expect(again.applied).toBe(false);
         expect((await loadAgent(pendingId))!.updatedAt).toEqual(updatedAt);
         expect(await budgetRows(pendingId)).toHaveLength(1);
@@ -1565,7 +1562,7 @@ describe("WS-2 PR-W1: exclusive instruction roots", () => {
       const secretsBefore = await secretCount();
       const approval = await insertApproval("pending", { name, adapterType: "hermes_gateway", budgetMonthlyCents: BUDGET,
         adapterConfig: { ...overlappingConfig(), apiKey: RAW_API_KEY } });
-      const refused = await settle(approvalService(db).approve(approval.id, userId));
+      const refused = await settle(approvalService(db).approve(approval.id, userId, null, { decider: PG4_LOCAL_BOARD }));
       expect(refused).toMatchObject({ ok: false, status: 409, code: INSTRUCTION_ROOT_IN_USE });
       expect((await approvalRow(approval.id)).status).toBe("pending");
       expect(await agentCount()).toBe(agentsBefore);
@@ -1576,7 +1573,7 @@ describe("WS-2 PR-W1: exclusive instruction roots", () => {
       await approvalService(db).requestRevision(approval.id, userId, "pick another folder");
       const corrected = independentConfig("hire-corrected");
       await approvalService(db).resubmit(approval.id, { name, adapterType: "hermes_gateway", budgetMonthlyCents: BUDGET, adapterConfig: corrected });
-      const approved = await approvalService(db).approve(approval.id, userId);
+      const approved = await approvalService(db).approve(approval.id, userId, null, { decider: PG4_LOCAL_BOARD });
       expect(approved.applied).toBe(true);
       expect(await agentCount()).toBe(agentsBefore + 1);
       const [created] = await db.select().from(agents).where(and(eq(agents.companyId, companyId), eq(agents.name, name)));
@@ -1585,7 +1582,7 @@ describe("WS-2 PR-W1: exclusive instruction roots", () => {
       expect(hireHook.notifyHireApproved).toHaveBeenCalledTimes(1);
       expect(hireHook.notifyHireApproved).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ agentId: created!.id }));
 
-      const again = await approvalService(db).approve(approval.id, userId);
+      const again = await approvalService(db).approve(approval.id, userId, null, { decider: PG4_LOCAL_BOARD });
       expect(again.applied).toBe(false);
       expect(await agentCount()).toBe(agentsBefore + 1);
       expect(hireHook.notifyHireApproved).toHaveBeenCalledTimes(1);
@@ -1600,8 +1597,9 @@ describe("WS-2 PR-W1: exclusive instruction roots", () => {
       if (withAgent) await seedAgent(pendingId, { model: "m0" }, { status: "pending_approval", adapterType: "hermes_gateway" });
       const agentsBefore = await agentCount();
       const root = independentConfig("concurrent");
+      // PG-4: the linked payload keeps the pending agent's current (empty) instruction configuration.
       const approval = await insertApproval("pending", withAgent
-        ? { agentId: pendingId, adapterType: "hermes_gateway", budgetMonthlyCents: BUDGET, adapterConfig: root }
+        ? { agentId: pendingId, adapterType: "hermes_gateway", budgetMonthlyCents: BUDGET, adapterConfig: { model: "m0" } }
         : { name, adapterType: "hermes_gateway", budgetMonthlyCents: BUDGET, adapterConfig: root });
       // Hold the approval row so both decisions queue on it, then release them together.
       let release!: () => void;
@@ -1617,7 +1615,7 @@ describe("WS-2 PR-W1: exclusive instruction roots", () => {
       let both: Promise<Outcome[]> | null = null;
       let queued = false;
       try {
-        both = Promise.all([settle(approvalService(db).approve(approval.id, userId)), settle(approvalService(db).approve(approval.id, userId))]);
+        both = Promise.all([settle(approvalService(db).approve(approval.id, userId, null, { decider: PG4_LOCAL_BOARD })), settle(approvalService(db).approve(approval.id, userId, null, { decider: PG4_LOCAL_BOARD }))]);
         queued = await waitFor(async () => (await rowLockWaiters()) >= 2, 5_000);
       } finally {
         release();
@@ -1640,7 +1638,7 @@ describe("WS-2 PR-W1: exclusive instruction roots", () => {
     it("non-hire approvals are unchanged: approve resolves them without any agent effect", async () => {
       const agentsBefore = await agentCount();
       const [row] = await db.insert(approvals).values({ companyId, type: "approve_ceo_strategy", status: "pending", payload: { plan: "SENTINEL" } }).returning();
-      const result = await approvalService(db).approve(row!.id, userId, "ok");
+      const result = await approvalService(db).approve(row!.id, userId, "ok", { decider: PG4_LOCAL_BOARD });
       expect(result.applied).toBe(true);
       expect((await approvalRow(row!.id)).status).toBe("approved");
       expect(await agentCount()).toBe(agentsBefore);

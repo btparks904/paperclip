@@ -22,6 +22,7 @@ import { assertBoard, assertCompanyAccess, getAccessibleResource, getActorInfo, 
 import { redactEventPayload } from "../redaction.js";
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
 import { issueService } from "../services/issues.js";
+import { authorizeHireApprovalRequest } from "../services/hire-approval-authorization.js";
 import { REVIEW_PATH_RECOVERY_INSTRUCTION } from "../services/recovery/review-path-recovery.js";
 
 function redactApprovalPayload<T extends { payload: Record<string, unknown> }>(approval: T): T {
@@ -230,6 +231,16 @@ export function approvalRoutes(
       : [];
     const uniqueIssueIds = Array.from(new Set(issueIds));
     const { issueIds: _issueIds, ...approvalInput } = req.body;
+    if (approvalInput.type === "hire_agent") {
+      // PG-4: current agents:create and the hire payload rules, before the
+      // payload's secrets are normalized and persisted. The requester
+      // attribution is checked, never used to authorize.
+      await authorizeHireApprovalRequest(db, req.actor, {
+        companyId,
+        payload: approvalInput.payload,
+        requestedByAgentId: approvalInput.requestedByAgentId ?? null,
+      });
+    }
     const normalizedPayload =
       approvalInput.type === "hire_agent"
         ? await secretsSvc.normalizeHireApprovalPayloadForPersistence(
@@ -291,7 +302,10 @@ export function approvalRoutes(
       return;
     }
     const decidedByUserId = req.actor.userId ?? "board";
-    const { approval, applied } = await svc.approve(id, decidedByUserId, req.body.decisionNote);
+    const { approval, applied } = await svc.approve(id, decidedByUserId, req.body.decisionNote, {
+      decider: req.actor,
+      expectedUpdatedAt: req.body.expectedUpdatedAt ? new Date(req.body.expectedUpdatedAt) : undefined,
+    });
 
     if (applied) {
       const linkedIssues = await issueApprovalsSvc.listIssuesForApproval(approval.id);
@@ -472,6 +486,15 @@ export function approvalRoutes(
       return;
     }
 
+    if (existing.type === "hire_agent") {
+      // PG-4: the resubmitting actor is authorized now, for the payload that
+      // will be pending: the new one, or the kept one (no grandfathering).
+      await authorizeHireApprovalRequest(db, req.actor, {
+        companyId: existing.companyId,
+        payload: (req.body.payload ?? existing.payload) as Record<string, unknown>,
+        instructionAmendment: req.body.instructionAmendment === true,
+      });
+    }
     const normalizedPayload = req.body.payload
       ? existing.type === "hire_agent"
         ? await secretsSvc.normalizeHireApprovalPayloadForPersistence(
@@ -481,7 +504,12 @@ export function approvalRoutes(
           )
         : req.body.payload
       : undefined;
-    const approval = await svc.resubmit(id, normalizedPayload);
+    const approval = await svc.resubmit(id, normalizedPayload, {
+      updatedAt: existing.updatedAt,
+      payload: existing.payload as Record<string, unknown>,
+    }, existing.type === "hire_agent" && req.body.instructionAmendment === true && req.actor.type === "board"
+      ? { instructionAmendment: { actorUserId: req.actor.userId ?? "board" } }
+      : undefined);
     const actor = getActorInfo(req);
     await logActivity(db, {
       companyId: approval.companyId,

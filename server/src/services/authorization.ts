@@ -2422,5 +2422,6 @@ export function authorizationService(db: Db | DbTransaction) {
   return {
     decide,
     decidePrincipalGrant,
+    isInstanceAdmin,
   };
 }

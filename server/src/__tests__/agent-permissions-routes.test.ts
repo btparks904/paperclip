@@ -1323,7 +1323,10 @@ describe.sequential("agent permission routes", () => {
       .send({}));
 
     expect(res.status).toBe(200);
-    expect(mockAgentService.activatePendingApproval).toHaveBeenCalledWith(agentId);
+    // PG-4: the unlinked fallback activation runs the hire guard inside its transaction.
+    expect(mockAgentService.activatePendingApproval).toHaveBeenCalledWith(agentId, null, {
+      authorize: expect.any(Function),
+    });
     expect(mockApprovalService.approve).not.toHaveBeenCalled();
     expect(mockLogActivity).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
       companyId,
@@ -1376,7 +1379,10 @@ describe.sequential("agent permission routes", () => {
 
     expect(res.status).toBe(200);
     // The shared approval flow handles activation; we must not double-activate.
-    expect(mockApprovalService.approve).toHaveBeenCalledWith("approval-1", "board-user");
+    // PG-4: the deciding board actor is passed for the in-transaction re-check.
+    expect(mockApprovalService.approve).toHaveBeenCalledWith("approval-1", "board-user", null, {
+      decider: expect.objectContaining({ type: "board", userId: "board-user" }),
+    });
     expect(mockAgentService.activatePendingApproval).not.toHaveBeenCalled();
     expect(mockLogActivity).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
       action: "agent.approved",
