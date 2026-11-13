@@ -10,6 +10,8 @@ permissions:
 
 jobs:
   ci:
-    # Master requires CODEOWNERS review for .github/**, including this workflow.
-    # The AWS runner group permits pr-trusted.yml@refs/heads/master.
-    uses: paperclipai/paperclip/.github/workflows/pr-trusted.yml@master
+    # Sunspark fork: pin the upstream trusted workflow to the v2026.1005.0
+    # release commit that this fork is built from. Its pr-trusted.yml is
+    # byte-identical to this tree's copy. Upstream master moves ahead of this
+    # older fork and calls scripts and actions that this tree does not have.
+    uses: paperclipai/paperclip/.github/workflows/pr-trusted.yml@467125fafb47a8520856504fecc48d6e32055db1

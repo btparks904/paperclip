@@ -1,6 +1,6 @@
 import { connectionIntentService } from "../services/connection-intents.js";
 import { completeConnectionIntentSchema } from "@paperclipai/shared";
-import { agentFileStore, agentFileTokenFromHash } from "../services/agent-file-store.js";
+import { agentFileStore, agentFileTokenFromHash, type AgentFileConfigRepair } from "../services/agent-file-store.js";
 import { pipeline } from "node:stream/promises";
 import { resolveAgentAppearance, agentAvatarUrl } from "@paperclipai/shared";
 import { listOpenRouterModels } from "../services/openrouter-models.js";
@@ -73,7 +73,12 @@ import { agentInstructionRevisionService } from "../services/agent-instruction-r
 import { agentInstructionWorkingCopyService } from "../services/agent-instruction-working-copies.js";
 import { authorizeInstructionRead } from "../services/agent-instruction-authorization.js";
 import { instructionPath } from "../services/agent-instruction-files.js";
-import { agentInstructionsBundleMode, deriveBundleState } from "../services/agent-instructions.js";
+import {
+  AGENT_INSTRUCTION_CONFIG_KEY_SET,
+  AGENT_INSTRUCTION_CONFIG_KEYS,
+  type AgentInstructionConfigKey,
+} from "../services/agent-instruction-keys.js";
+import { agentInstructionsBundleMode, deriveBundleState, resolveInstructionWriteTarget, resolveRecoveredManagedBundle } from "../services/agent-instructions.js";
 import {
   agentService,
   agentInstructionsService,
@@ -527,14 +532,8 @@ export function agentRoutes(
     return DEFAULT_INSTRUCTIONS_PATH_KEYS[adapterType] ?? null;
   }
   const KNOWN_INSTRUCTIONS_PATH_KEYS = new Set(["instructionsFilePath", "agentsMdPath"]);
-  const KNOWN_INSTRUCTIONS_BUNDLE_KEYS = [
-    "instructionsBundleMode",
-    "instructionsRootPath",
-    "instructionsEntryFile",
-    "instructionsFilePath",
-    "agentsMdPath",
-  ] as const;
-  const KNOWN_INSTRUCTIONS_BUNDLE_KEY_SET: ReadonlySet<string> = new Set(KNOWN_INSTRUCTIONS_BUNDLE_KEYS);
+  const KNOWN_INSTRUCTIONS_BUNDLE_KEYS = AGENT_INSTRUCTION_CONFIG_KEYS;
+  const KNOWN_INSTRUCTIONS_BUNDLE_KEY_SET = AGENT_INSTRUCTION_CONFIG_KEY_SET;
 
   const router = Router();
   const svc = agentService(db);
@@ -2748,6 +2747,7 @@ export function agentRoutes(
 
     const updated = await svc.update(agent.id, { adapterConfig: nextAdapterConfig }, {
       allowPendingApprovalConfigUpdate: true,
+      instructionConfigWrite: { keys: "all" },
     });
     return (updated as T | null) ?? { ...agent, adapterConfig: nextAdapterConfig };
   }
@@ -2892,6 +2892,74 @@ export function agentRoutes(
     if (agentInstructionsBundleMode(agent) === "external") {
       assertInstanceAdmin(req);
     }
+  }
+
+  // Persist a recovered bundle's repaired instruction configuration through
+  // the same normalization and agent-service update the unversioned save path
+  // uses, inside the file store's locked transaction.
+  function repairInstructionsConfig(
+    req: Request,
+    source: "instructions_bundle_file_put" | "instructions_bundle_patch" | "instructions_path_patch" = "instructions_bundle_file_put",
+  ): AgentFileConfigRepair {
+    const actor = getActorInfo(req);
+    return async (tx, agent, adapterConfig) => {
+      // The store transaction is a full Db for the services' queries. Normalize
+      // on it too, so a managed secret created for a raw value commits or rolls
+      // back with the repaired configuration instead of committing on its own.
+      const txDb = tx as unknown as Db;
+      const normalized = await secretService(txDb).normalizeAdapterConfigForPersistence(
+        agent.companyId,
+        adapterConfig,
+        { strictMode: strictSecretsMode, adapterType: agent.adapterType },
+      );
+      await agentService(txDb).update(
+        agent.id,
+        { adapterConfig: normalized },
+        {
+          recordRevision: {
+            createdByAgentId: actor.agentId,
+            createdByUserId: actor.actorType === "user" ? actor.actorId : null,
+            source,
+          },
+          instructionConfigWrite: { keys: "all" },
+        },
+      );
+    };
+  }
+
+  // WS-2 PR-W1: the unlocked exclusive-root pre-check of a create or hire,
+  // before the route's own secret normalization. svc.create repeats it under
+  // the assignment lock; a root claimed in between is the tracked PG-3 window.
+  async function precheckNewAgentInstructionRoot(
+    req: Request,
+    agent: { id: string; companyId: string; name: string },
+    adapterConfig: Record<string, unknown>,
+  ) {
+    await instructions.precheckExclusiveRoot(db, { ...agent, adapterConfig }, { isInstanceAdmin: isInstanceAdminActor(req) });
+  }
+
+  // Server-side instance-admin determination (never from the request body,
+  // query or headers); it only selects the detail level of a copy 409.
+  function isInstanceAdminActor(req: Request): boolean {
+    return req.actor.type === "board" && (req.actor.source === "local_implicit" || req.actor.isInstanceAdmin === true);
+  }
+
+  // Lock the agent row and refuse unless the bundle the route authorized
+  // against is still the one configured (target and config-only mode).
+  async function lockAgentForInstructionsChange(
+    tx: Parameters<Parameters<Db["transaction"]>[0]>[0],
+    existing: { id: string; companyId: string; name: string; adapterConfig: unknown },
+    expectedTarget: Awaited<ReturnType<typeof resolveInstructionWriteTarget>>,
+  ) {
+    const [current] = await tx.select().from(agentsTable)
+      .where(and(eq(agentsTable.id, existing.id), eq(agentsTable.companyId, existing.companyId))).for("no key update");
+    if (!current) return null;
+    const target = await resolveInstructionWriteTarget(current);
+    if (target.mode !== expectedTarget.mode || target.rootPath !== expectedTarget.rootPath
+      || agentInstructionsBundleMode(current) !== agentInstructionsBundleMode(existing)) {
+      throw conflict("The instructions bundle mode changed; reload and retry");
+    }
+    return current;
   }
 
   function adapterConfigTouchesInstructionsConfig(adapterConfig: Record<string, unknown>) {
@@ -4548,6 +4616,7 @@ export function agentRoutes(
       ),
       "add",
     );
+    await precheckNewAgentInstructionRoot(req, { id: hiredAgentId, companyId, name: hireInput.name }, desiredSkillAssignment.adapterConfig);
     const normalizedAdapterConfig = await normalizeMediatedAdapterConfigForPersistence({
       companyId,
       adapterType: hireInput.adapterType,
@@ -4849,6 +4918,7 @@ export function agentRoutes(
       ),
       "add",
     );
+    await precheckNewAgentInstructionRoot(req, { id: agentId, companyId, name: createInput.name }, desiredSkillAssignment.adapterConfig);
     const normalizedAdapterConfig = await normalizeMediatedAdapterConfigForPersistence({
       companyId,
       adapterType: createInput.adapterType,
@@ -5013,7 +5083,6 @@ export function agentRoutes(
     await assertCanManageInstructionsPath(req, existing);
     assertExternalInstructionsAdmin(req, existing);
 
-    const existingAdapterConfig = asRecord(existing.adapterConfig) ?? {};
     const explicitKey = asNonEmptyString(req.body.adapterConfigKey);
     const defaultKey = resolveInstructionsPathKey(existing.adapterType);
     const adapterConfigKey = explicitKey ?? defaultKey;
@@ -5024,32 +5093,52 @@ export function agentRoutes(
       return;
     }
 
-    const nextAdapterConfig: Record<string, unknown> = { ...existingAdapterConfig };
-    if (req.body.path === null) {
-      delete nextAdapterConfig[adapterConfigKey];
-    } else {
-      nextAdapterConfig[adapterConfigKey] = resolveInstructionsFilePath(req.body.path, existingAdapterConfig);
-    }
-
-    const syncedAdapterConfig = syncInstructionsBundleConfigFromFilePath(existing, nextAdapterConfig);
-    assertExternalInstructionsAdmin(req, { ...existing, adapterConfig: syncedAdapterConfig });
-    const normalizedAdapterConfig = await secretsSvc.normalizeAdapterConfigForPersistence(
-      existing.companyId,
-      syncedAdapterConfig,
-      { strictMode: strictSecretsMode, adapterType: existing.adapterType },
-    );
+    const buildPathConfig = (row: Parameters<typeof syncInstructionsBundleConfigFromFilePath>[0]) => {
+      const rowConfig = asRecord(row.adapterConfig) ?? {};
+      const nextAdapterConfig: Record<string, unknown> = { ...rowConfig };
+      if (req.body.path === null) {
+        delete nextAdapterConfig[adapterConfigKey];
+      } else {
+        nextAdapterConfig[adapterConfigKey] = resolveInstructionsFilePath(req.body.path, rowConfig);
+      }
+      return syncInstructionsBundleConfigFromFilePath(row, nextAdapterConfig);
+    };
+    // Fail fast on the unlocked read; the same check repeats on the locked row.
+    assertExternalInstructionsAdmin(req, { ...existing, adapterConfig: buildPathConfig(existing) });
+    const expectedTarget = await resolveInstructionWriteTarget(existing);
     const actor = getActorInfo(req);
-    const agent = await svc.update(
-      id,
-      { adapterConfig: normalizedAdapterConfig },
-      {
-        recordRevision: {
-          createdByAgentId: actor.agentId,
-          createdByUserId: actor.actorType === "user" ? actor.actorId : null,
-          source: "instructions_path_patch",
+    // Read-modify-write on the locked row, refusing if the bundle changed after
+    // the authorization checks above read it.
+    const agent = await db.transaction(async (tx) => {
+      const current = await lockAgentForInstructionsChange(tx, existing, expectedTarget);
+      if (!current) return null;
+      const syncedAdapterConfig = buildPathConfig(current);
+      assertExternalInstructionsAdmin(req, { ...current, adapterConfig: syncedAdapterConfig });
+      const txDb = tx as unknown as Db;
+      // A new instruction root must not activate a folder that a copy record
+      // marks as incomplete (same classifier and 409 as the bundle PATCH).
+      const nextTarget = await resolveInstructionWriteTarget({ ...current, adapterConfig: syncedAdapterConfig });
+      if (nextTarget.rootPath && nextTarget.rootPath !== expectedTarget.rootPath) {
+        await instructions.assertNoCopyIntentForRoot(tx, current, nextTarget.rootPath, isInstanceAdminActor(req));
+      }
+      const normalizedAdapterConfig = await secretService(txDb).normalizeAdapterConfigForPersistence(
+        current.companyId,
+        syncedAdapterConfig,
+        { strictMode: strictSecretsMode, adapterType: current.adapterType },
+      );
+      return agentService(txDb).update(
+        id,
+        { adapterConfig: normalizedAdapterConfig },
+        {
+          recordRevision: {
+            createdByAgentId: actor.agentId,
+            createdByUserId: actor.actorType === "user" ? actor.actorId : null,
+            source: "instructions_path_patch",
+          },
+          instructionConfigWrite: { keys: "all" },
         },
-      },
-    );
+      );
+    });
     if (!agent) {
       res.status(404).json({ error: "Agent not found" });
       return;
@@ -5117,23 +5206,16 @@ export function agentRoutes(
     if (req.body.mode === "external") assertInstanceAdmin(req);
 
     const actor = getActorInfo(req);
-    const { bundle, adapterConfig } = await instructions.updateBundle(existing, req.body);
-    const normalizedAdapterConfig = await secretsSvc.normalizeAdapterConfigForPersistence(
-      existing.companyId,
-      adapterConfig,
-      { strictMode: strictSecretsMode, adapterType: existing.adapterType },
-    );
-    await svc.update(
-      id,
-      { adapterConfig: normalizedAdapterConfig },
-      {
-        recordRevision: {
-          createdByAgentId: actor.agentId,
-          createdByUserId: actor.actorType === "user" ? actor.actorId : null,
-          source: "instructions_bundle_patch",
-        },
-      },
-    );
+    // Plan, copy and persist under the agent row lock, refusing if the bundle
+    // changed after the authorization checks above read it.
+    const { bundle } = await instructions.updateBundle(existing, req.body, {
+      expectedTarget: await resolveInstructionWriteTarget(existing),
+      expectedConfigMode: agentInstructionsBundleMode(existing),
+      persist: (tx, current, adapterConfig) =>
+        repairInstructionsConfig(req, "instructions_bundle_patch")(tx, current as Parameters<AgentFileConfigRepair>[1], adapterConfig),
+      isInstanceAdmin: isInstanceAdminActor(req),
+      actor: { actorType: actor.actorType, actorId: actor.actorId, runId: actor.runId },
+    });
 
     await logActivity(db, {
       companyId: existing.companyId,
@@ -5209,13 +5291,16 @@ export function agentRoutes(
           contentHash: receipt.revision.contentHash }).catch(() => undefined);
       }
       if (req.body.clearLegacyPromptTemplate) {
-        const fresh = await svc.getById(existing.id);
-        if (fresh) {
+        // Read-modify-write on the locked row, not an unlocked fresh read.
+        await db.transaction(async (tx) => {
+          const [fresh] = await tx.select().from(agentsTable)
+            .where(and(eq(agentsTable.id, existing.id), eq(agentsTable.companyId, existing.companyId))).for("update");
+          if (!fresh) return;
           const adapterConfig = { ...asRecord(fresh.adapterConfig) };
           delete adapterConfig.promptTemplate;
           delete adapterConfig.bootstrapPromptTemplate;
-          await svc.update(existing.id, { adapterConfig });
-        }
+          await agentService(tx as unknown as Db).update(existing.id, { adapterConfig });
+        });
       }
       res.json(instructionFileDetail(receipt, receipt));
       return;
@@ -5223,32 +5308,34 @@ export function agentRoutes(
     await assertCanManageInstructionsPath(req, existing);
     assertExternalInstructionsAdmin(req, existing);
 
-    if (agentInstructionsBundleMode(existing) === "managed" && req.body.path !== "promptTemplate.legacy.md") {
+    // A request that supplies baseHash (including null for a new file) always
+    // takes the managed compare-and-swap path. Its row lock rejects a bundle that
+    // became external, so the base is never silently ignored by the external path.
+    const managedWrite = agentInstructionsBundleMode(existing) === "managed" || req.body.baseHash !== undefined;
+    if (managedWrite && req.body.path !== "promptTemplate.legacy.md") {
       if (req.body.baseHash === undefined) throw unprocessable("Read the file and supply baseHash (null for a new file)");
       await agentFiles.write({ companyId: existing.companyId, agentId: existing.id, path: req.body.path,
-        bytes: Buffer.from(req.body.content, "utf8"), baseHash: req.body.baseHash }, req.actor);
+        bytes: Buffer.from(req.body.content, "utf8"), baseHash: req.body.baseHash }, req.actor, {
+        // assertExternalInstructionsAdmin above already required instance admin
+        // for a stale-root bundle; the store re-checks recovery under its lock.
+        allowRecoveredManaged: agentInstructionsBundleMode(existing) === "external",
+        repairConfig: repairInstructionsConfig(req),
+      });
       res.json(await instructions.readFile(existing, req.body.path)); return;
     }
     const actor = getActorInfo(req);
     const result = await instructions.writeFile(existing, req.body.path, req.body.content, {
       clearLegacyPromptTemplate: req.body.clearLegacyPromptTemplate,
+      // Refuse under the lock if the bundle mode or destination root changed
+      // after the read above. The legacy pseudo-file lives in adapter config,
+      // not in either root.
+      expectedMode: req.body.path === "promptTemplate.legacy.md" ? undefined : "external",
+      expectedTarget: req.body.path === "promptTemplate.legacy.md" ? undefined : await resolveInstructionWriteTarget(existing),
+      // Persist on the locked row, so a bundle PATCH queued behind this write
+      // is not reverted by a configuration built from the pre-PATCH row.
+      persistConfig: (tx, current, adapterConfig) =>
+        repairInstructionsConfig(req)(tx, current as Parameters<AgentFileConfigRepair>[1], adapterConfig),
     });
-    const normalizedAdapterConfig = await secretsSvc.normalizeAdapterConfigForPersistence(
-      existing.companyId,
-      result.adapterConfig,
-      { strictMode: strictSecretsMode, adapterType: existing.adapterType },
-    );
-    await svc.update(
-      id,
-      { adapterConfig: normalizedAdapterConfig },
-      {
-        recordRevision: {
-          createdByAgentId: actor.agentId,
-          createdByUserId: actor.actorType === "user" ? actor.actorId : null,
-          source: "instructions_bundle_file_put",
-        },
-      },
-    );
 
     await logActivity(db, {
       companyId: existing.companyId,
@@ -5343,14 +5430,24 @@ export function agentRoutes(
       return;
     }
 
-    if (agentInstructionsBundleMode(existing) === "managed") {
-      const baseHash = typeof req.query.baseHash === "string" && /^[a-f0-9]{64}$/.test(req.query.baseHash) ? req.query.baseHash : null;
+    const baseHash = typeof req.query.baseHash === "string" && /^[a-f0-9]{64}$/.test(req.query.baseHash) ? req.query.baseHash : null;
+    const syncMode = agentInstructionsBundleMode(existing);
+    // A recovered-managed bundle (managed files at the canonical managed root,
+    // not explicitly external) is deleted through the store when the caller
+    // read it and supplied its base. baseHash alone never selects this path.
+    const recoveredManagedDelete = syncMode !== "managed" && baseHash !== null && relativePath !== "promptTemplate.legacy.md"
+      && (await resolveRecoveredManagedBundle(existing)) !== null;
+    if (syncMode === "managed" || recoveredManagedDelete) {
       if (baseHash === null) throw unprocessable("Read the file and supply baseHash before deleting it");
-      await agentFiles.write({ companyId: existing.companyId, agentId: existing.id, path: relativePath, bytes: null, baseHash }, req.actor);
+      await agentFiles.write({ companyId: existing.companyId, agentId: existing.id, path: relativePath, bytes: null, baseHash }, req.actor,
+        { allowRecoveredManaged: syncMode === "external" });
       res.json(await instructions.getBundle(existing)); return;
     }
     const actor = getActorInfo(req);
-    const result = await instructions.deleteFile(existing, relativePath);
+    const result = await instructions.deleteFile(existing, relativePath, {
+      expectedMode: relativePath === "promptTemplate.legacy.md" ? undefined : "external",
+      expectedTarget: relativePath === "promptTemplate.legacy.md" ? undefined : await resolveInstructionWriteTarget(existing),
+    });
     await logActivity(db, {
       companyId: existing.companyId,
       actorType: actor.actorType,
@@ -5456,6 +5553,9 @@ export function agentRoutes(
     const touchesAdapterConfiguration =
       hasOwn(patchData, "adapterType") ||
       hasOwn(patchData, "adapterConfig");
+    // Instruction keys this PATCH sets on purpose (D-R4). The others are kept
+    // as the locked row has them.
+    let instructionConfigWrite: { keys: "all" | AgentInstructionConfigKey[]; expected: Record<string, unknown> } | undefined;
     if (touchesAdapterConfiguration) {
       assertExternalInstructionsAdmin(req, existing);
       const existingAdapterConfig = asRecord(existing.adapterConfig) ?? {};
@@ -5528,16 +5628,37 @@ export function agentRoutes(
           rawEffectiveAdapterConfig,
         ),
       );
-      const normalizedEffectiveAdapterConfig = await normalizeMediatedAdapterConfigForPersistence({
-        companyId: existing.companyId,
-        adapterType: requestedAdapterType,
-        adapterConfig: effectiveAdapterConfig,
-      });
-      patchData.adapterConfig = syncInstructionsBundleConfigFromFilePath(existing, normalizedEffectiveAdapterConfig);
+      // Secrets are normalized inside the update transaction (with strict mode,
+      // below), so a rejected PATCH, including an unauthorized one, persists no
+      // secret. Secret normalization touches only env and secret fields, which
+      // these constraint and runner checks do not read.
+      await assertAdapterConfigConstraints(existing.companyId, requestedAdapterType, effectiveAdapterConfig);
+      patchData.adapterConfig = syncInstructionsBundleConfigFromFilePath(
+        existing,
+        normalizePaperclipRunnerAdapterConfig(requestedAdapterType ?? "", effectiveAdapterConfig),
+      );
       assertExternalInstructionsAdmin(req, {
         ...existing,
         adapterConfig: patchData.adapterConfig,
       });
+      // Replace mode sets every instruction key, clearing the omitted ones
+      // (authorized above). Merge mode sets the keys named in the body and the
+      // keys this route derives from them. Either way, the locked row must still
+      // hold the instruction state these checks authorized against.
+      const explicitInstructionKeys = requestedAdapterConfig
+        ? KNOWN_INSTRUCTIONS_BUNDLE_KEYS.filter((key) => hasOwn(requestedAdapterConfig, key))
+        : [];
+      if (requestedAdapterConfig && (replaceAdapterConfig || explicitInstructionKeys.length > 0)) {
+        const nextAdapterConfig = patchData.adapterConfig as Record<string, unknown>;
+        instructionConfigWrite = {
+          keys: replaceAdapterConfig
+            ? "all"
+            : KNOWN_INSTRUCTIONS_BUNDLE_KEYS.filter((key) =>
+              explicitInstructionKeys.includes(key)
+              || JSON.stringify(nextAdapterConfig[key] ?? null) !== JSON.stringify(existingAdapterConfig[key] ?? null)),
+          expected: existingAdapterConfig,
+        };
+      }
     }
     if (existing.runtimeConfig.aiConnection && requestedRuntimeConfig && !requestedRuntimeConfig.aiConnection) requestedRuntimeConfig.aiConnection = existing.runtimeConfig.aiConnection;
     const nextAiBinding = aiConnectionBindingSchema.safeParse(requestedRuntimeConfig?.aiConnection ?? existing.runtimeConfig.aiConnection).data;
@@ -5573,6 +5694,10 @@ export function agentRoutes(
 
     const actor = getActorInfo(req);
     const agent = await svc.update(id, patchData, {
+      instructionConfigWrite,
+      secretNormalization: { strictMode: strictSecretsMode },
+      // WS-2 PR-W1: only the detail level of an exclusive-root 409.
+      instructionRootGuard: { isInstanceAdmin: isInstanceAdminActor(req) },
       recordRevision: {
         createdByAgentId: actor.agentId,
         createdByUserId: actor.actorType === "user" ? actor.actorId : null,

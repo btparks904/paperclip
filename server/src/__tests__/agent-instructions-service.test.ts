@@ -2,7 +2,13 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { agentInstructionsService } from "../services/agent-instructions.js";
+import {
+  agentInstructionsBundleMode,
+  agentInstructionsService,
+  resolveInstructionWriteTarget,
+  resolveManagedInstructionsRoot,
+  type UpdateBundleOptions,
+} from "../services/agent-instructions.js";
 
 type TestAgent = {
   id: string;
@@ -22,6 +28,27 @@ function makeAgent(adapterConfig: Record<string, unknown>): TestAgent {
     name: "Agent 1",
     adapterConfig,
   };
+}
+
+// updateBundle only exists in its locked form. This stand-in transaction
+// returns the agent for the row lock and no revision heads; the database-backed
+// behavior is covered by agent-instructions-bundle-switch-race.test.ts.
+function lockedBundle(agent: TestAgent) {
+  const persisted: Array<Record<string, unknown>> = [];
+  const tx = {
+    select: () => ({ from: () => ({ where: () => Object.assign(Promise.resolve([]), { for: async () => [agent] }) }) }),
+    insert: () => ({ values: async () => undefined }),
+    execute: async () => [],
+  };
+  const db = { transaction: async (fn: (t: typeof tx) => Promise<unknown>) => fn(tx) };
+  const options = async (): Promise<UpdateBundleOptions> => ({
+    expectedTarget: await resolveInstructionWriteTarget(agent),
+    expectedConfigMode: agentInstructionsBundleMode(agent),
+    persist: async (_tx, _current, adapterConfig) => { persisted.push(adapterConfig); },
+    isInstanceAdmin: false,
+    actor: { actorType: "system", actorId: "test" },
+  });
+  return { svc: agentInstructionsService(db as never), options, persisted };
 }
 
 describe("agent instructions service", () => {
@@ -91,15 +118,16 @@ describe("agent instructions service", () => {
     await fs.mkdir(path.join(externalRoot, "docs"), { recursive: true });
     await fs.writeFile(path.join(externalRoot, "docs", "TOOLS.md"), "## Tools\n", "utf8");
 
-    const svc = agentInstructionsService({ select: () => ({ from: () => ({ where: async () => [] }) }) } as never);
     const agent = makeAgent({
       instructionsBundleMode: "external",
       instructionsRootPath: externalRoot,
       instructionsEntryFile: "AGENTS.md",
       instructionsFilePath: path.join(externalRoot, "AGENTS.md"),
     });
+    const locked = lockedBundle(agent);
 
-    const result = await svc.updateBundle(agent, { mode: "managed" });
+    const result = await locked.svc.updateBundle(agent, { mode: "managed" }, await locked.options());
+    expect(locked.persisted).toEqual([result.adapterConfig]);
 
     expect(result.bundle.mode).toBe("managed");
     expect(result.bundle.managedRootPath).toBe(
@@ -140,19 +168,20 @@ describe("agent instructions service", () => {
     await fs.mkdir(managedRoot, { recursive: true });
     await fs.writeFile(path.join(managedRoot, "AGENTS.md"), "# Managed Agent\n", "utf8");
 
-    const svc = agentInstructionsService();
     const agent = makeAgent({
       instructionsBundleMode: "managed",
       instructionsRootPath: managedRoot,
       instructionsEntryFile: "AGENTS.md",
       instructionsFilePath: path.join(managedRoot, "AGENTS.md"),
     });
+    const locked = lockedBundle(agent);
 
-    const result = await svc.updateBundle(agent, {
+    const result = await locked.svc.updateBundle(agent, {
       mode: "external",
       rootPath: externalRoot,
       entryFile: "docs/AGENTS.md",
-    });
+    }, await locked.options());
+    expect(locked.persisted).toEqual([result.adapterConfig]);
 
     expect(result.bundle.mode).toBe("external");
     expect(result.bundle.rootPath).toBe(externalRoot);
@@ -416,5 +445,46 @@ describe("agent instructions service", () => {
       `Recovered managed instructions from disk at ${managedRoot}; ignoring stale configured root ${staleRoot}.`,
     ]);
     expect(exported.files).toEqual({ "AGENTS.md": "# Managed Agent\n" });
+  });
+
+  it("keeps unversioned writes and deletes unchanged when no expected mode is given", async () => {
+    const externalRoot = await makeTempDir("external-no-expected-"); cleanupDirs.add(externalRoot);
+    await fs.writeFile(path.join(externalRoot, "AGENTS.md"), "# External Agent\n", "utf8");
+    const agent = makeAgent({ instructionsBundleMode: "external", instructionsRootPath: externalRoot, instructionsEntryFile: "AGENTS.md" });
+    const svc = agentInstructionsService();
+    const written = await svc.writeFile(agent, "docs/TOOLS.md", "## Tools\n");
+    expect(written.file).toMatchObject({ path: "docs/TOOLS.md", content: "## Tools\n" });
+    expect(await fs.readFile(path.join(externalRoot, "docs", "TOOLS.md"), "utf8")).toBe("## Tools\n");
+    await svc.deleteFile(agent, "docs/TOOLS.md");
+    await expect(fs.stat(path.join(externalRoot, "docs", "TOOLS.md"))).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("accepts the external expected mode for external and unconfigured bundles", async () => {
+    const externalRoot = await makeTempDir("external-expected-"); cleanupDirs.add(externalRoot);
+    await fs.writeFile(path.join(externalRoot, "AGENTS.md"), "# External Agent\n", "utf8");
+    const svc = agentInstructionsService();
+    const external = makeAgent({ instructionsBundleMode: "external", instructionsRootPath: externalRoot, instructionsEntryFile: "AGENTS.md" });
+    await svc.writeFile(external, "docs/TOOLS.md", "## Tools\n", { expectedMode: "external" });
+    expect(await fs.readFile(path.join(externalRoot, "docs", "TOOLS.md"), "utf8")).toBe("## Tools\n");
+    await svc.deleteFile(external, "docs/TOOLS.md", { expectedMode: "external" });
+    await expect(fs.stat(path.join(externalRoot, "docs", "TOOLS.md"))).rejects.toMatchObject({ code: "ENOENT" });
+    const unconfigured = await svc.writeFile(makeAgent({}), "docs/TOOLS.md", "## Tools\n", { expectedMode: "external" });
+    expect(unconfigured.file).toMatchObject({ path: "docs/TOOLS.md", content: "## Tools\n" });
+  });
+
+  it("refuses an expected mode that does not match the bundle, without writing", async () => {
+    // A managed bundle is one rooted at the resolved managed root.
+    const managedRoot = resolveManagedInstructionsRoot(makeAgent({}));
+    await fs.mkdir(path.join(managedRoot, "docs"), { recursive: true });
+    await fs.writeFile(path.join(managedRoot, "AGENTS.md"), "# Managed Agent\n", "utf8");
+    await fs.writeFile(path.join(managedRoot, "docs", "TOOLS.md"), "## Tools\n", "utf8");
+    const managed = makeAgent({ instructionsBundleMode: "managed", instructionsRootPath: managedRoot, instructionsEntryFile: "AGENTS.md" });
+    const svc = agentInstructionsService();
+    await expect(svc.writeFile(managed, "docs/TOOLS.md", "changed\n", { expectedMode: "external" }))
+      .rejects.toMatchObject({ status: 409, message: "The instructions bundle mode changed; reload and retry" });
+    await expect(svc.writeFile(managed, "docs/NEW.md", "new\n", { expectedMode: "external" })).rejects.toMatchObject({ status: 409 });
+    await expect(svc.deleteFile(managed, "docs/TOOLS.md", { expectedMode: "external" })).rejects.toMatchObject({ status: 409 });
+    expect(await fs.readFile(path.join(managedRoot, "docs", "TOOLS.md"), "utf8")).toBe("## Tools\n");
+    await expect(fs.stat(path.join(managedRoot, "docs", "NEW.md"))).rejects.toMatchObject({ code: "ENOENT" });
   });
 });

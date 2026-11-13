@@ -15,7 +15,7 @@ import { adoptAgentFiles, agentFilePath, fileHash, readAgentFile, snapshotAgentF
 import { assertInstructionPathSafe, instructionBytes, materializeInstructionBytes } from "./agent-instruction-files.js";
 import { agentInstructionRevisionService } from "./agent-instruction-revisions.js";
 import type { AuthorizationActor } from "./authorization.js";
-import { agentInstructionsBundleMode, agentInstructionsService } from "./agent-instructions.js";
+import { agentInstructionsBundleMode, agentInstructionsService, resolveInstructionWriteTarget } from "./agent-instructions.js";
 import { agentService } from "./agents.js";
 import { approvalService } from "./approvals.js";
 import {
@@ -990,7 +990,8 @@ export function builtInAgentService(db: Db) {
       // files. If a write or DB commit fails, the next reconciliation can accept
       // already-applied bytes and retry. This is not instruction revision history.
       const prepared = await db.transaction(async (tx) => {
-        const [current] = await tx.select().from(agents).where(and(eq(agents.companyId, agent.companyId), eq(agents.id, agent.id))).for("update");
+        // FOR NO KEY UPDATE: first adoption can take the instruction-root assignment lock (WS-2 PR-W1).
+        const [current] = await tx.select().from(agents).where(and(eq(agents.companyId, agent.companyId), eq(agents.id, agent.id))).for("no key update");
         if (!current) throw notFound("Built-in agent not found");
         if (agentInstructionsBundleMode(current) !== "managed") return false;
         const root = await adoptAgentFiles(tx, current);
@@ -1040,7 +1041,8 @@ export function builtInAgentService(db: Db) {
       });
       if (!prepared) return currentState;
       return db.transaction(async (tx) => {
-        const [current] = await tx.select().from(agents).where(and(eq(agents.companyId, agent.companyId), eq(agents.id, agent.id))).for("update");
+        // FOR NO KEY UPDATE: first adoption can take the instruction-root assignment lock (WS-2 PR-W1).
+        const [current] = await tx.select().from(agents).where(and(eq(agents.companyId, agent.companyId), eq(agents.id, agent.id))).for("no key update");
         if (!current) throw notFound("Built-in agent not found");
         if (agentInstructionsBundleMode(current) !== "managed") return currentState;
         const root = await adoptAgentFiles(tx, current);
@@ -1097,6 +1099,9 @@ export function builtInAgentService(db: Db) {
     }
 
     let adapterConfig: Record<string, unknown>;
+    // A reset copies the instruction keys of `refreshed`; the update and every
+    // file write must still find that configuration and root under the lock.
+    let resetExpected: Record<string, unknown> | undefined;
     if (currentFiles[bundle.instructions.entryFile] !== null && currentFiles[bundle.instructions.entryFile] !== undefined) {
       if (!actor && mode === "reconcile") return currentState;
       if (!actor) throw unprocessable("Resetting existing instructions requires an authenticated operator", { code: "INSTRUCTION_IDENTITY_INVALID" });
@@ -1109,9 +1114,11 @@ export function builtInAgentService(db: Db) {
       if (receipt.materialization === "pending") throw conflict("Instruction revision saved; retry reset to repair its disk copy", { revisionId: receipt.revision.id });
       const refreshed = await agentSvc.getById(agent.id);
       if (!refreshed) throw notFound("Built-in agent not found");
+      const expectedTarget = await resolveInstructionWriteTarget(refreshed);
       for (const [file, content] of Object.entries(bundle.instructions.files)) {
-        if (file !== bundle.instructions.entryFile) await instructionsSvc.writeFile(refreshed, file, content);
+        if (file !== bundle.instructions.entryFile) await instructionsSvc.writeFile(refreshed, file, content, { expectedTarget });
       }
+      resetExpected = refreshed.adapterConfig;
       // Preserve personal files outside this built-in bundle's declared paths.
       adapterConfig = { ...refreshed.adapterConfig };
       delete adapterConfig.promptTemplate;
@@ -1129,6 +1136,7 @@ export function builtInAgentService(db: Db) {
     }, {
       allowBuiltInAgentMetadata: true,
       recordRevision: { source: `built-in-bundle:${mode}:instructions` },
+      instructionConfigWrite: { keys: "all", expected: resetExpected },
     });
     if (!updated) throw notFound("Built-in agent not found");
     await upsertManagedResourceBinding({

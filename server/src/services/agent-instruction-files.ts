@@ -22,6 +22,37 @@ export function instructionPath(value: string): string {
   return value;
 }
 
+/** Comparison key for deciding whether two instruction paths can name the
+ * same file on a volume that ignores letter case and Unicode normalization
+ * (macOS APFS and HFS+ by default, Windows NTFS). It is deliberately broader
+ * than any one volume: canonical composition (NFC), then an upper-to-lower
+ * round trip so letters with several case forms (final sigma, the Kelvin sign,
+ * sharp s) fold together. Folding more than the volume only refuses more paths
+ * as entry-equivalent. It does not validate; callers validate paths first. */
+export function instructionPathKey(value: string): string {
+  return value.normalize("NFC").toUpperCase().toLowerCase().normalize("NFC");
+}
+
+/** True when both paths exist under root as the same regular file (same device
+ * and inode). On a case-insensitive volume an alias resolves to the entry's
+ * inode, which catches folding rules the string key does not reproduce. */
+export async function sameInstructionFile(root: string, a: string, b: string): Promise<boolean> {
+  const [left, right] = await Promise.all([a, b].map(name =>
+    fs.lstat(path.resolve(root, name), { bigint: true }).catch(() => null)));
+  return Boolean(left?.isFile() && right?.isFile() && left.dev === right.dev && left.ino === right.ino);
+}
+
+/** True when candidate names one of the entries, under any spelling the
+ * volume may treat as the same file. */
+export async function matchesInstructionEntry(root: string | null | undefined, candidate: string, entries: Iterable<string>): Promise<boolean> {
+  const key = instructionPathKey(candidate);
+  for (const entry of entries) {
+    if (instructionPathKey(entry) === key) return true;
+    if (root && await sameInstructionFile(root, candidate, entry)) return true;
+  }
+  return false;
+}
+
 export function instructionBytes(content: string | Uint8Array): Buffer {
   const byteLength =
     typeof content === "string"

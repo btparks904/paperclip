@@ -40,6 +40,7 @@ const mockAgentInstructionsService = vi.hoisted(() => ({
   exportFiles: vi.fn(),
   ensureManagedBundle: vi.fn(),
   materializeManagedBundle: vi.fn(),
+  precheckExclusiveRoot: vi.fn(async () => undefined),
 }));
 
 const mockCompanySkillService = vi.hoisted(() => ({
