@@ -1104,6 +1104,7 @@ async function buildAgentContext(
       status: agents.status,
       adapterType: agents.adapterType,
       adapterConfig: agents.adapterConfig,
+      instructionBundleId: agents.instructionBundleId,
       runtimeConfig: agents.runtimeConfig,
     })
     .from(agents)
@@ -1176,6 +1177,7 @@ async function buildAgentContext(
     companyId: agent.companyId,
     name: agent.name,
     adapterConfig: agent.adapterConfig,
+    instructionBundleId: agent.instructionBundleId,
   }) === "external";
   if (externalInstructions) {
     state.omittedFields.add("bundle.agentContext.runtime.configuredInstructionsFilePath");
@@ -1239,6 +1241,7 @@ async function buildAgentContext(
       companyId: agent.companyId,
       name: agent.name,
       adapterConfig: agent.adapterConfig,
+      instructionBundleId: agent.instructionBundleId,
     }).catch(() => null);
 
   let entryDigest: string | null = null;
@@ -1254,6 +1257,7 @@ async function buildAgentContext(
         companyId: agent.companyId,
         name: agent.name,
         adapterConfig: agent.adapterConfig,
+        instructionBundleId: agent.instructionBundleId,
       }, readableEntryPath).catch(() => null);
       if (entryFile) {
         entryDigest = sha256Digest(entryFile.content);

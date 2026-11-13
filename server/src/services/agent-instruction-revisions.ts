@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import path from "node:path";
-import { adoptAgentFiles, agentFileToken } from "./agent-file-store.js";
+import { adoptAgentFiles, agentFileToken, assertAgentFileGeneration } from "./agent-file-store.js";
 import { and, desc, eq, getTableColumns, lt, or, sql } from "drizzle-orm";
 import {
   activityLog,
@@ -219,6 +219,8 @@ export function agentInstructionRevisionService(db: Db) {
         }),
     actor: RevisionActor,
     configuredEntryFile?: string,
+    /** WS-2 PR-W2: a legacy working copy's recorded generation; checked under the lock before any adoption or write. */
+    expectedGeneration?: string | null,
   ): Promise<AgentInstructionCommitReceipt> {
     instructionPath(input.entryFile);
     const bytes = "content" in input ? instructionBytes(input.content) : null;
@@ -231,6 +233,7 @@ export function agentInstructionRevisionService(db: Db) {
       const bound = actor.type === "plugin"
         ? await authorizePluginReset(tx, actor, input, state.agent)
         : await authorizeInstructionCommit(tx, actor, state.agent);
+      if (expectedGeneration !== undefined) assertAgentFileGeneration(state.agent, expectedGeneration);
       if (bound.type === "plugin") {
         if (input.entryFile !== bound.declaredEntryFile) throw forbidden("Plugin reset must restore its declared entry file");
         if (configuredEntryFile !== state.entryFile) throw conflict("Configured instruction entry changed; read the current entry and retry", { code: "INSTRUCTION_ENTRY_CHANGED", entryFile: state.entryFile });
@@ -423,7 +426,33 @@ export function agentInstructionRevisionService(db: Db) {
       suffix: end ? a.slice(-end).join("") : "",
     };
   }
+  /**
+   * WS-2 PR-W2: a legacy working copy's baseline. The current entry snapshot,
+   * the generation and the exported files are read in one agent-row-lock
+   * transaction, so the copy's recorded generation is the one its baseline
+   * came from.
+   */
+  async function readCurrentForCopy(
+    target: InstructionTarget,
+    actor: AuthorizationActor,
+    exportFiles: (agent: typeof agents.$inferSelect) => Promise<{ files: Record<string, string>; entryFile: string }>,
+  ) {
+    return db.transaction(async (tx) => {
+      const state = await lockTarget(tx, target, actor, "no key update");
+      const bound = await authorizeRead(tx, actor, target);
+      const row = await currentFile(tx, target, state, bound);
+      return {
+        snapshot: row ? snapshot(row) : null,
+        generation: state.agent.instructionBundleId ?? null,
+        exported: await exportFiles(state.agent),
+      };
+    });
+  }
   return {
+    readCurrentForCopy,
+    /** WS-2 PR-W2: the plugin reset authority check, on the caller's locked transaction. */
+    authorizePluginReset: (tx: Tx, actor: PluginResetActor, target: InstructionTarget, agent: typeof agents.$inferSelect) =>
+      authorizePluginReset(tx, actor, target, agent),
     readCommittedForRuntime,
     readCurrent,
     readForPluginReset,
@@ -433,8 +462,8 @@ export function agentInstructionRevisionService(db: Db) {
     history,
     diff,
     materializeCurrent,
-    commit: (input: InstructionCommitInput, actor: AuthorizationActor) =>
-      commitInternal(input, actor),
+    commit: (input: InstructionCommitInput, actor: AuthorizationActor, options?: { expectedGeneration?: string | null }) =>
+      commitInternal(input, actor, undefined, options?.expectedGeneration),
     restore: (
       input: InstructionTarget & {
         entryFile: string;

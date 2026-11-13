@@ -10,7 +10,7 @@ import { captureDirectorySnapshot, mergeDirectoryWithBaseline, type DirectorySna
 import { HttpError, conflict, notFound, unprocessable } from "../errors.js";
 import { authorizeInstructionCommit, authorizeInstructionRead } from "./agent-instruction-authorization.js";
 import { assertInstructionPathSafe, instructionPath, instructionPathKey, matchesInstructionEntry, instructionBytes, materializeInstructionBytes, readInstructionBytes, MAX_INSTRUCTION_BYTES } from "./agent-instruction-files.js";
-import { agentInstructionsBundleMode, deriveBundleState, resolveManagedInstructionsRoot, resolveRecoveredManagedBundle, type RecoveredManagedBundle } from "./agent-instructions.js";
+import { agentInstructionsBundleMode, deriveBundleState, resolveAgentFileSyncDirectory, resolveManagedInstructionsRoot, resolveRecoveredManagedBundle, type RecoveredManagedBundle } from "./agent-instructions.js";
 import type { AuthorizationActor } from "./authorization.js";
 import { assertExclusiveInstructionRoot } from "./instruction-root-exclusivity.js";
 
@@ -47,6 +47,9 @@ export function assertDirectorySize(size: number, count: number) {
   if (count > MAX_AGENT_DIRECTORY_ENTRIES) throw new AgentFileLimitError("Agent directory exceeds the 100,000-entry limit (files and folders)");
 }
 export const AGENT_FILES_ENTRY_CONFLICT = "AGENT_FILES_ENTRY_CONFLICT";
+/** WS-2 PR-W2: a working copy derived from another instruction generation.
+ * Terminal like AGENT_FILES_ENTRY_CONFLICT: never retried or redirected. */
+export const AGENT_FILES_GENERATION_CHANGED = "AGENT_FILES_GENERATION_CHANGED";
 
 /** Content identity of one snapshot entry. Files compare by SHA-256 only, never
  * by mode, size, timestamps, inode or path; an absent entry is null. */
@@ -74,6 +77,25 @@ export function isStaleEntryWriteBack(entryPath: string, baseline: DirectorySnap
 export function isAgentFileEntryConflict(error: unknown): boolean {
   return error instanceof HttpError && error.status === 409 &&
     (error.details as { code?: unknown } | undefined)?.code === AGENT_FILES_ENTRY_CONFLICT;
+}
+export function isAgentFileGenerationConflict(error: unknown): boolean {
+  return error instanceof HttpError && error.status === 409 &&
+    (error.details as { code?: unknown } | undefined)?.code === AGENT_FILES_GENERATION_CHANGED;
+}
+/** The terminal write-back rejection code of error, if it is one. */
+export function agentFileTerminalConflictCode(error: unknown): typeof AGENT_FILES_ENTRY_CONFLICT | typeof AGENT_FILES_GENERATION_CHANGED | null {
+  if (isAgentFileEntryConflict(error)) return AGENT_FILES_ENTRY_CONFLICT;
+  if (isAgentFileGenerationConflict(error)) return AGENT_FILES_GENERATION_CHANGED;
+  return null;
+}
+/** WS-2 PR-W2 fence: refuses a copy whose recorded generation is not the
+ * locked agent's. Call under the agent row lock, before any check that can
+ * adopt or write files. */
+export function assertAgentFileGeneration(agent: { instructionBundleId?: string | null }, expected: string | null) {
+  if ((agent.instructionBundleId ?? null) !== expected) {
+    throw conflict("The agent's instructions moved to a new generation after this working copy was prepared. The write-back was rejected and no files were saved.",
+      { code: AGENT_FILES_GENERATION_CHANGED });
+  }
 }
 
 export function agentStorageWarning(detail: string) {
@@ -116,7 +138,7 @@ async function planAgentFileAdoption(tx: Tx, agent: Agent, options?: { recovered
     throw unprocessable("External instructions must be migrated to managed storage first");
   }
   const root = resolveManagedInstructionsRoot(agent);
-  const markerRoot = path.join(path.dirname(root), "file-sync");
+  const markerRoot = resolveAgentFileSyncDirectory(agent);
   const marker = "adopted.json";
   await assertInstructionPathSafe(root, deriveBundleState(agent).entryFile);
   const filename = await assertInstructionPathSafe(markerRoot, marker);
@@ -283,7 +305,10 @@ async function applyTreeUsage(finalEntries: ApplyTree,
 export function agentFileStore(db: Db) {
   async function locked<T>(companyId: string, agentId: string, actor: AuthorizationActor, write: boolean,
     fn: (tx: Tx, agent: Agent, root: string, bound: AuthorizationActor, recovered: RecoveredManagedBundle | null, adoption: AdoptionPlan) => Promise<T>,
-    options?: { recoverManaged?: boolean; allowRecoveredManaged?: boolean; deferAdoption?: boolean }) {
+    options?: { recoverManaged?: boolean; allowRecoveredManaged?: boolean; deferAdoption?: boolean;
+      /** WS-2 PR-W2: the generation a working copy was derived from. When set
+       * (null included), any other generation refuses before adoption. */
+      expectedGeneration?: string | null }) {
     return db.transaction(async tx => {
       // FOR NO KEY UPDATE, like every instruction writer that can take the
       // instruction-root assignment lock: writers of this agent still
@@ -292,6 +317,7 @@ export function agentFileStore(db: Db) {
       const [agent] = await tx.select().from(agents).where(and(eq(agents.companyId, companyId), eq(agents.id, agentId))).for("no key update");
       if (!agent) throw notFound("Agent not found");
       const bound = write ? await authorizeInstructionCommit(tx, actor, agent) : await authorizeInstructionRead(tx, actor, agent);
+      if (options?.expectedGeneration !== undefined) assertAgentFileGeneration(agent, options.expectedGeneration);
       // Re-evaluate recovery on the locked row, never on the caller's earlier read.
       const recovered = options?.recoverManaged || options?.allowRecoveredManaged ? await resolveRecoveredManagedBundle(agent) : null;
       const adoption = await planAgentFileAdoption(tx, agent, { recoveredManaged: options?.allowRecoveredManaged === true && recovered !== null });
@@ -399,7 +425,9 @@ export function agentFileStore(db: Db) {
       // recovered entry stays protected even without the stale-root allowance.
       }, { recoverManaged: true,
         allowRecoveredManaged: options?.allowRecoveredManaged === true, deferAdoption: true }),
-    apply: (input: { companyId: string; agentId: string; sourceDir: string; baseline: DirectorySnapshot; checkpoint?: AgentFileManifest }, actor: AuthorizationActor) =>
+    apply: (input: { companyId: string; agentId: string; sourceDir: string; baseline: DirectorySnapshot; checkpoint?: AgentFileManifest;
+      /** WS-2 PR-W2: the copy's recorded generation; checked first under the lock. */
+      expectedGeneration?: string | null }, actor: AuthorizationActor) =>
       locked(input.companyId, input.agentId, actor, true, async (tx, agent, root, bound, _recovered, adoption) => {
         const incoming = input.checkpoint ? checkpointSnapshot(input.checkpoint) : await snapshotAgentFiles(input.sourceDir);
         const entryPath = deriveBundleState(agent).entryFile;
@@ -433,7 +461,7 @@ export function agentFileStore(db: Db) {
         // Previously saved/imported bytes must remain readable, including when
         // over quota. Enforce limits on the incoming and resulting tree so a
         // run can delete files to recover instead of being locked out forever.
-        const captureCurrent = async () => input.checkpoint ? checkpointSnapshot(await cachedAgentFileManifest(root)) : await snapshotAgentFiles(root, false);
+        const captureCurrent = async () => input.checkpoint ? checkpointSnapshot(await cachedAgentFileManifest(root, resolveAgentFileSyncDirectory(agent))) : await snapshotAgentFiles(root, false);
         const assertNotStale = (current: DirectorySnapshot) => {
           if (isStaleEntryWriteBack(entryPath, input.baseline, incoming, current)) {
             throw conflict("The instruction entry changed after this working copy was prepared. The write-back was rejected and no files were saved.",
@@ -497,6 +525,6 @@ export function agentFileStore(db: Db) {
           ...(input.checkpoint ? { snapshots: { source: incoming, current } } : {}) });
         await audit(tx, agent, bound, { sourceRunId: actor.runId, contract: AGENT_FILES_CONTRACT });
         return { storageWarning: storageWarning(total, finalEntries.size, fullFile) };
-      }, { deferAdoption: true }),
+      }, { deferAdoption: true, expectedGeneration: input.expectedGeneration }),
   };
 }

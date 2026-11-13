@@ -9,7 +9,8 @@ import { instructionPath, instructionPathKey, matchesInstructionEntry, assertIns
 import { conflict, notFound, unprocessable } from "../errors.js";
 import { resolveHomeAwarePath, resolvePaperclipInstanceRoot } from "../home-paths.js";
 import { logger } from "../middleware/logger.js";
-import { assertExclusiveInstructionRoot } from "./instruction-root-exclusivity.js";
+import { assertExclusiveInstructionRoot, resolveManagedAgentArea } from "./instruction-root-exclusivity.js";
+import { instructionActivationService, type ActivityActor, type OverlaySource } from "./instruction-generation-activation.js";
 
 const ENTRY_FILE_DEFAULT = "AGENTS.md";
 const MODE_KEY = "instructionsBundleMode";
@@ -42,6 +43,8 @@ type AgentLike = {
   companyId: string;
   name: string;
   adapterConfig: unknown;
+  /** WS-2 PR-W2: the active managed generation (agents.instruction_bundle_id). */
+  instructionBundleId?: string | null;
 };
 
 type AgentInstructionsFileSummary = {
@@ -139,15 +142,63 @@ function resolvePathWithinRoot(rootPath: string, relativePath: string): string {
   return absolutePath;
 }
 
+const GENERATION_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+
+/** WS-2 PR-W2: the legacy managed folder, <area>/instructions (generation null). */
+export function resolveLegacyManagedInstructionsRoot(agent: Pick<AgentLike, "id" | "companyId">): string {
+  return path.join(resolveManagedAgentArea(agent), "instructions");
+}
+
+/** WS-2 PR-W2: <area>/instruction-versions, the parent of every versioned generation. */
+export function resolveInstructionVersionsDirectory(agent: Pick<AgentLike, "id" | "companyId">): string {
+  return path.join(resolveManagedAgentArea(agent), "instruction-versions");
+}
+
+/** WS-2 PR-W2: the folder of one versioned generation. */
+export function resolveInstructionVersionRoot(agent: Pick<AgentLike, "id" | "companyId">, generationId: string): string {
+  if (!GENERATION_ID.test(generationId)) throw new Error("Invalid instruction generation id");
+  return path.join(resolveInstructionVersionsDirectory(agent), generationId);
+}
+
+/** WS-2 PR-W2: Paperclip's per-agent sync folder (adoption marker, manifest
+ * cache, run copies). It sits beside every generation and is not part of one. */
+export function resolveAgentFileSyncDirectory(agent: Pick<AgentLike, "id" | "companyId">): string {
+  return path.join(resolveManagedAgentArea(agent), "file-sync");
+}
+
+/** The current managed root: the active generation's folder (WS-2 PR-W2). */
 export function resolveManagedInstructionsRoot(agent: AgentLike): string {
-  return path.resolve(
-    resolvePaperclipInstanceRoot(),
-    "companies",
-    agent.companyId,
-    "agents",
-    agent.id,
-    "instructions",
-  );
+  return agent.instructionBundleId
+    ? resolveInstructionVersionRoot(agent, agent.instructionBundleId)
+    : resolveLegacyManagedInstructionsRoot(agent);
+}
+
+/**
+ * WS-2 PR-W2: the agent's own managed root that candidate equals or lies
+ * inside: the current generation, the legacy folder, or any retained version.
+ * Null for every other path. A configuration naming an older generation of the
+ * agent's own area is still the managed bundle, recovered to the current one.
+ */
+function ownManagedRootContaining(agent: AgentLike, candidate: string): string | null {
+  const resolved = path.resolve(candidate);
+  const inside = (root: string) => {
+    const relative = path.relative(root, resolved);
+    return relative === "" || (relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative));
+  };
+  for (const root of [resolveManagedInstructionsRoot(agent), resolveLegacyManagedInstructionsRoot(agent)]) {
+    if (inside(root)) return root;
+  }
+  const versions = resolveInstructionVersionsDirectory(agent);
+  const relative = path.relative(versions, resolved);
+  const [first] = relative.split(path.sep);
+  if (relative && first && first !== ".." && !path.isAbsolute(relative) && GENERATION_ID.test(first)) {
+    return path.join(versions, first);
+  }
+  return null;
+}
+
+function isOwnManagedRoot(agent: AgentLike, candidate: string): boolean {
+  return ownManagedRootContaining(agent, candidate) === path.resolve(candidate);
 }
 
 function resolveLegacyInstructionsPath(candidatePath: string, config: Record<string, unknown>): string {
@@ -273,7 +324,9 @@ export function deriveBundleState(agent: AgentLike): BundleState {
   if (!rootPath && legacyInstructionsPath) {
     try {
       const resolvedLegacyPath = resolveLegacyInstructionsPath(legacyInstructionsPath, config);
-      const managedRoot = resolveManagedInstructionsRoot(agent);
+      // WS-2 PR-W2: inside the current generation, the legacy folder or a
+      // retained version of this agent's own area counts as managed.
+      const managedRoot = ownManagedRootContaining(agent, resolvedLegacyPath) ?? resolveManagedInstructionsRoot(agent);
       const managedRelative = path.relative(managedRoot, resolvedLegacyPath);
       const inManagedRoot = managedRelative !== ".." && !managedRelative.startsWith(`..${path.sep}`) && !path.isAbsolute(managedRelative);
       rootPath = inManagedRoot ? managedRoot : path.dirname(resolvedLegacyPath);
@@ -305,17 +358,30 @@ export function deriveBundleState(agent: AgentLike): BundleState {
 export function agentInstructionsBundleMode(agent: AgentLike): BundleMode | null {
   const state = deriveBundleState(agent);
   if (state.mode === "external") return "external";
-  if (
-    state.rootPath
-    && path.resolve(state.rootPath) !== resolveManagedInstructionsRoot(agent)
-  ) {
+  // WS-2 PR-W2: the current generation, the legacy folder and any retained
+  // version of the agent's own area are its managed root (recovered to the
+  // current generation); every other root is external.
+  if (state.rootPath && !isOwnManagedRoot(agent, state.rootPath)) {
     return "external";
   }
   return state.mode;
 }
 
-async function recoverManagedBundleState(agent: AgentLike, state: BundleState): Promise<BundleState> {
+async function recoverManagedBundleState(agent: AgentLike, inputState: BundleState): Promise<BundleState> {
   const managedRootPath = resolveManagedInstructionsRoot(agent);
+  let state = inputState;
+  // WS-2 PR-W2: a configured root that is an older generation of this agent's
+  // own area never receives reads or writes; the current generation does.
+  if (state.mode !== "external" && state.rootPath && path.resolve(state.rootPath) !== managedRootPath
+    && isOwnManagedRoot(agent, state.rootPath)) {
+    state = {
+      ...state,
+      mode: "managed",
+      rootPath: managedRootPath,
+      resolvedEntryPath: path.resolve(managedRootPath, state.entryFile),
+      warnings: [...state.warnings, `Configured instructions root ${state.rootPath} is not the current generation; using ${managedRootPath}.`],
+    };
+  }
   const stat = await statIfExists(managedRootPath);
   if (!stat?.isDirectory()) return state;
 
@@ -426,6 +492,16 @@ function applyBundleConfig(
   return next;
 }
 
+/** WS-2 PR-W2: the managed bundle keys for rootPath and entryFile on config. */
+export function applyManagedBundleConfig(
+  config: Record<string, unknown>,
+  rootPath: string,
+  entryFile: string,
+  options?: { clearLegacyPromptTemplate?: boolean },
+): Record<string, unknown> {
+  return applyBundleConfig(config, { mode: "managed", rootPath, entryFile, clearLegacyPromptTemplate: options?.clearLegacyPromptTemplate });
+}
+
 function buildPersistedBundleConfig(
   derived: BundleState,
   current: BundleState,
@@ -526,6 +602,8 @@ export type UpdateBundleOptions = {
 export const INSTRUCTION_BUNDLE_COPY_COMPLETED_ACTION = "agent.instructions_bundle_copy_completed";
 export const INSTRUCTION_BUNDLE_COPY_INCOMPLETE = "INSTRUCTION_BUNDLE_COPY_INCOMPLETE";
 export const INSTRUCTION_BUNDLE_NAME_COLLISION = "INSTRUCTION_BUNDLE_NAME_COLLISION";
+/** WS-2 PR-W2, D5(c): import-with-replace on an agent with versioned instructions. */
+export const INSTRUCTION_BUNDLE_REPLACE_UNSUPPORTED = "INSTRUCTION_BUNDLE_REPLACE_UNSUPPORTED";
 const MODE_CHANGED_MESSAGE = "The instructions bundle mode changed; reload and retry";
 const COPY_INTENT_NAME = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.json$/;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
@@ -788,7 +866,8 @@ export function syncInstructionsBundleConfigFromFilePath(
     return next;
   }
   const resolvedPath = resolveLegacyInstructionsPath(instructionsFilePath, adapterConfig);
-  const managedRoot = resolveManagedInstructionsRoot(agent);
+  // WS-2 PR-W2: the same own-area rule as deriveBundleState.
+  const managedRoot = ownManagedRootContaining(agent, resolvedPath) ?? resolveManagedInstructionsRoot(agent);
   const relative = path.relative(managedRoot, resolvedPath);
   const managed = relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative);
   const rootPath = managed ? managedRoot : path.dirname(resolvedPath);
@@ -1210,7 +1289,7 @@ export function agentInstructionsService(db?: Db) {
     if (!db) throw unprocessable("Bundle updates require the database-backed instructions service");
     if (!options?.persist) throw unprocessable("Bundle updates must persist their configuration under the agent lock");
     let ownIntentFile: string | null = null;
-    const result = await db.transaction(async (tx) => {
+    const result: { bundle: AgentInstructionsBundle; adapterConfig: Record<string, unknown> } | { activate: true } = await db.transaction(async (tx) => {
       // Step 1: lock, then recheck what the route authorized (3.2).
       const [current] = await tx.select().from(agents)
         .where(and(eq(agents.id, agent.id), eq(agents.companyId, agent.companyId))).for("no key update");
@@ -1233,6 +1312,10 @@ export function agentInstructionsService(db?: Db) {
         nextRootPath = resolvedRoot;
       }
       await assertInstructionPathSafe(nextRootPath, nextEntryFile);
+      // WS-2 PR-W2: a switch to an empty managed folder activates a new
+      // generation instead of copying into the current one (below, outside
+      // this transaction). A populated managed folder is still adopted here.
+      if (nextMode === "managed" && (await listFilesRecursive(nextRootPath)).length === 0) return { activate: true as const };
       // WS-2 PR-W1: a switch to another root takes the assignment lock and
       // refuses a root that overlaps another agent, before the first folder.
       const configuredRoot = deriveBundleState(current).rootPath;
@@ -1302,7 +1385,52 @@ export function agentInstructionsService(db?: Db) {
         logger.warn({ err: error, intentFile: file }, "instructions bundle copy committed but its copy record was not removed");
       });
     }
+    if ("activate" in result) return switchToNewManagedGeneration(agent, input, options);
     return result;
+  }
+
+  /**
+   * WS-2 PR-W2: updateBundle into an empty managed folder. The planned copy
+   * (the source bundle, else the legacy body) is the overlay of a new
+   * generation that carries the current managed folder's entries forward.
+   */
+  async function switchToNewManagedGeneration(agent: AgentLike, input: UpdateBundleInput, options: UpdateBundleOptions) {
+    const nextEntry = (current: AgentLike) => input.entryFile ? normalizeRelativeFilePath(input.entryFile) : deriveBundleState(current).entryFile;
+    const activated = await instructionActivationService(db!).activate({
+      companyId: agent.companyId,
+      agentId: agent.id,
+      kind: "switch_managed",
+      isInstanceAdmin: options.isInstanceAdmin === true,
+      activity: { actorType: options.actor.actorType, actorId: options.actor.actorId, runId: options.actor.runId ?? null },
+      clearLegacyPromptTemplate: input.clearLegacyPromptTemplate,
+      persist: (tx, current, adapterConfig) => options.persist(tx, current, adapterConfig),
+      identity: async (tx, current) => {
+        // The checks the route authorized against, on every locked read.
+        await assertExpectedTarget(current, options.expectedTarget);
+        if (agentInstructionsBundleMode(current) !== options.expectedConfigMode) throw conflict(MODE_CHANGED_MESSAGE);
+        const state = await recoverManagedBundleState(current, deriveBundleState(current));
+        return { mode: state.mode, rootPath: state.rootPath, entryFile: state.entryFile, nextEntryFile: nextEntry(current) };
+      },
+      plan: async (tx, current) => {
+        const state = await recoverManagedBundleState(current, deriveBundleState(current));
+        const nextEntryFile = nextEntry(current);
+        const managedRoot = resolveManagedInstructionsRoot(current);
+        await assertInstructionPathSafe(managedRoot, nextEntryFile);
+        // Adoption may have projected revision heads into the folder meanwhile.
+        if ((await listFilesRecursive(managedRoot)).length > 0) throw conflict(MODE_CHANGED_MESSAGE);
+        await assertUnversionedEntry(current, nextEntryFile, tx);
+        const plan = await planBundleCopy(state, current, nextEntryFile);
+        const overlay = new Map<string, Buffer | OverlaySource>();
+        for (const file of plan.files) {
+          overlay.set(agentFilePath(file.path), file.bytes ?? {
+            size: file.size, hash: file.hash, read: () => readInstructionCopyBytes(file.source!),
+          });
+        }
+        return { overlay, entryFile: nextEntryFile };
+      },
+    });
+    if (activated.outcome !== "activated") throw new Error("The managed switch did not activate a generation");
+    return { bundle: await getBundle(activated.agent), adapterConfig: activated.adapterConfig };
   }
 
   async function writeFileUnversioned(
@@ -1528,31 +1656,80 @@ export function agentInstructionsService(db?: Db) {
     return { bundle, adapterConfig };
   }
 
+  /**
+   * Initializes the managed bundle with files. WS-2 PR-W2: this activates a new
+   * generation carrying the agent directory forward with files overlaid, except
+   * for replaceExisting (D5(c)): an agent still on the legacy folder keeps the
+   * in-place replacement, and a versioned agent is refused with 409.
+   */
   async function materializeManagedBundle(
-    ...args: Parameters<typeof materializeManagedBundleUnversioned>
-  ) {
+    agent: AgentLike,
+    files: Record<string, string>,
+    options?: {
+      clearLegacyPromptTemplate?: boolean;
+      replaceExisting?: boolean;
+      entryFile?: string;
+      activity?: ActivityActor;
+    },
+  ): Promise<{ bundle: AgentInstructionsBundle; adapterConfig: Record<string, unknown> }> {
     if (!db) throw unprocessable("Bundle initialization requires the database-backed instructions service");
-    return db.transaction(async (tx) => {
-      const agent = args[0];
-      const [owner] = await tx.select({ id: agents.id }).from(agents).where(and(eq(agents.id, agent.id), eq(agents.companyId, agent.companyId))).for("no key update");
-      if (!owner) throw notFound("Agent not found");
-      // WS-2 PR-W1: the first bind of the managed root is a root activation.
-      const managedRoot = resolveManagedInstructionsRoot(agent);
-      const configuredRoot = deriveBundleState(agent).rootPath;
-      if (!configuredRoot || path.resolve(configuredRoot) !== managedRoot) {
-        await assertExclusiveRoot(tx, agent, managedRoot, { isInstanceAdmin: false });
-      }
-      await assertUnversionedEntry(agent, args[2]?.entryFile ? normalizeRelativeFilePath(args[2].entryFile) : ENTRY_FILE_DEFAULT, tx);
-      if (args[2]?.replaceExisting) {
+    const entryFile = options?.entryFile ? normalizeRelativeFilePath(options.entryFile) : ENTRY_FILE_DEFAULT;
+    if (options?.replaceExisting) {
+      return db.transaction(async (tx) => {
+        const [owner] = await tx.select().from(agents).where(and(eq(agents.id, agent.id), eq(agents.companyId, agent.companyId))).for("no key update");
+        if (!owner) throw notFound("Agent not found");
+        if (owner.instructionBundleId) {
+          throw conflict("Replacing the instructions of an agent with versioned instructions is not supported yet. Nothing was changed.", {
+            code: INSTRUCTION_BUNDLE_REPLACE_UNSUPPORTED,
+          });
+        }
+        // Legacy folder: the base in-place behavior, unchanged.
+        // WS-2 PR-W1: the first bind of the managed root is a root activation.
+        const managedRoot = resolveManagedInstructionsRoot(agent);
+        const configuredRoot = deriveBundleState(agent).rootPath;
+        if (!configuredRoot || path.resolve(configuredRoot) !== managedRoot) {
+          await assertExclusiveRoot(tx, agent, managedRoot, { isInstanceAdmin: false });
+        }
+        await assertUnversionedEntry(agent, entryFile, tx);
         const [existingHead] = await tx.select({ id: agentInstructionHeads.revisionId }).from(agentInstructionHeads)
           .where(and(eq(agentInstructionHeads.companyId, agent.companyId), eq(agentInstructionHeads.agentId, agent.id))).limit(1);
         if (existingHead) throw unprocessable("Replacing this bundle would remove a versioned entry. Use canonical content commits.", { code: "INSTRUCTION_REVISION_REQUIRED" });
-      }
-      return materializeManagedBundleUnversioned(...args);
+        return materializeManagedBundleUnversioned(agent, files, options);
+      });
+    }
+    const overlay = new Map<string, Buffer>();
+    for (const [relativePath, content] of Object.entries(files)) {
+      overlay.set(agentFilePath(normalizeRelativeFilePath(relativePath)), instructionBytes(content));
+    }
+    if (!overlay.has(entryFile)) overlay.set(entryFile, Buffer.alloc(0));
+    const result = await instructionActivationService(db).activate({
+      companyId: agent.companyId,
+      agentId: agent.id,
+      kind: "materialize",
+      isInstanceAdmin: false,
+      activity: options?.activity ?? { actorType: "system", actorId: "instructions-materialize" },
+      clearLegacyPromptTemplate: options?.clearLegacyPromptTemplate,
+      identity: async (tx, locked) => {
+        await assertUnversionedEntry(locked, entryFile, tx);
+        return { entryFile };
+      },
+      plan: async (_tx, locked) => {
+        const previous = await readInstructionBytes(resolveManagedInstructionsRoot(locked), entryFile);
+        if (previous && !previous.equals(overlay.get(entryFile)!)) {
+          throw unprocessable("Existing entry content must be saved through the canonical revision API before replacing a bundle", { code: "INSTRUCTION_REVISION_REQUIRED" });
+        }
+        return { overlay, entryFile };
+      },
     });
+    if (result.outcome !== "activated") throw new Error("Materialization did not activate a generation");
+    const bundle = await getBundle(result.agent);
+    return { bundle, adapterConfig: result.adapterConfig };
   }
 
   return {
+    /** Refuses (422 INSTRUCTION_REVISION_REQUIRED) a path that has revision history. */
+    assertUnversionedPath: (agent: AgentLike, relativePath: string, connection: InstructionTx) =>
+      assertUnversionedEntry(agent, normalizeRelativeFilePath(relativePath), connection),
     getBundle,
     readFile,
     updateBundle,

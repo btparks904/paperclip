@@ -1,5 +1,4 @@
-import { agentDirectoryWorkingCopyService, isAgentDirectoryCopy } from "./agent-directory-working-copies.js";
-import { AGENT_FILES_ENTRY_CONFLICT } from "./agent-file-store.js";
+import { agentDirectoryTerminalConflict, agentDirectoryWorkingCopyService, isAgentDirectoryCopy } from "./agent-directory-working-copies.js";
 import { createHash } from "node:crypto";
 import { execFile as execFileCallback } from "node:child_process";
 import { promisify } from "node:util";
@@ -21,8 +20,6 @@ import { hasNativeLocalProcessStop } from "./native-local-process-stop.js";
 import { remoteExecutionHasStopped } from "./remote-execution-termination.js";
 import type { AuthorizationActor } from "./authorization.js";
 import type { EnvironmentRuntimeService } from "./environment-runtime.js";
-// Same bounded text that the directory lifecycle records for this rejection.
-const ENTRY_CONFLICT_MESSAGE = "The instruction entry changed after this run's copy was prepared. This run's agent-folder changes were rejected and not saved; the temporary copy is discarded.";
 
 const execFile = promisify(execFileCallback);
 type Copy = typeof copies.$inferSelect;
@@ -119,16 +116,23 @@ export function agentInstructionWorkingCopyService(db: Db, options: { environmen
     if (!agent) throw notFound("Agent not found");
     if (agentInstructionsBundleMode(agent) !== "managed") return null;
     const bound = await resolveInstructionActor(db, { type: "agent", companyId: input.companyId, agentId: input.agentId, runId: input.runId });
-    const baseline = existing?.baseRevisionId && !refreshStoppedCopy
-      ? await revisions.readRevision({ companyId: input.companyId, agentId: input.agentId, entryFile: existing.entryFile, revisionId: existing.baseRevisionId }, bound).catch(async (error) => {
+    // WS-2 PR-W2: a fresh baseline, its generation and the exported files come
+    // from one locked read. An interrupted preparation keeps the generation it
+    // recorded with its baseline.
+    const resumed = existing?.baseRevisionId && !refreshStoppedCopy;
+    const locked = resumed ? null : await revisions.readCurrentForCopy({ companyId: input.companyId, agentId: input.agentId }, bound,
+      (current) => agentInstructionsService().exportFiles(current, { rejectSymlinks: true }));
+    const baseline = resumed
+      ? await revisions.readRevision({ companyId: input.companyId, agentId: input.agentId, entryFile: existing.entryFile, revisionId: existing.baseRevisionId! }, bound).catch(async (error) => {
           if ((error as { status?: number }).status !== 404) throw error;
           const current = await revisions.readCurrent({ companyId: input.companyId, agentId: input.agentId }, bound);
           if (current?.revision.id !== existing.baseRevisionId) throw conflict("The instruction baseline changed during preparation");
           return current;
         })
-      : await revisions.readCurrent({ companyId: input.companyId, agentId: input.agentId }, bound);
+      : locked!.snapshot;
     if (!baseline) return null;
-    const exported = await agentInstructionsService().exportFiles(agent, { rejectSymlinks: true });
+    const generation = resumed ? existing.instructionBundleId ?? null : locked!.generation;
+    const exported = locked?.exported ?? await agentInstructionsService().exportFiles(agent, { rejectSymlinks: true });
     const entryFile = instructionPath(baseline?.revision.entryFile ?? exported.entryFile);
     const content = instructionBytes(baseline?.content ?? exported.files[entryFile] ?? "");
     const localRoot = existing?.localRoot ?? expectedLocalRoot;
@@ -141,7 +145,7 @@ export function agentInstructionWorkingCopyService(db: Db, options: { environmen
         runId: input.runId, companyId: input.companyId, agentId: input.agentId,
         responsibleUserId: bound.onBehalfOfUserId!, entryFile,
         baseRevisionId: baseline?.revision.id ?? null, baseHash: hash(content),
-        localRoot, executionRoot, location, state: "preparing",
+        localRoot, executionRoot, location, state: "preparing", instructionBundleId: generation,
       });
     }
     const row = (await get(input.companyId, input.runId))!;
@@ -172,7 +176,7 @@ export function agentInstructionWorkingCopyService(db: Db, options: { environmen
     // remote staging step succeeds. Keep its receipt and stop evidence intact
     // if preparation throws or the controller stops midway through staging.
     const prepared = await patch(row, { state: "prepared", ...(refreshStoppedCopy ? {
-      entryFile, baseRevisionId: baseline.revision.id, baseHash: hash(content),
+      entryFile, baseRevisionId: baseline.revision.id, baseHash: hash(content), instructionBundleId: generation,
       candidateBase64: null, candidateHash: null, receipt: null, processStoppedAt: null,
       attempts: 0, nextAttemptAt: null, errorCode: null, errorMessage: null,
     } : {}) });
@@ -234,7 +238,8 @@ export function agentInstructionWorkingCopyService(db: Db, options: { environmen
       const receipt = await revisions.commit({
         companyId: row.companyId, agentId: row.agentId, entryFile: row.entryFile,
         baseRevisionId: row.baseRevisionId, content: Buffer.from(row.candidateBase64, "base64"), source: "cleanup",
-      }, actorFor(row));
+      // WS-2 PR-W2: a candidate from another generation is preserved as a conflict.
+      }, actorFor(row), { expectedGeneration: row.instructionBundleId ?? null });
       return patch(row, { state: "saved", receipt: { ...receipt }, errorCode: null, errorMessage: null, nextAttemptAt: null });
     } catch (error) {
       const detail = error as { status?: number; details?: { code?: string }; message?: string };
@@ -319,9 +324,9 @@ export function agentInstructionWorkingCopyService(db: Db, options: { environmen
       } else if (row.location !== "local" && await remoteExecutionHasStopped(db, row.companyId, row.runId)) {
         // Keep a recorded stale-entry rejection as the copy's final outcome. The
         // receipt marker survives transitions that replace the visible code.
-        const entryConflict = row.errorCode === AGENT_FILES_ENTRY_CONFLICT || row.receipt?.checkpointState === "conflict";
+        const terminal = agentDirectoryTerminalConflict(row);
         const unavailable = row.receipt?.warm === true
-          ? await patch(row, entryConflict ? { state: "unavailable", errorCode: AGENT_FILES_ENTRY_CONFLICT, errorMessage: ENTRY_CONFLICT_MESSAGE, nextAttemptAt: null } : { state: "unavailable", errorCode: "AGENT_FILES_FINAL_COLLECTION_UNAVAILABLE",
+          ? await patch(row, terminal ? { state: "unavailable", errorCode: terminal.code, errorMessage: terminal.message, nextAttemptAt: null } : { state: "unavailable", errorCode: "AGENT_FILES_FINAL_COLLECTION_UNAVAILABLE",
             errorMessage: "The last completed checkpoint remains saved. Files changed afterwards could not be collected after remote termination.", nextAttemptAt: null })
           : await reportUnavailable(row.companyId, row.runId);
         if (unavailable && isAgentDirectoryCopy(unavailable)) {

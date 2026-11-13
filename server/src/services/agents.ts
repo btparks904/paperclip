@@ -157,10 +157,11 @@ interface UpdateAgentOptions {
  * the instructions service reads it (explicit root, else a legacy file path).
  */
 function configuredInstructionRoot(
-  agent: { id: string; companyId: string; name: string },
+  agent: { id: string; companyId: string; name: string; instructionBundleId?: string | null },
   adapterConfig: Record<string, unknown>,
 ): string | null {
-  const root = deriveBundleState({ id: agent.id, companyId: agent.companyId, name: agent.name, adapterConfig }).rootPath;
+  const root = deriveBundleState({ id: agent.id, companyId: agent.companyId, name: agent.name, adapterConfig,
+    instructionBundleId: agent.instructionBundleId ?? null }).rootPath;
   return root ? path.resolve(root) : null;
 }
 

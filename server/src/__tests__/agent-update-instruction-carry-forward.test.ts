@@ -19,6 +19,7 @@ import {
   companySecrets, createDb, plugins, principalPermissionGrants, type Db,
 } from "@paperclipai/db";
 import { deriveBundleState, resolveManagedInstructionsRoot } from "../services/agent-instructions.js";
+import { instructionActivationTestHooks } from "../services/instruction-generation-activation.js";
 import { agentService } from "../services/agents.js";
 import { companySkillService } from "../services/company-skills.js";
 import { builtInAgentService } from "../services/built-in-agents.js";
@@ -274,7 +275,10 @@ describe("updateAgent carries instruction settings forward from the locked row",
         adapterConfig: { model: "gpt-5.4" }, runtimeConfig: {}, permissions: {} });
       const state = await builtInAgentService(db).ensure(companyId, "reflection-coach");
       const final = await configOf(state.agent!.id);
-      const managed = resolveManagedInstructionsRoot({ companyId, id: state.agent!.id, name: "x", adapterConfig: {} });
+      // The install activates a versioned generation (WS-2 PR-W2): reload the row to resolve it.
+      const installed = await loadAgent(state.agent!.id);
+      expect(installed.instructionBundleId).toBeTruthy();
+      const managed = resolveManagedInstructionsRoot(installed);
       char("R-R3 W-10 built-in install", { final: JSON.parse(JSON.stringify(keysOf(final)).split(state.agent!.id).join("<BUILTIN>")) });
       expect(keysOf(final)).toMatchObject({ instructionsBundleMode: "managed", instructionsRootPath: managed, instructionsEntryFile: "AGENTS.md" });
     }, 30_000);
@@ -522,7 +526,11 @@ describe("updateAgent carries instruction settings forward from the locked row",
   describe("F-1: stale reset writers (W-10, W-13, W-14)", () => {
     const STOCK = { "notes/one.md": "STOCK-ONE\n", "notes/two.md": "STOCK-TWO\n", "notes/three.md": "STOCK-THREE\n" };
     const PLUGIN_ENTRY = "PLUGIN-STOCK-ENTRY\n";
-    afterEach(() => { vi.restoreAllMocks(); updateHooks.before.clear(); });
+    afterEach(() => {
+      vi.restoreAllMocks(); updateHooks.before.clear();
+      delete instructionActivationTestHooks.duringStaging; delete instructionActivationTestHooks.afterStaging;
+    });
+    const generationOf = async (id: string) => (await loadAgent(id)).instructionBundleId ?? null;
 
     /** Every file under a root with its content, or null when the root does not exist. */
     async function filesUnder(root: string): Promise<Record<string, string> | null> {
@@ -556,29 +564,20 @@ describe("updateAgent carries instruction settings forward from the locked row",
       const [row] = await tx.select().from(agents).where(eq(agents.id, id)).for("update");
       await tx.update(agents).set({ adapterConfig: withKeys(row!.adapterConfig as Config, keys) }).where(eq(agents.id, id));
     });
-    /** Queue a switch behind a lock the caller holds, and return once it is waiting. */
-    async function queueSwitch(id: string, keys: Config) {
-      const done = commitSwitch(id, keys);
-      for (let i = 0; i < 200; i += 1) {
-        const rows = await db.execute(sql`select count(*)::int as n from pg_stat_activity
-          where datname = current_database() and wait_event_type = 'Lock'`);
-        const n = Number((rows as unknown as Array<{ n: number }>)[0]?.n ?? (rows as any).rows?.[0]?.n ?? 0);
-        if (n > 0) return { done, waited: true };
-        await sleep(25);
-      }
-      return { done, waited: false };
-    }
-    /** After the real write of `file` under `root`, queue a switch while the write still holds the row lock. */
-    function switchAfterWrite(root: string, file: string, id: () => string, keys: () => Config) {
-      const realWrite = fs.writeFile.bind(fs);
-      const state: { queued?: Promise<{ done: Promise<void>; waited: boolean }> } = {};
-      vi.spyOn(fs, "writeFile").mockImplementation((async (target: any, data: any, options?: any) => {
-        await realWrite(target, data, options);
-        if (!state.queued && String(target) === path.join(root, file)) {
-          state.queued = queueSwitch(id(), keys());
-          await state.queued;
-        }
-      }) as typeof fs.writeFile);
+    /**
+     * WS-2 PR-W2: a reset stages a new generation outside the row lock and
+     * activates it in one locked transaction, so there is no per-file write
+     * loop to interrupt. Commit a switch at a staging point instead: while the
+     * staged folder is being written, or after staging and before activation.
+     */
+    function switchDuringActivation(phase: "duringStaging" | "afterStaging", id: () => string, keys: () => Config) {
+      const state: { staged?: string; committed: boolean } = { committed: false };
+      instructionActivationTestHooks[phase] = async ({ stagingRoot }: { stagingRoot: string }) => {
+        delete instructionActivationTestHooks[phase];
+        state.staged = stagingRoot;
+        await commitSwitch(id(), keys());
+        state.committed = true;
+      };
       return state;
     }
 
@@ -598,7 +597,8 @@ describe("updateAgent carries instruction settings forward from the locked row",
         undefined, { manifest });
       const created = await services.agents.managedReconcile({ companyId, agentKey: "carry" });
       const id = created.agentId!;
-      const managed = resolveManagedInstructionsRoot({ companyId, id, name: "x", adapterConfig: {} });
+      // Reconcile activates a versioned generation (WS-2 PR-W2): reload the row to resolve the active root.
+      const managed = resolveManagedInstructionsRoot(await loadAgent(id));
       const ext = path.join(home, "ext-b", id);
       await fs.mkdir(ext, { recursive: true });
       await fs.writeFile(path.join(ext, "MAIN.md"), "B-ENTRY\n");
@@ -611,47 +611,54 @@ describe("updateAgent carries instruction settings forward from the locked row",
     const outcome = (value: Promise<unknown>) => value.then((r: any) => ({ ok: true, status: r?.status ?? null }),
       (e: any) => ({ ok: false, status: e?.status ?? null, code: e?.details?.code ?? null, message: String(e?.message ?? e) }));
 
-    it("W-13 mid-loop: a switch committed during the stock file writes stops the remaining writes; nothing reaches root B", async () => {
+    it("W-13 mid-staging: a switch committed while the generation is staged refuses activation; nothing reaches root A or B", async () => {
       const agent = await seedPluginAgent();
+      const generation = await generationOf(agent.id);
       const before = await effects(agent.id, { A: agent.managed, B: agent.ext });
-      const hook = switchAfterWrite(agent.managed, "notes/one.md", () => agent.id, agent.stateExt);
+      const hook = switchDuringActivation("duringStaging", () => agent.id, agent.stateExt);
       const result = await outcome(agent.reset());
-      const queued = await hook.queued!;
-      await queued.done;
       const after = await effects(agent.id, { A: agent.managed, B: agent.ext });
-      char("F-1 W-13 mid-loop", { result, waited: queued.waited, before: norm(before), after: norm(after) });
-      expect(queued.waited).toBe(true);
-      expect(result.ok).toBe(false);
-      expect(result.status).toBe(409);
+      char("F-1 W-13 mid-staging", { result, committed: hook.committed, before: norm(before), after: norm(after) });
+      expect(hook.committed).toBe(true);
+      // The locked recheck reruns the reset's identity on the switched row; an external bundle is refused there.
+      expect(result).toMatchObject({ ok: false, status: 422, code: "INSTRUCTION_MANAGED_BUNDLE_REQUIRED" });
       expect(after.keys).toEqual(agent.stateExt());
       expect(after.files.B).toEqual(before.files.B);
       expect(after.configRevisions).toBe(before.configRevisions);
-      // Residual (WS-2): the entry reset and the first stock write stay in root A.
-      expect(after.files.A).toMatchObject({ "AGENTS.md": PLUGIN_ENTRY, "notes/one.md": STOCK["notes/one.md"],
-        "notes/two.md": "USER-EDIT\n", "notes/three.md": "USER-EDIT\n" });
+      expect(after.instructionRevisions).toBe(before.instructionRevisions);
+      expect(after.activity).toBe(before.activity);
+      // No partial activation: the active generation and root A are unchanged; the staged folder is retained, not active.
+      expect(await generationOf(agent.id)).toBe(generation);
+      expect(after.files.A).toEqual(before.files.A);
+      expect(hook.staged).toBeTruthy();
+      expect(hook.staged).not.toBe(agent.managed);
     }, 30_000);
 
-    it("W-13 mid-loop, same-root entry-only switch: the remaining stock files still land in the active root, then the update refuses (residual)", async () => {
+    it("W-13 after staging, same-root entry-only switch: activation refuses and no stock file lands in the active root", async () => {
       const agent = await seedPluginAgent();
       await fs.writeFile(path.join(agent.managed, "OTHER.md"), "OTHER-ENTRY\n");
       const entrySwitch = () => cfg("managed", agent.managed, "OTHER.md");
+      const generation = await generationOf(agent.id);
       const before = await effects(agent.id, { A: agent.managed });
-      const hook = switchAfterWrite(agent.managed, "notes/one.md", () => agent.id, entrySwitch);
+      const hook = switchDuringActivation("afterStaging", () => agent.id, entrySwitch);
       const result = await outcome(agent.reset());
-      const queued = await hook.queued!;
-      await queued.done;
       const after = await effects(agent.id, { A: agent.managed });
-      char("F-1 W-13 mid-loop entry-only", { result, waited: queued.waited, before: norm(before), after: norm(after) });
-      expect(queued.waited).toBe(true);
-      expect(result).toMatchObject({ ok: false, status: 409, code: CONFIG_CHANGED });
+      char("F-1 W-13 after staging entry-only", { result, committed: hook.committed, before: norm(before), after: norm(after) });
+      expect(hook.committed).toBe(true);
+      expect(result).toMatchObject({ ok: false, status: 409, code: "INSTRUCTION_GENERATION_CHANGED" });
       expect(after.keys).toEqual(entrySwitch());
       expect(after.configRevisions).toBe(before.configRevisions);
-      // Residual (WS-2): same root, so the target guard does not trip; the rest of the stock files land in the active root.
-      expect(after.files.A).toMatchObject({ ...STOCK, "OTHER.md": "OTHER-ENTRY\n" });
+      expect(after.instructionRevisions).toBe(before.instructionRevisions);
+      expect(after.activity).toBe(before.activity);
+      // The former residual (stock files landing in the active root) is closed for supported writers.
+      expect(await generationOf(agent.id)).toBe(generation);
+      expect(after.files.A).toEqual(before.files.A);
+      expect((after.files.A as Record<string, string>)["notes/one.md"]).toBe("USER-EDIT\n");
     }, 30_000);
 
     it("W-13 after the loop: a switch committed before the final update gives 409 AGENT_CONFIG_CHANGED and keeps root B", async () => {
       const agent = await seedPluginAgent();
+      const generation = await generationOf(agent.id);
       const before = await effects(agent.id, { A: agent.managed, B: agent.ext });
       updateHooks.before.set(":managed-agent-instructions", () => commitSwitch(agent.id, agent.stateExt()));
       const result = await outcome(agent.reset());
@@ -661,6 +668,9 @@ describe("updateAgent carries instruction settings forward from the locked row",
       expect(after.keys).toEqual(agent.stateExt());
       expect(after.files.B).toEqual(before.files.B);
       expect(after.configRevisions).toBe(before.configRevisions);
+      // The switch landed after the atomic activation: a new generation is recorded, the earlier one is retained untouched.
+      expect(await generationOf(agent.id)).not.toBe(generation);
+      expect(after.files.A).toEqual(before.files.A);
     }, 30_000);
 
     for (const variant of ["root switch", "agentsMdPath added (missing to present)"] as const) {
@@ -687,13 +697,22 @@ describe("updateAgent carries instruction settings forward from the locked row",
 
     it("W-13 and W-14 without a concurrent switch: the reset succeeds and writes every stock file into root A", async () => {
       const agent = await seedPluginAgent();
+      const generation = await generationOf(agent.id);
+      const before = await effects(agent.id, { A: agent.managed });
       const result = await outcome(agent.reset());
-      const after = await effects(agent.id, { A: agent.managed, B: agent.ext });
+      // The reset activates a new generation (WS-2 PR-W2); reload the row to resolve its root.
+      const activated = await loadAgent(agent.id);
+      expect(activated.instructionBundleId).toBeTruthy();
+      expect(activated.instructionBundleId).not.toBe(generation);
+      const rootY = resolveManagedInstructionsRoot(activated);
+      const after = await effects(agent.id, { A: agent.managed, Y: rootY, B: agent.ext });
       char("F-1 plugin reset success", { result, after: norm(after) });
       expect(result).toMatchObject({ ok: true, status: "reset" });
-      expect(after.keys).toMatchObject({ instructionsBundleMode: "managed", instructionsRootPath: agent.managed, instructionsEntryFile: "AGENTS.md" });
-      for (const [file, content] of Object.entries(STOCK)) expect((after.files.A as Record<string, string>)[file]).toBe(content);
-      expect((after.files.A as Record<string, string>)["AGENTS.md"]).toBe(PLUGIN_ENTRY);
+      expect(after.keys).toMatchObject({ instructionsBundleMode: "managed", instructionsRootPath: rootY, instructionsEntryFile: "AGENTS.md" });
+      for (const [file, content] of Object.entries(STOCK)) expect((after.files.Y as Record<string, string>)[file]).toBe(content);
+      expect((after.files.Y as Record<string, string>)["AGENTS.md"]).toBe(PLUGIN_ENTRY);
+      // The previous generation is retained unchanged.
+      expect(after.files.A).toEqual(before.files.A);
     }, 30_000);
 
     const operator = { type: "board", userId: "local-board", source: "local_implicit" } as const;
@@ -703,7 +722,7 @@ describe("updateAgent carries instruction settings forward from the locked row",
       const builtIns = builtInAgentService(db);
       const state = await builtIns.ensure(companyId, "reflection-coach");
       const id = state.agent!.id;
-      const managed = resolveManagedInstructionsRoot({ companyId, id, name: "x", adapterConfig: {} });
+      const managed = resolveManagedInstructionsRoot(await loadAgent(id));
       const ext = path.join(home, "ext-b", id);
       await fs.mkdir(ext, { recursive: true });
       await fs.writeFile(path.join(ext, "MAIN.md"), "B-ENTRY\n");
@@ -728,13 +747,20 @@ describe("updateAgent carries instruction settings forward from the locked row",
 
     it("W-10 without a concurrent switch: the reset succeeds and restores the stock entry", async () => {
       const agent = await seedBuiltIn();
+      const generation = await generationOf(agent.id);
       const result = await outcome(agent.reset());
-      const after = await effects(agent.id, { A: agent.managed });
+      // The reset activates a new generation (WS-2 PR-W2); reload the row to resolve its root.
+      const activated = await loadAgent(agent.id);
+      expect(activated.instructionBundleId).toBeTruthy();
+      expect(activated.instructionBundleId).not.toBe(generation);
+      const rootY = resolveManagedInstructionsRoot(activated);
+      const after = await effects(agent.id, { A: rootY, previous: agent.managed });
       char("F-1 W-10 reset success", { result: { ok: result.ok }, keys: JSON.parse(JSON.stringify(norm(after.keys)).split(agent.id).join("<BUILTIN>")),
         entryRestored: (after.files.A as Record<string, string>)["AGENTS.md"] !== "USER-EDIT\n" });
       expect(result.ok).toBe(true);
-      expect(after.keys).toMatchObject({ instructionsBundleMode: "managed", instructionsRootPath: agent.managed });
+      expect(after.keys).toMatchObject({ instructionsBundleMode: "managed", instructionsRootPath: rootY });
       expect((after.files.A as Record<string, string>)["AGENTS.md"]).not.toBe("USER-EDIT\n");
+      expect((after.files.previous as Record<string, string>)["AGENTS.md"]).toBe("USER-EDIT\n");
     }, 30_000);
   });
 

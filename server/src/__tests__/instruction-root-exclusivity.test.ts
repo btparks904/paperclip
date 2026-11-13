@@ -1286,7 +1286,6 @@ describe("WS-2 PR-W1: exclusive instruction roots", () => {
       async (order) => {
         const { actorId, targetId } = await seedPair();
         const actor = (await loadAgent(actorId))!;
-        const actorManaged = managedOf(actorId);
         const materializeAndPersist = async () => {
           const materialized = await agentInstructionsService(db).materializeManagedBundle(actor, { "AGENTS.md": ENTRY },
             { entryFile: "AGENTS.md", replaceExisting: false });
@@ -1296,6 +1295,11 @@ describe("WS-2 PR-W1: exclusive instruction roots", () => {
         const { first, second } = await race(order, () => actorSave(actorId, targetId), materializeAndPersist);
         expect(first, JSON.stringify(first)).toMatchObject({ ok: true });
         expect(second, JSON.stringify(second)).toMatchObject({ ok: true });
+        // WS-2 PR-W2: materialize activates a versioned generation inside A's own managed area; reload A to resolve it.
+        const activated = (await loadAgent(actorId))!;
+        expect(activated.instructionBundleId).toBeTruthy();
+        const actorManaged = resolveManagedInstructionsRoot(activated);
+        expect(actorManaged).toBe(path.join(path.dirname(managedOf(actorId)), "instruction-versions", activated.instructionBundleId!));
         expect((await configOf(actorId)).instructionsRootPath).toBe(actorManaged);
         expect((await configOf(actorId)).instructionsBundleMode).toBe("managed");
         expect(await fs.readFile(path.join(actorManaged, "AGENTS.md"), "utf8")).toBe(ENTRY);

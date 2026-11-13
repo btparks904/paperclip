@@ -28,6 +28,10 @@ export const agents = pgTable(
     capabilities: text("capabilities"),
     adapterType: text("adapter_type").notNull().default("process"),
     adapterConfig: jsonb("adapter_config").$type<Record<string, unknown>>().notNull().default({}),
+    /** WS-2 PR-W2: the active managed instruction generation. Null selects the
+     * legacy <area>/instructions folder; a value selects
+     * <area>/instruction-versions/<id>. Set only by a generation activation. */
+    instructionBundleId: uuid("instruction_bundle_id"),
     runtimeConfig: jsonb("runtime_config").$type<Record<string, unknown>>().notNull().default({}),
     defaultEnvironmentId: uuid("default_environment_id").references(() => environments.id, { onDelete: "set null" }),
     budgetMonthlyCents: integer("budget_monthly_cents").notNull().default(0),
