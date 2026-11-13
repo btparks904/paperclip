@@ -3,8 +3,26 @@ import path from "node:path";
 import { describe, expect, it } from "vitest";
 
 const repositoryRoot = path.resolve(import.meta.dirname, "../..");
-// PR #13470 uses the code-owner-reviewed default branch for this first-party workflow.
-const ordinaryPrTrustedWorkflowRevision = "master";
+// Sunspark fork: the ordinary PR caller pins the upstream trusted workflow to
+// the v2026.1005.0 release commit that this fork is built from (its
+// pr-trusted.yml is byte-identical to this tree's copy). Only this exact
+// repository, workflow path and full commit SHA is accepted.
+const ordinaryPrTrustedWorkflowRepositoryPath =
+  "paperclipai/paperclip/.github/workflows/pr-trusted.yml";
+const ordinaryPrTrustedWorkflowRevision = "467125fafb47a8520856504fecc48d6e32055db1";
+const ordinaryPrTrustedWorkflowCall =
+  `${ordinaryPrTrustedWorkflowRepositoryPath}@${ordinaryPrTrustedWorkflowRevision}`;
+
+function workflowUsesValues(workflow: string): string[] {
+  return [...workflow.matchAll(/^\s*(?:-\s*)?uses:\s*(.*?)\s*$/gmu)].map(
+    (match) => match[1] ?? "",
+  );
+}
+
+function isPinnedOrdinaryPrCaller(workflow: string): boolean {
+  const calls = workflowUsesValues(workflow);
+  return calls.length === 1 && calls[0] === ordinaryPrTrustedWorkflowCall;
+}
 const fullStackTestNeeds =
   /needs:\s*\[\s*authorize,\s*target_lock,\s*catalog,\s*daytona_image,\s*build_runner_artifacts,\s*build_remote_provider_pack,?\s*\]/u;
 const buildRunnerNeeds =
@@ -30,7 +48,7 @@ describe("public repository paid workflow security", () => {
     expect(manual).toContain('docker logout ghcr.io');
   });
 
-  it("uses the reviewed master branch for the first-party trusted PR workflow", async () => {
+  it("pins the first-party trusted PR workflow to the exact upstream release commit", async () => {
     const ordinaryPrWorkflow = await readFile(
       path.join(repositoryRoot, ".github/workflows/pr.yml"),
       "utf8",
@@ -48,6 +66,53 @@ describe("public repository paid workflow security", () => {
     expect(trustedWorkflowCalls[0]?.[2]).toBe(
       ordinaryPrTrustedWorkflowRevision,
     );
+    expect(ordinaryPrTrustedWorkflowRevision).toMatch(/^[0-9a-f]{40}$/u);
+    expect(workflowUsesValues(ordinaryPrWorkflow)).toEqual([
+      ordinaryPrTrustedWorkflowCall,
+    ]);
+    expect(isPinnedOrdinaryPrCaller(ordinaryPrWorkflow)).toBe(true);
+  });
+
+  it("rejects any ordinary PR caller other than the exact pinned upstream workflow", async () => {
+    const ordinaryPrWorkflow = await readFile(
+      path.join(repositoryRoot, ".github/workflows/pr.yml"),
+      "utf8",
+    );
+    const pinnedLine = `uses: ${ordinaryPrTrustedWorkflowCall}`;
+    expect(ordinaryPrWorkflow.split(pinnedLine)).toHaveLength(2);
+    const withUses = (value: string) =>
+      ordinaryPrWorkflow.replace(pinnedLine, `uses: ${value}`);
+    const workflowPath = ordinaryPrTrustedWorkflowRepositoryPath;
+    const rejected: Record<string, string> = {
+      "branch ref": `${workflowPath}@master`,
+      "qualified branch ref": `${workflowPath}@refs/heads/master`,
+      "tag ref": `${workflowPath}@v2026.1005.0`,
+      "short SHA": `${workflowPath}@467125fa`,
+      "other full SHA": `${workflowPath}@334b2ae066953e293d40571cd3e205dcf916a731`,
+      "uppercase SHA": `${workflowPath}@467125FAFB47A8520856504FECC48D6E32055DB1`,
+      "alternate repository":
+        "btparks904/paperclip/.github/workflows/pr-trusted.yml@467125fafb47a8520856504fecc48d6e32055db1",
+      "look-alike repository":
+        "paperclipai/paperclip-fork/.github/workflows/pr-trusted.yml@467125fafb47a8520856504fecc48d6e32055db1",
+      "other workflow path":
+        "paperclipai/paperclip/.github/workflows/pr.yml@467125fafb47a8520856504fecc48d6e32055db1",
+      "local invocation": "./.github/workflows/pr-trusted.yml",
+      "quoted value": `"${ordinaryPrTrustedWorkflowCall}"`,
+      "trailing text": `${ordinaryPrTrustedWorkflowCall} # master`,
+    };
+    for (const [label, value] of Object.entries(rejected)) {
+      expect(isPinnedOrdinaryPrCaller(withUses(value)), label).toBe(false);
+    }
+    expect(
+      isPinnedOrdinaryPrCaller(
+        `${ordinaryPrWorkflow}  other:\n    uses: ./.github/workflows/pr-trusted.yml\n`,
+      ),
+      "a second workflow call",
+    ).toBe(false);
+    expect(
+      isPinnedOrdinaryPrCaller(ordinaryPrWorkflow.replace(pinnedLine, "")),
+      "no workflow call",
+    ).toBe(false);
   });
 
   it("keeps pnpm bootstrap registry telemetry out of trusted workflow setup", async () => {
