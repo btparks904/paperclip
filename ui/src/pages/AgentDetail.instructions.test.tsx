@@ -22,6 +22,7 @@ const mockAgentsApi = vi.hoisted(() => ({
   resolveInstructionCandidate: vi.fn(),
   instructionDiff: vi.fn(),
   restoreInstructions: vi.fn(),
+  downloadInstructionsFile: vi.fn(),
 }));
 
 const markdownEditorRenderMock = vi.hoisted(() => vi.fn());
@@ -1058,6 +1059,120 @@ describe("PromptsTab raw instruction editor", () => {
     saveButton("Save raw edit").click();
     for (let i = 0; i < 5; i++) await flushReact();
     expect(mockAgentsApi.saveInstructionsFile).toHaveBeenCalledTimes(1);
+  });
+
+  const binaryRefetch = async () => {
+    // Another writer stores a NUL byte; a focus refetch returns binary metadata.
+    await act(async () => { queryClient.setQueryData(queryKeys.agents.instructionsFile("agent-1", "AGENTS.md"), entryDetail("# Sentinel binary\u0000\n", { binary: true })); });
+    for (let i = 0; i < 3; i++) await flushReact();
+  };
+  const binaryView = () => container.textContent?.includes("Download it to view its contents") ?? false;
+
+  it("keeps a raw draft and expected hash when a refetch reports the file as binary, with no PUT", async () => {
+    await renderRaw(entryDetail(ORIGINAL));
+    await enter("Verified installation");
+    await typeDraft(PROPOSED);
+    await typeExpected(sha(PROPOSED));
+    await waitFor(() => expect(saveButton("Save verified installation").disabled).toBe(false));
+    const editorBefore = rawEditor();
+    await binaryRefetch();
+    expect(binaryView()).toBe(false);
+    // Same keyed instance, not a remount with a new session.
+    expect(rawEditor()).toBe(editorBefore);
+    expect(rawEditor()?.value).toBe(PROPOSED);
+    expect(expectedInput()?.value).toBe(sha(PROPOSED));
+    expect(saveButton("Save verified installation").disabled).toBe(true);
+    saveButton("Save verified installation").click();
+    for (let i = 0; i < 3; i++) await flushReact();
+    expect(mockAgentsApi.saveInstructionsFile).not.toHaveBeenCalled();
+  });
+
+  it("keeps the unknown-outcome state and its no-retry guard when a refetch reports the file as binary", async () => {
+    await renderRaw(entryDetail(ORIGINAL));
+    await enter("Edit raw");
+    await typeDraft(PROPOSED);
+    await waitFor(() => expect(saveButton("Save raw edit").disabled).toBe(false));
+    mockAgentsApi.saveInstructionsFile.mockRejectedValue(new TypeError("Failed to fetch"));
+    await act(async () => { saveButton("Save raw edit").click(); });
+    await waitFor(() => expect(container.textContent).toContain("The save outcome is unknown"));
+    await binaryRefetch();
+    expect(binaryView()).toBe(false);
+    expect(container.textContent).toContain("The save outcome is unknown");
+    expect(rawEditor()?.value).toBe(PROPOSED);
+    expect(saveButton("Save raw edit").disabled).toBe(true);
+    saveButton("Save raw edit").click();
+    for (let i = 0; i < 5; i++) await flushReact();
+    expect(mockAgentsApi.saveInstructionsFile).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps an in-flight raw save to one PUT when a refetch reports the file as binary", async () => {
+    await renderRaw(entryDetail(ORIGINAL));
+    await enter("Edit raw");
+    await typeDraft(PROPOSED);
+    await waitFor(() => expect(saveButton("Save raw edit").disabled).toBe(false));
+    let resolveSave: (value: AgentInstructionsFileDetail) => void = () => {};
+    mockAgentsApi.saveInstructionsFile.mockImplementation(() => new Promise<AgentInstructionsFileDetail>((resolve) => { resolveSave = resolve; }));
+    await act(async () => { saveButton("Save raw edit").click(); });
+    await flushReact();
+    expect(mockAgentsApi.saveInstructionsFile).toHaveBeenCalledTimes(1);
+    const editorBefore = rawEditor();
+    await binaryRefetch();
+    expect(binaryView()).toBe(false);
+    expect(rawEditor()).toBe(editorBefore);
+    expect(saveButton("Saving…").disabled).toBe(true);
+    saveButton("Saving…").click();
+    for (let i = 0; i < 3; i++) await flushReact();
+    expect(mockAgentsApi.saveInstructionsFile).toHaveBeenCalledTimes(1);
+    await act(async () => { resolveSave(entryDetail(PROPOSED)); });
+    for (let i = 0; i < 3; i++) await flushReact();
+    expect(mockAgentsApi.saveInstructionsFile).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps an open raw session mounted when the file query resets and is loading", async () => {
+    await renderRaw(entryDetail(ORIGINAL));
+    await enter("Edit raw");
+    await typeDraft(PROPOSED);
+    await waitFor(() => expect(saveButton("Save raw edit").disabled).toBe(false));
+    const editorBefore = rawEditor();
+    mockAgentsApi.instructionsFile.mockImplementation(() => new Promise(() => {}));
+    await act(async () => { void queryClient.resetQueries({ queryKey: queryKeys.agents.instructionsFile("agent-1", "AGENTS.md") }); });
+    for (let i = 0; i < 3; i++) await flushReact();
+    expect(queryClient.getQueryState(queryKeys.agents.instructionsFile("agent-1", "AGENTS.md"))?.fetchStatus).toBe("fetching");
+    expect(queryClient.getQueryData(queryKeys.agents.instructionsFile("agent-1", "AGENTS.md"))).toBeUndefined();
+    expect(rawEditor()).toBe(editorBefore);
+    expect(rawEditor()?.value).toBe(PROPOSED);
+    expect(saveButton("Save raw edit").disabled).toBe(true);
+    expect(mockAgentsApi.saveInstructionsFile).not.toHaveBeenCalled();
+  });
+
+  it("keeps an open raw session mounted when the bundle query resets and is loading", async () => {
+    await renderRaw(entryDetail(ORIGINAL));
+    await enter("Edit raw");
+    await typeDraft(PROPOSED);
+    await waitFor(() => expect(saveButton("Save raw edit").disabled).toBe(false));
+    const editorBefore = rawEditor();
+    // The sign-out sweep resets account-scoped queries, including this bundle.
+    mockAgentsApi.instructionsBundle.mockImplementation(() => new Promise(() => {}));
+    await act(async () => { void queryClient.resetQueries({ queryKey: queryKeys.agents.instructionsBundle("agent-1"), exact: true }); });
+    for (let i = 0; i < 3; i++) await flushReact();
+    expect(queryClient.getQueryData(queryKeys.agents.instructionsBundle("agent-1"))).toBeUndefined();
+    expect(rawEditor()).toBe(editorBefore);
+    expect(rawEditor()?.value).toBe(PROPOSED);
+    expect(saveButton("Save raw edit").disabled).toBe(true);
+    expect(mockAgentsApi.saveInstructionsFile).not.toHaveBeenCalled();
+  });
+
+  it("restores the normal binary view after an explicit discard", async () => {
+    await renderRaw(entryDetail(ORIGINAL));
+    await enter("Edit raw");
+    await typeDraft(PROPOSED);
+    await binaryRefetch();
+    expect(binaryView()).toBe(false);
+    await act(async () => { buttonByText(container, "Discard raw edit").click(); });
+    for (let i = 0; i < 3; i++) await flushReact();
+    expect(rawEditor()).toBeNull();
+    expect(binaryView()).toBe(true);
+    expect(mockAgentsApi.saveInstructionsFile).not.toHaveBeenCalled();
   });
 
   it("refuses ill-formed and oversized drafts", async () => {

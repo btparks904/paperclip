@@ -3054,7 +3054,9 @@ export function PromptsTab({
     );
   }
 
-  if (bundleLoading && !bundle) {
+  // A reset bundle query (for example the sign-out cache sweep) must not
+  // unmount an open raw session; its existing gates continue to control Save.
+  if (bundleLoading && !bundle && !rawActive) {
     return <PromptsTabSkeleton />;
   }
 
@@ -3508,12 +3510,14 @@ export function PromptsTab({
               queryClient.invalidateQueries({ queryKey: queryKeys.agents.instructionsBundle(agent.id) });
             }}
           />}
-          {selectedFileDetail?.binary ? (
+          {/* An open raw session stays mounted if a refetch reports the file as
+              binary or loading; its existing gates continue to control Save. */}
+          {selectedFileDetail?.binary && !rawActive ? (
             <div className="space-y-3 rounded-md border border-border p-4">
               <p className="text-sm text-muted-foreground">This file is preserved with the agent directory. Download it to view its contents.</p>
               <a className="text-sm text-primary underline" href={agentsApi.downloadInstructionsFile(agent.id, selectedOrEntryFile, companyId)} download>Download {selectedOrEntryFile}</a>
             </div>
-          ) : selectedFileExists && fileLoading && !selectedFileDetail ? (
+          ) : selectedFileExists && fileLoading && !selectedFileDetail && !rawActive ? (
             <PromptEditorSkeleton />
           ) : instructionMode === "read" ? (
             <div className="min-h-(--sz-420px) rounded-md border border-border bg-background p-4">
