@@ -97,6 +97,9 @@ export const agentInstructionWorkingCopies = pgTable(
     baseRevisionId: uuid("base_revision_id"),
     baseHash: text("base_hash").notNull(),
     localRoot: text("local_root").notNull(),
+    /** WS-2 PR-W2: the agent's instruction generation this copy was derived
+     * from, recorded under the agent row lock. Null is the legacy generation. */
+    instructionBundleId: uuid("instruction_bundle_id"),
     executionRoot: text("execution_root").notNull(),
     location: text("location").notNull(),
     state: text("state").notNull().default("prepared"),

@@ -94,6 +94,8 @@ export interface Agent {
   capabilities: string | null;
   adapterType: AgentAdapterType;
   adapterConfig: Record<string, unknown>;
+  /** Server-managed active instruction generation; null is the legacy folder. */
+  instructionBundleId?: string | null;
   runtimeConfig: AgentRuntimeConfig;
   defaultEnvironmentId?: string | null;
   budgetMonthlyCents: number;

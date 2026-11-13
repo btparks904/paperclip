@@ -18,8 +18,10 @@ export function checkpointBaseline(snapshot: DirectorySnapshot): AgentFileManife
     return [name, entry];
   }) };
 }
-export async function cachedAgentFileManifest(root: string): Promise<AgentFileManifest> {
-  const filename = path.join(path.dirname(root), "file-sync", "canonical-manifest.json");
+/** fileSyncDirectory is the agent's <area>/file-sync (resolveAgentFileSyncDirectory).
+ * The cache is keyed on stamps, so one file serves every generation. */
+export async function cachedAgentFileManifest(root: string, fileSyncDirectory: string): Promise<AgentFileManifest> {
+  const filename = path.join(fileSyncDirectory, "canonical-manifest.json");
   const previous = await fs.readFile(filename, "utf8").then(s => JSON.parse(s) as AgentFileManifest).catch(() => undefined);
   const { manifest } = await captureAgentFiles(root, previous, undefined, false);
   await fs.mkdir(path.dirname(filename), { recursive: true });

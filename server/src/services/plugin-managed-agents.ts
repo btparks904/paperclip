@@ -15,11 +15,14 @@ import type {
   PluginManagedAgentResolution,
 } from "@paperclipai/shared";
 import { isUuidLike } from "@paperclipai/shared";
-import { conflict, forbidden, notFound } from "../errors.js";
+import { conflict, forbidden, notFound, unprocessable } from "../errors.js";
 import { agentService } from "./agents.js";
 import { approvalService } from "./approvals.js";
 import { logActivity } from "./activity-log.js";
-import { agentInstructionsBundleMode, agentInstructionsService, resolveInstructionWriteTarget } from "./agent-instructions.js";
+import { agentInstructionsBundleMode, agentInstructionsService } from "./agent-instructions.js";
+import { agentFilePath } from "./agent-file-store.js";
+import { instructionBytes, instructionPath } from "./agent-instruction-files.js";
+import { instructionActivationService } from "./instruction-generation-activation.js";
 import { agentInstructionRevisionService } from "./agent-instruction-revisions.js";
 
 const MANAGED_AGENT_ENTITY_TYPE = "managed_agent";
@@ -389,20 +392,45 @@ export function pluginManagedAgentService(
       const revisions = agentInstructionRevisionService(db);
       const target = { companyId, agentId: agent.id };
       const actor = { type: "plugin" as const, pluginId: options.pluginId, pluginKey: options.pluginKey, agentKey: declaration.agentKey };
-      const baseline = await revisions.readForPluginReset(target, actor);
-      const receipt = await revisions.commitPluginReset({ ...target, entryFile: declared.entryFile,
-        baseRevisionId: baseline.snapshot?.revision.id ?? null, configuredEntryFile: baseline.configuredEntryFile, content: declared.files[declared.entryFile] ?? "" }, actor);
-      if (receipt.materialization === "pending") throw conflict("Instruction revision saved; retry reset to repair its disk copy", { revisionId: receipt.revision.id });
-      const refreshed = await agentSvc.getById(agent.id);
-      if (!refreshed) throw notFound("Managed agent not found");
-      const expectedTarget = await resolveInstructionWriteTarget(refreshed);
-      for (const [file, content] of Object.entries(declared.files)) {
-        if (file !== declared.entryFile) await instructions.writeFile(refreshed, file, content, { expectedTarget });
-      }
-      resetExpected = refreshed.adapterConfig;
-      // A stock reset owns declared instruction paths, not the agent's other
-      // persistent files (including a formerly configured entry).
-      adapterConfig = { ...refreshed.adapterConfig };
+      // WS-2 PR-W2: the reset activates a new generation that carries the agent
+      // directory forward with the declared files overlaid. A stock reset owns
+      // declared instruction paths, not the agent's other persistent files
+      // (including a formerly configured entry). The declared entry becomes the
+      // configured entry, as the plugin reset commit bound it.
+      const entryFile = instructionPath(declared.entryFile);
+      const overlay = new Map(Object.entries(declared.files)
+        .map(([file, content]) => [agentFilePath(file), instructionBytes(content)] as const));
+      if (!overlay.has(entryFile)) overlay.set(entryFile, instructionBytes(""));
+      const activated = await instructionActivationService(db).activate({
+        companyId,
+        agentId: agent.id,
+        kind: "plugin_reset",
+        isInstanceAdmin: false,
+        activity: { actorType: "plugin", actorId: options.pluginId },
+        identity: async (tx, current) => {
+          if (agentInstructionsBundleMode(current) === "external") {
+            throw unprocessable("External host instructions do not support revision write-back. Ask an instance administrator to migrate this bundle to managed storage.",
+              { code: "INSTRUCTION_MANAGED_BUNDLE_REQUIRED" });
+          }
+          const bound = await revisions.authorizePluginReset(tx, actor, target, current);
+          if (entryFile !== bound.declaredEntryFile) throw forbidden("Plugin reset must restore its declared entry file");
+          // Declared supporting files keep the reset's base rule: a path with
+          // revision history is changed only through canonical commits.
+          for (const file of overlay.keys()) if (file !== entryFile) await instructions.assertUnversionedPath(current, file, tx);
+          return { declaredEntryFile: bound.declaredEntryFile };
+        },
+        plan: async () => ({ overlay, entryFile }),
+        effects: async (tx, _current, staged) => {
+          const contentHash = staged.overlayHashes.get(entryFile)!;
+          if (staged.sourceHashes.get(entryFile) === contentHash) return;
+          await tx.insert(activityLog).values({ companyId, actorType: "plugin", actorId: options.pluginId,
+            action: "agent.files_updated", entityType: "agent", entityId: agent.id,
+            details: { path: entryFile, contentHash, source: "api" } });
+        },
+      });
+      if (activated.outcome !== "activated") throw new Error("Plugin reset did not activate a generation");
+      resetExpected = activated.adapterConfig;
+      adapterConfig = { ...activated.adapterConfig };
       delete adapterConfig.promptTemplate;
       delete adapterConfig.bootstrapPromptTemplate;
     } else {

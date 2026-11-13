@@ -29,7 +29,7 @@ import { filterResolvedGitHubConnectionsForRun } from "../git-credentials.js";
 
 const MAX_ASSET_FILES = 10_000;
 const MAX_ASSET_BYTES = 64 * 1024 * 1024;
-type RuntimeAgent = { id: string; companyId: string; name: string; adapterType?: string | null; adapterConfig: unknown };
+type RuntimeAgent = { id: string; companyId: string; name: string; adapterType?: string | null; adapterConfig: unknown; instructionBundleId?: string | null };
 type AssetFile = { path: string; content: Buffer; mode: number };
 
 const sha256 = (value: string | Buffer) => createHash("sha256").update(value).digest("hex");

@@ -9,6 +9,7 @@ import {
   resolveManagedInstructionsRoot,
   type UpdateBundleOptions,
 } from "../services/agent-instructions.js";
+import { instructionActivationTestHooks } from "../services/instruction-generation-activation.js";
 
 type TestAgent = {
   id: string;
@@ -36,11 +37,14 @@ function makeAgent(adapterConfig: Record<string, unknown>): TestAgent {
 function lockedBundle(agent: TestAgent) {
   const persisted: Array<Record<string, unknown>> = [];
   const tx = {
-    select: () => ({ from: () => ({ where: () => Object.assign(Promise.resolve([]), { for: async () => [agent] }) }) }),
+    select: () => ({ from: () => ({ where: () => Object.assign(Promise.resolve([]), { for: async () => [agent], limit: async () => [] }) }) }),
     insert: () => ({ values: async () => undefined }),
+    update: () => ({ set: (values: Record<string, unknown>) => ({ where: () => Object.assign(Promise.resolve(undefined), {
+      returning: async () => [{ ...agent, ...values, adapterConfig: persisted.at(-1) ?? agent.adapterConfig }],
+    }) }) }),
     execute: async () => [],
   };
-  const db = { transaction: async (fn: (t: typeof tx) => Promise<unknown>) => fn(tx) };
+  const db = { ...tx, transaction: async (fn: (t: typeof tx) => Promise<unknown>) => fn(tx) };
   const options = async (): Promise<UpdateBundleOptions> => ({
     expectedTarget: await resolveInstructionWriteTarget(agent),
     expectedConfigMode: agentInstructionsBundleMode(agent),
@@ -61,9 +65,12 @@ describe("agent instructions service", () => {
     cleanupDirs.add(home);
     process.env.PAPERCLIP_HOME = home;
     process.env.PAPERCLIP_INSTANCE_ID = "instructions-service-test";
+    // Keep the activation capacity check independent of the host's free space.
+    instructionActivationTestHooks.statfs = async () => ({ bsize: 4096, blocks: 1 << 24, bavail: 1 << 23, files: 1 << 20, ffree: 1 << 20 });
   });
 
   afterEach(async () => {
+    delete instructionActivationTestHooks.statfs;
     if (originalPaperclipHome === undefined) delete process.env.PAPERCLIP_HOME;
     else process.env.PAPERCLIP_HOME = originalPaperclipHome;
     if (originalPaperclipInstanceId === undefined) delete process.env.PAPERCLIP_INSTANCE_ID;

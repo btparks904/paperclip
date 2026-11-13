@@ -5,8 +5,8 @@ import { agents, environmentLeases, environments, agentInstructionWorkingCopies 
 import { syncDirectoryToSsh, restoreWorkspaceFromSshExecution } from "@paperclipai/adapter-utils/ssh";
 import { prepareAdapterExecutionTargetRuntime, runAdapterExecutionTargetShellCommand, type AdapterExecutionTarget, type PreparedAdapterExecutionTargetRuntime } from "@paperclipai/adapter-utils/execution-target";
 import { withDirectoryMergeLock, directorySnapshotSha256, parseDirectorySnapshot, serializeDirectorySnapshot, type DirectoryMergeLockOperation } from "@paperclipai/adapter-utils/workspace-restore-merge";
-import { AGENT_FILES_CONTRACT, AGENT_FILES_ENTRY_CONFLICT, AgentFileLimitError, agentFileStore, agentStorageWarning, inspectAgentDirectory, isAgentFileEntryConflict } from "./agent-file-store.js";
-import { agentInstructionsBundleMode, deriveBundleState, resolveManagedInstructionsRoot } from "./agent-instructions.js";
+import { AGENT_FILES_CONTRACT, AGENT_FILES_ENTRY_CONFLICT, AGENT_FILES_GENERATION_CHANGED, AgentFileLimitError, agentFileStore, agentFileTerminalConflictCode, agentStorageWarning, inspectAgentDirectory } from "./agent-file-store.js";
+import { agentInstructionsBundleMode, deriveBundleState, resolveAgentFileSyncDirectory } from "./agent-instructions.js";
 import { instructionGitExcludeProgram } from "./agent-instruction-files.js";
 import { resolveInstructionActor } from "./agent-instruction-authorization.js";
 import { HttpError, conflict, notFound } from "../errors.js";
@@ -23,6 +23,15 @@ const completed = new Set(["saved", "unchanged", "resolved", "unavailable"]);
 const transports = new Map<string, PreparedAdapterExecutionTargetRuntime>();
 const key = (row: Pick<Copy, "companyId" | "runId">) => `${row.companyId}:${row.runId}`;
 const ENTRY_CONFLICT_MESSAGE = "The instruction entry changed after this run's copy was prepared. This run's agent-folder changes were rejected and not saved; the temporary copy is discarded.";
+const GENERATION_CONFLICT_MESSAGE = "The agent's instructions moved to a new generation after this run's copy was prepared. This run's agent-folder changes were rejected and not saved; the temporary copy is discarded.";
+const terminalMessage = (code: string) => code === AGENT_FILES_GENERATION_CHANGED ? GENERATION_CONFLICT_MESSAGE : ENTRY_CONFLICT_MESSAGE;
+/** The terminal write-back rejection recorded on a copy, if any (WS-2 PR-W2 adds the generation fence). */
+export function agentDirectoryTerminalConflict(row: Pick<Copy, "errorCode" | "receipt">): { code: string; message: string } | null {
+  const recorded = typeof row.receipt?.checkpointConflictCode === "string" ? row.receipt.checkpointConflictCode : null;
+  const code = row.errorCode === AGENT_FILES_ENTRY_CONFLICT || row.errorCode === AGENT_FILES_GENERATION_CHANGED ? row.errorCode
+    : row.receipt?.checkpointState === "conflict" ? recorded ?? AGENT_FILES_ENTRY_CONFLICT : null;
+  return code ? { code, message: terminalMessage(code) } : null;
+}
 export function isAgentDirectoryCopy(row: Pick<Copy, "receipt"> | null): boolean {
   return row?.receipt?.schema === AGENT_FILES_CONTRACT;
 }
@@ -46,8 +55,10 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
     if (!row || row.agentId !== agentId || row.state !== "warm_saved" || row.errorCode || !await owns(row)) return false;
     const entry = baseline(row).entries.get(row.entryFile);
     if (entry?.kind !== "file" || entry.hash !== row.receipt?.sessionEntryHash) return false;
-    return store.locked(companyId, agentId, actor(row), false, async (_tx, _agent, root) =>
-      directorySnapshotSha256(checkpointSnapshot(await cachedAgentFileManifest(root))) === row.baseHash);
+    // WS-2 PR-W2: equal bytes in another generation are not reusable.
+    return store.locked(companyId, agentId, actor(row), false, async (_tx, lockedAgent, root) =>
+      (lockedAgent.instructionBundleId ?? null) === (row.instructionBundleId ?? null) &&
+      directorySnapshotSha256(checkpointSnapshot(await cachedAgentFileManifest(root, resolveAgentFileSyncDirectory(lockedAgent)))) === row.baseHash);
   }
   async function transport(row: Copy, target: AdapterExecutionTarget, recovering: boolean) {
     if (target.kind !== "remote" || row.location !== `remote:${target.environmentId ?? ""}`) throw new Error("Agent directory environment changed");
@@ -72,7 +83,6 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
     if (!agent) throw notFound("Agent not found");
     if (agentInstructionsBundleMode(agent) !== "managed") return null;
     const bound = await resolveInstructionActor(db, { type: "agent", companyId: input.companyId, agentId: input.agentId, runId: input.runId });
-    const root = resolveManagedInstructionsRoot(agent);
     if (input.reuseRunId) {
       const prior = await get(input.companyId, input.reuseRunId);
       if (!prior || prior.agentId !== input.agentId) throw conflict("Managed warm directory owner changed");
@@ -82,13 +92,17 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
         // Insert before taking the agent-row lock: this foreign key needs an
         // independent transaction, and must survive post-handoff failures.
         const [successor] = await db.insert(copies).values({ runId: input.runId, companyId: input.companyId, agentId: input.agentId, responsibleUserId: bound.onBehalfOfUserId!,
-          entryFile: current.entryFile, baseHash: current.baseHash, localRoot: current.localRoot, executionRoot: current.executionRoot, location: current.location, state: "prepared", receipt }).returning();
+          entryFile: current.entryFile, baseHash: current.baseHash, localRoot: current.localRoot, executionRoot: current.executionRoot, location: current.location, state: "prepared", receipt,
+          instructionBundleId: current.instructionBundleId ?? null }).returning();
         let handedOff = false;
         try { return await store.locked(input.companyId, input.agentId, bound, false, async (_tx, lockedAgent, canonical) => {
           // The reservation's earlier check is only a hint. Serialize this last
           // validation and ownership transfer with every canonical writer.
-          if (current.entryFile !== deriveBundleState(lockedAgent).entryFile ||
-              directorySnapshotSha256(checkpointSnapshot(await cachedAgentFileManifest(canonical))) !== current.baseHash) {
+          // WS-2 PR-W2: a copy of another generation is never handed off; the
+          // run restores a fresh copy and the old one is fenced at collection.
+          if ((current.instructionBundleId ?? null) !== (lockedAgent.instructionBundleId ?? null) ||
+              current.entryFile !== deriveBundleState(lockedAgent).entryFile ||
+              directorySnapshotSha256(checkpointSnapshot(await cachedAgentFileManifest(canonical, resolveAgentFileSyncDirectory(lockedAgent)))) !== current.baseHash) {
             throw new AgentDirectoryReuseInvalidatedError("Managed agent files changed before warm directory handoff");
           }
           // The controller-owned marker fences old callbacks. Attach the new
@@ -111,7 +125,8 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
         }
       }, "agent_directory_handoff");
     }
-    const localRoot = path.join(path.dirname(root), "file-sync", "runs", input.runId, "live");
+    // The run copy lives in the agent's sync folder, beside every generation.
+    const localRoot = path.join(resolveAgentFileSyncDirectory(agent), "runs", input.runId, "live");
     // Local copies live outside the task cwd. Remote copies use the reserved,
     // excluded runtime area inside the provider's confined workspace. They are
     // synchronized independently; provider HOME is never reinterpreted.
@@ -137,18 +152,21 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
       await db.insert(copies).values({ runId: input.runId, companyId: input.companyId, agentId: input.agentId, responsibleUserId: bound.onBehalfOfUserId!, ...preparing });
       row = (await get(input.companyId, input.runId))!;
     }
-    const { snapshot, storageWarning } = await store.locked(input.companyId, input.agentId, bound, false, async (_tx, _agent, canonical) => {
+    const { snapshot, storageWarning, entryFile, generation } = await store.locked(input.companyId, input.agentId, bound, false, async (_tx, lockedAgent, canonical) => {
       // Storage quotas govern saves, never admission to a future run. Restore
       // existing bytes so the agent can work normally and remove excess files.
       // Path/link validation remains mandatory even for an over-quota folder.
       const inspected = await inspectAgentDirectory(canonical, false);
+      // WS-2 PR-W2: the entry and generation come from the locked row with the
+      // root, never from the unlocked read above.
+      const derived = { entryFile: deriveBundleState(lockedAgent).entryFile, generation: lockedAgent.instructionBundleId ?? null };
       // A stopped lifecycle has already accounted for all its bytes. No live
       // or pending candidate ever enters this replacement path.
       await fs.rm(localRoot, { recursive: true, force: true });
       await fs.mkdir(path.dirname(localRoot), { recursive: true, mode: 0o700 });
       try {
         await fs.cp(canonical, localRoot, { recursive: true, preserveTimestamps: true });
-        return inspected;
+        return { ...inspected, ...derived };
       } catch (error) {
         await fs.rm(path.dirname(localRoot), { recursive: true, force: true });
         throw error;
@@ -157,8 +175,8 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
       await fs.rm(path.dirname(localRoot), { recursive: true, force: true });
       throw error;
     });
-    const loadedEntry = snapshot.entries.get(deriveBundleState(agent).entryFile);
-    const values = { entryFile: deriveBundleState(agent).entryFile, baseRevisionId: null, baseHash: directorySnapshotSha256(snapshot),
+    const loadedEntry = snapshot.entries.get(entryFile);
+    const values = { entryFile, instructionBundleId: generation, baseRevisionId: null, baseHash: directorySnapshotSha256(snapshot),
       localRoot, executionRoot, location, state: "preparing", candidateBase64: null, candidateHash: null,
       receipt: { ...preparing.receipt, baseline: serializeDirectorySnapshot(snapshot), storageWarning,
         ...(input.warm ? { sessionEntryHash: loadedEntry?.kind === "file" ? loadedEntry.hash : null } : {}) },
@@ -213,9 +231,10 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
     // A rejected stale entry is terminal for this copy. Later checkpoints and
     // stopped collection never re-evaluate or reapply it. The receipt marker
     // survives recovery transitions that replace the error code.
-    if (row.errorCode === AGENT_FILES_ENTRY_CONFLICT || row.receipt?.checkpointState === "conflict") {
+    const recorded = agentDirectoryTerminalConflict(row);
+    if (recorded) {
       return stopped ? patch(row, { state: "unavailable", processStoppedAt: row.processStoppedAt ?? new Date(), nextAttemptAt: null,
-        errorCode: AGENT_FILES_ENTRY_CONFLICT, errorMessage: ENTRY_CONFLICT_MESSAGE }) : row;
+        errorCode: recorded.code, errorMessage: recorded.message }) : row;
     }
     let failure: unknown;
     for (let attempt = 0; attempt < 3; attempt++) {
@@ -227,10 +246,11 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
         const nextHash = directorySnapshotSha256(snapshot);
         const changed = nextHash !== row.baseHash;
         const { storageWarning } = changed
-          ? await store.apply({ companyId: row.companyId, agentId: row.agentId, sourceDir: path.join(captured.directory, "files"), baseline: baseline(row), checkpoint: captured.manifest }, actor(row))
+          ? await store.apply({ companyId: row.companyId, agentId: row.agentId, sourceDir: path.join(captured.directory, "files"), baseline: baseline(row), checkpoint: captured.manifest,
+            expectedGeneration: row.instructionBundleId ?? null }, actor(row))
           : await store.locked(row.companyId, row.agentId, actor(row), true, async () => ({
             storageWarning: typeof row.receipt?.storageWarning === "string" ? row.receipt.storageWarning : null,
-          }));
+          }), { expectedGeneration: row.instructionBundleId ?? null });
         row = await patch(row, { state: stopped ? (changed ? "saved" : "unchanged") : "warm_saved", baseHash: nextHash,
           candidateHash: nextHash, errorCode: null, errorMessage: null, attempts: 0, nextAttemptAt: null,
           ...(stopped ? { processStoppedAt: new Date() } : {}),
@@ -240,17 +260,18 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
       } catch (error) {
         failure = error;
         logger.warn({ err: error, runId: row.runId, attempt: attempt + 1, stopped }, "Agent file checkpoint failed");
-        if (isAgentFileEntryConflict(error)) break;
+        if (agentFileTerminalConflictCode(error)) break;
       }
       finally {
         await captured?.cleanup().catch(error => logger.warn({ err: error, runId: row.runId }, "Agent checkpoint scratch cleanup deferred to session retirement"));
       }
     }
-    if (isAgentFileEntryConflict(failure)) {
+    const terminal = agentFileTerminalConflictCode(failure);
+    if (terminal) {
       // The provider may still be running. Record the rejection, keep the copy
       // out of warm reuse, and let the stopped boundary discard it.
-      return patch(row, { errorCode: AGENT_FILES_ENTRY_CONFLICT, errorMessage: ENTRY_CONFLICT_MESSAGE, nextAttemptAt: null,
-        receipt: { ...row.receipt, checkpointState: "conflict" }, ...(stopped ? { state: "unavailable", processStoppedAt: new Date() } : {}) });
+      return patch(row, { errorCode: terminal, errorMessage: terminalMessage(terminal), nextAttemptAt: null,
+        receipt: { ...row.receipt, checkpointState: "conflict", checkpointConflictCode: terminal }, ...(stopped ? { state: "unavailable", processStoppedAt: new Date() } : {}) });
     }
     if (!stopped) return patch(row, { errorCode: "AGENT_FILES_CHECKPOINT_UNSTABLE", errorMessage: "Incremental checkpoint could not be validated; collecting after provider stop.", nextAttemptAt: null });
     const storageLimit = failure instanceof AgentFileLimitError || String(failure).includes("LIMIT_EXCEEDED");
@@ -280,7 +301,8 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
         if (candidateHash === row.baseHash) {
           row = await patch(row, { state: "unchanged", errorCode: null, errorMessage: null, nextAttemptAt: null });
         } else {
-          ({ storageWarning } = await store.apply({ companyId: row.companyId, agentId: row.agentId, sourceDir: row.localRoot, baseline: baseline(row) }, actor(row)));
+          ({ storageWarning } = await store.apply({ companyId: row.companyId, agentId: row.agentId, sourceDir: row.localRoot, baseline: baseline(row),
+            expectedGeneration: row.instructionBundleId ?? null }, actor(row)));
           row = await patch(row, { state: "saved", candidateHash, errorCode: null, errorMessage: null, nextAttemptAt: null });
         }
         row = await patch(row, { receipt: { ...row.receipt, storageWarning } });
@@ -288,11 +310,11 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
       } catch (error) {
         const retryable = !(error instanceof HttpError) || error.status >= 500;
         if (retryable && row.attempts < 3) continue;
-        const entryConflict = isAgentFileEntryConflict(error);
+        const terminal = agentFileTerminalConflictCode(error);
         row = await patch(row, { state: "unavailable", nextAttemptAt: null,
           receipt: { ...row.receipt, storageWarning: error instanceof AgentFileLimitError ? agentStorageWarning(error.message) : row.receipt?.storageWarning ?? null },
-          errorCode: entryConflict ? AGENT_FILES_ENTRY_CONFLICT : error instanceof AgentFileLimitError ? "AGENT_FILES_LIMIT_EXCEEDED" : "AGENT_FILES_SAVE_FAILED",
-          errorMessage: entryConflict ? ENTRY_CONFLICT_MESSAGE : error instanceof HttpError && error.status === 422
+          errorCode: terminal ?? (error instanceof AgentFileLimitError ? "AGENT_FILES_LIMIT_EXCEEDED" : "AGENT_FILES_SAVE_FAILED"),
+          errorMessage: terminal ? terminalMessage(terminal) : error instanceof HttpError && error.status === 422
             ? `${error.message}. This run's agent-folder changes were not saved; the temporary copy is discarded.`
             : "Agent-file synchronization failed. No successful save is claimed; the temporary copy is discarded.",
         });

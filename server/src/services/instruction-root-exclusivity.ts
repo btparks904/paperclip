@@ -59,7 +59,7 @@ const MAX_SYMLINK_HOPS = 40;
 const realpathNative = promisify(realpathCallback.native);
 
 /** The agent fields the check reads. */
-export type ExclusivityAgent = { id: string; companyId: string; name: string; adapterConfig: unknown };
+export type ExclusivityAgent = { id: string; companyId: string; name: string; adapterConfig: unknown; instructionBundleId?: string | null };
 
 /** The caller's transaction (or, for the unlocked pre-check, any connection). */
 export type ExclusivityConnection = Db;
@@ -173,6 +173,7 @@ export async function assertExclusiveInstructionRoot(
     companyId: agents.companyId,
     name: agents.name,
     adapterConfig: agents.adapterConfig,
+    instructionBundleId: agents.instructionBundleId,
   }).from(agents);
   // A create without a caller-chosen id has no row to exclude yet.
   const others = (await (agent.id ? everyAgent.where(ne(agents.id, agent.id)) : everyAgent))
