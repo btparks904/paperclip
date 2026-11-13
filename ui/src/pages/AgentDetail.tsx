@@ -1,10 +1,17 @@
-import type { AgentInstructionCandidate, AgentInstructionsBundle } from "@paperclipai/shared";
+import type { AgentInstructionCandidate, AgentInstructionsBundle, AgentInstructionsFileDetail } from "@paperclipai/shared";
+import {
+  browserSubtleCrypto,
+  inspectInstructionRawText,
+  isSha256Hex,
+  parseExpectedSha256,
+  sha256HexOfInstructionText,
+} from "../lib/instruction-raw-bytes";
 import { InstructionHistory } from "../components/InstructionHistory";
 import { AgentCharacter } from "../components/AgentCharacter";
 import { characterStateForAgent } from "@paperclipai/shared";
 import { mergeRunLogChunks, readChunkSeq } from "../lib/run-log-chunks";
 import { getPageVisibility, usePageVisibility } from "../lib/page-visibility";
-import { useCallback, useEffect, useMemo, useState, useRef } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useState, useRef } from "react";
 import { useParams, useNavigate, Link, Navigate, useBeforeUnload, type NavigateFunction } from "@/lib/router";
 import { useQuery, useMutation, useQueryClient, type QueryClient } from "@tanstack/react-query";
 import {
@@ -2173,6 +2180,385 @@ export function ConfigurationTab({
   );
 }
 
+/* ---- Raw instruction editor (byte-exact) ---- */
+
+type RawEditKind = "ordinary" | "verified";
+type RawSessionPhase = "editing" | "saving" | "conflict" | "rejected" | "unknown" | "unconfirmed";
+type RawReconcileResult = "checking" | "submitted" | "base" | "other" | "failed";
+
+interface RawFrozenPayload {
+  path: string;
+  content: string;
+  hash: string;
+  baseHash: string;
+  kind: RawEditKind;
+  expectedHash: string | null;
+}
+
+interface RawSession {
+  kind: RawEditKind;
+  path: string;
+  /** The verified server string the session started from. */
+  baseContent: string;
+  baseHash: string;
+  draft: string;
+  /** SHA-256 of exactly `digest.content`; stale whenever the draft differs. */
+  digest: { content: string; hash: string } | null;
+  digestFailed: boolean;
+  /** Operator-entered expected hash (verified mode only). Never prefilled. */
+  expectedInput: string;
+  phase: RawSessionPhase;
+  frozen: RawFrozenPayload | null;
+  errorMessage: string | null;
+  reconcile: RawReconcileResult | null;
+  transformed: boolean;
+}
+
+type RawEligibility =
+  | { status: "checking" }
+  | { status: "ineligible"; reason: string }
+  | { status: "eligible"; content: string; hash: string };
+
+const RAW_EDITABLE_PHASES: RawSessionPhase[] = ["editing", "rejected"];
+
+function rawTextProblemReason(problems: string[]): string | null {
+  if (problems.includes("ill_formed")) return "The text is not well-formed Unicode, so its bytes cannot be encoded exactly.";
+  if (problems.includes("carriage_return")) return "The text contains carriage return characters. Raw editing supports LF-only files and never normalizes line endings.";
+  if (problems.includes("too_many_utf8_bytes")) return "The text exceeds the 1 MiB instruction file limit.";
+  if (problems.includes("too_many_code_units")) return "The text exceeds the instruction file length limit.";
+  return null;
+}
+
+function rawSaveBlockReason(
+  session: RawSession,
+  context: { blockedReason: string | null; currentHash: string | undefined; saveInFlight: boolean },
+): string | null {
+  if (context.saveInFlight || session.phase === "saving") return "A save is already in progress.";
+  if (session.phase !== "editing") return "Saving is disabled for this raw edit.";
+  if (session.transformed) return "The editor changed the loaded text, so raw saving is refused.";
+  if (context.blockedReason) return context.blockedReason;
+  if (context.currentHash !== session.baseHash) {
+    return "The file changed on the server after raw editing started. Discard this raw edit and start again from the current file.";
+  }
+  const problem = rawTextProblemReason(inspectInstructionRawText(session.draft).problems);
+  if (problem) return problem;
+  if (session.draft === session.baseContent) return "No changes to save.";
+  if (session.digestFailed) return "The browser could not compute the SHA-256 of this content.";
+  if (!session.digest || session.digest.content !== session.draft) return "Computing SHA-256 of the content to save.";
+  if (session.kind === "verified") {
+    if (session.expectedInput === "") return "Enter the expected SHA-256 of the content to install.";
+    const expected = parseExpectedSha256(session.expectedInput);
+    if (!expected) return "The expected SHA-256 must be exactly 64 hexadecimal characters.";
+    if (expected !== session.digest.hash) return "The content's SHA-256 does not match the expected SHA-256.";
+  }
+  return null;
+}
+
+export function RawInstructionEditor({
+  agentId,
+  companyId,
+  path,
+  detail,
+  blockedReason,
+  readOnlyContent,
+  onSessionChange,
+  onSaved,
+}: {
+  agentId: string;
+  companyId?: string;
+  path: string;
+  detail: AgentInstructionsFileDetail | undefined;
+  blockedReason: string | null;
+  readOnlyContent: string;
+  onSessionChange: (state: { active: boolean; saving: boolean }) => void;
+  onSaved: (file: AgentInstructionsFileDetail) => void;
+}) {
+  const [session, setSession] = useState<RawSession | null>(null);
+  const [eligibility, setEligibility] = useState<RawEligibility>({ status: "checking" });
+  const [savedNotice, setSavedNotice] = useState<{ kind: RawEditKind; hash: string } | null>(null);
+  const sessionRef = useRef<RawSession | null>(null);
+  sessionRef.current = session;
+  const currentHashRef = useRef<string | undefined>(detail?.contentHash);
+  currentHashRef.current = detail?.contentHash;
+  const blockedReasonRef = useRef<string | null>(blockedReason);
+  blockedReasonRef.current = blockedReason;
+  // Synchronous duplicate-submission guard. It is released only on a verified
+  // terminal outcome (confirmed success or a definitive rejection), or when the
+  // operator deliberately discards the raw edit.
+  const inFlightRef = useRef<RawFrozenPayload | null>(null);
+  const mountedRef = useRef(true);
+  const hashSeqRef = useRef(0);
+  const textareaRef = useRef<HTMLTextAreaElement | null>(null);
+  const loadedContent = detail?.content;
+  const loadedHash = detail?.contentHash;
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => { mountedRef.current = false; };
+  }, []);
+
+  const active = session !== null;
+  const saving = session?.phase === "saving";
+  useEffect(() => { onSessionChange({ active, saving }); }, [active, saving, onSessionChange]);
+  useEffect(() => () => { onSessionChange({ active: false, saving: false }); }, [onSessionChange]);
+
+  // Eligibility (A to F): the loaded string must be well formed, LF-only,
+  // within limits, and hash to the server contentHash with browser SHA-256.
+  useEffect(() => {
+    if (blockedReason) { setEligibility({ status: "ineligible", reason: blockedReason }); return; }
+    if (loadedContent === undefined) { setEligibility({ status: "ineligible", reason: "The current file has not loaded yet." }); return; }
+    if (!isSha256Hex(loadedHash)) { setEligibility({ status: "ineligible", reason: "The server did not provide a content hash for this file, so raw editing is unavailable." }); return; }
+    const problem = rawTextProblemReason(inspectInstructionRawText(loadedContent).problems);
+    if (problem) { setEligibility({ status: "ineligible", reason: problem }); return; }
+    const subtle = browserSubtleCrypto();
+    if (!subtle) { setEligibility({ status: "ineligible", reason: "Browser SHA-256 is unavailable. Raw editing needs a secure context such as HTTPS or localhost." }); return; }
+    let cancelled = false;
+    setEligibility({ status: "checking" });
+    sha256HexOfInstructionText(loadedContent, subtle).then((hash) => {
+      if (cancelled) return;
+      setEligibility(hash === loadedHash
+        ? { status: "eligible", content: loadedContent, hash }
+        : { status: "ineligible", reason: "The loaded text does not hash to the server's content hash, so raw editing is refused." });
+    }, () => {
+      if (!cancelled) setEligibility({ status: "ineligible", reason: "The browser could not compute the SHA-256 of the loaded text." });
+    });
+    return () => { cancelled = true; };
+  }, [blockedReason, loadedContent, loadedHash]);
+
+  // Hash the exact draft. Results for an older draft are discarded.
+  const sessionDraft = session?.draft;
+  useEffect(() => {
+    const current = sessionRef.current;
+    if (!current || sessionDraft === undefined) return;
+    if (current.digest?.content === sessionDraft) return;
+    const seq = ++hashSeqRef.current;
+    sha256HexOfInstructionText(sessionDraft).then((hash) => {
+      if (seq !== hashSeqRef.current || !mountedRef.current) return;
+      setSession((cur) => cur && cur.draft === sessionDraft ? { ...cur, digest: { content: sessionDraft, hash }, digestFailed: false } : cur);
+    }, () => {
+      if (seq !== hashSeqRef.current || !mountedRef.current) return;
+      setSession((cur) => cur && cur.draft === sessionDraft ? { ...cur, digest: null, digestFailed: true } : cur);
+    });
+  }, [sessionDraft]);
+
+  // H: the textarea must hold exactly the verified string once mounted.
+  const sessionStarted = session?.baseContent;
+  useLayoutEffect(() => {
+    const current = sessionRef.current;
+    const element = textareaRef.current;
+    if (!current || !element || sessionStarted === undefined) return;
+    if (current.draft === current.baseContent && element.value !== current.baseContent) {
+      setSession((cur) => cur ? { ...cur, transformed: true } : cur);
+    }
+  }, [sessionStarted]);
+
+  const start = (kind: RawEditKind) => {
+    if (sessionRef.current || inFlightRef.current) return;
+    if (blockedReasonRef.current) return;
+    if (eligibility.status !== "eligible" || !detail) return;
+    if (detail.content !== eligibility.content || detail.contentHash !== eligibility.hash) return;
+    setSavedNotice(null);
+    setSession({
+      kind, path, baseContent: eligibility.content, baseHash: eligibility.hash,
+      draft: eligibility.content, digest: { content: eligibility.content, hash: eligibility.hash }, digestFailed: false,
+      expectedInput: "", phase: "editing", frozen: null, errorMessage: null, reconcile: null, transformed: false,
+    });
+  };
+
+  const discard = () => {
+    const current = sessionRef.current;
+    if (!current || current.phase === "saving") return;
+    inFlightRef.current = null;
+    hashSeqRef.current += 1;
+    setSession(null);
+  };
+
+  const updateDraft = (value: string) => {
+    setSession((cur) => {
+      if (!cur || !RAW_EDITABLE_PHASES.includes(cur.phase) || value === cur.draft) return cur;
+      return {
+        ...cur, draft: value,
+        digest: cur.digest?.content === value ? cur.digest : null, digestFailed: false,
+        // An expected hash is bound to one exact payload; any edit clears it.
+        expectedInput: "",
+        phase: "editing", errorMessage: null,
+      };
+    });
+  };
+
+  const save = () => {
+    if (inFlightRef.current) return;
+    const current = sessionRef.current;
+    if (!current) return;
+    const reason = rawSaveBlockReason(current, {
+      blockedReason: blockedReasonRef.current, currentHash: currentHashRef.current, saveInFlight: false,
+    });
+    if (reason || !current.digest) return;
+    const frozen: RawFrozenPayload = {
+      path: current.path, content: current.digest.content, hash: current.digest.hash, baseHash: current.baseHash,
+      kind: current.kind, expectedHash: current.kind === "verified" ? parseExpectedSha256(current.expectedInput) : null,
+    };
+    inFlightRef.current = frozen;
+    setSession({ ...current, phase: "saving", frozen, errorMessage: null, reconcile: null });
+    agentsApi.saveInstructionsFile(agentId, { path: frozen.path, content: frozen.content, baseHash: frozen.baseHash }, companyId)
+      .then((file) => {
+        const confirmed = Boolean(file) && file.path === frozen.path && file.contentHash === frozen.hash && file.content === frozen.content;
+        if (!confirmed) {
+          if (mountedRef.current) {
+            setSession((cur) => cur && cur.frozen === frozen ? { ...cur, phase: "unconfirmed" } : cur);
+          }
+          return;
+        }
+        inFlightRef.current = null;
+        if (mountedRef.current) {
+          setSession(null);
+          setSavedNotice({ kind: frozen.kind, hash: frozen.hash });
+        }
+        onSaved(file);
+      }, (error: unknown) => {
+        if (error instanceof ApiError && error.status >= 400 && error.status < 500) {
+          inFlightRef.current = null;
+          if (mountedRef.current) {
+            setSession((cur) => cur && cur.frozen === frozen
+              ? { ...cur, phase: error.status === 409 ? "conflict" : "rejected", errorMessage: error.message }
+              : cur);
+          }
+          return;
+        }
+        if (mountedRef.current) {
+          setSession((cur) => cur && cur.frozen === frozen ? { ...cur, phase: "unknown" } : cur);
+        }
+      });
+  };
+
+  // Read-only reconciliation after an unknown or unconfirmed outcome. The
+  // entry GET only re-reads under the row lock; it never writes the file.
+  const reconcile = () => {
+    const current = sessionRef.current;
+    const frozen = current?.frozen;
+    if (!current || !frozen || (current.phase !== "unknown" && current.phase !== "unconfirmed")) return;
+    if (current.reconcile === "checking") return;
+    setSession({ ...current, reconcile: "checking" });
+    agentsApi.instructionsFile(agentId, frozen.path, companyId).then((file) => {
+      const result: RawReconcileResult = file.contentHash === frozen.hash ? "submitted"
+        : file.contentHash === frozen.baseHash ? "base" : "other";
+      if (mountedRef.current) setSession((cur) => cur && cur.frozen === frozen ? { ...cur, reconcile: result } : cur);
+    }, () => {
+      if (mountedRef.current) setSession((cur) => cur && cur.frozen === frozen ? { ...cur, reconcile: "failed" } : cur);
+    });
+  };
+
+  if (!session) {
+    return (
+      <div className="space-y-3">
+        <div className="flex flex-wrap items-center gap-2">
+          <Button type="button" size="sm" variant="outline" disabled={eligibility.status !== "eligible"} onClick={() => start("ordinary")}>Edit raw</Button>
+          <Button type="button" size="sm" variant="outline" disabled={eligibility.status !== "eligible"} onClick={() => start("verified")}>Verified installation</Button>
+          {eligibility.status === "checking" && <span role="status" className="text-xs text-muted-foreground">Verifying the loaded text against the server hash.</span>}
+        </div>
+        {eligibility.status === "ineligible" && <p role="note" data-testid="instructions-raw-ineligible" className="text-sm text-muted-foreground">Raw editing is unavailable: {eligibility.reason} The file is shown read only and has not been changed.</p>}
+        {savedNotice && <p role="status" data-testid="instructions-raw-saved" className="text-sm text-muted-foreground">
+          {savedNotice.kind === "verified" ? "Verified installation saved. The stored content's SHA-256 matches the expected hash: " : "Saved. The server's SHA-256 matches the submitted content: "}
+          <span className="font-mono break-all">{savedNotice.hash}</span>
+        </p>}
+        <pre
+          data-testid="instructions-raw-source"
+          className="min-h-(--sz-420px) overflow-x-auto whitespace-pre-wrap break-words rounded-md border border-border bg-muted p-4 font-mono text-sm leading-7"
+        >
+          {readOnlyContent}
+        </pre>
+      </div>
+    );
+  }
+
+  const blockReason = rawSaveBlockReason(session, {
+    blockedReason, currentHash: detail?.contentHash, saveInFlight: false,
+  });
+  const draftInspection = inspectInstructionRawText(session.draft);
+  const digestCurrent = session.digest && session.digest.content === session.draft ? session.digest.hash : null;
+  const expectedParsed = session.kind === "verified" ? parseExpectedSha256(session.expectedInput) : null;
+  const expectedMatches = Boolean(expectedParsed && digestCurrent && expectedParsed === digestCurrent);
+  const editable = RAW_EDITABLE_PHASES.includes(session.phase);
+
+  return (
+    <div className="space-y-3" data-testid="instructions-raw-session" data-raw-mode={session.kind}>
+      <p className="text-sm font-medium">
+        {session.kind === "verified" ? "Verified installation" : "Raw edit"}
+        <span className="ml-2 text-xs font-normal text-muted-foreground">Byte-exact. Nothing is normalized, trimmed or reformatted.</span>
+      </p>
+      {session.kind === "verified" && <p className="text-xs text-muted-foreground">The expected SHA-256 is an integrity check on the exact bytes to install. It does not authorize the installation.</p>}
+      <dl className="grid gap-1 text-xs text-muted-foreground">
+        <div><dt className="inline">Original SHA-256: </dt><dd className="inline font-mono break-all">{session.baseHash}</dd></div>
+        <div><dt className="inline">Size: </dt><dd className="inline">{draftInspection.utf8ByteLength === null ? "unknown" : `${draftInspection.utf8ByteLength} bytes (UTF-8)`}</dd></div>
+        {(session.kind === "ordinary" || expectedMatches) && <div>
+          <dt className="inline">SHA-256 of the content to save: </dt>
+          <dd className="inline font-mono break-all" data-testid="instructions-raw-draft-hash">{digestCurrent ?? (session.digestFailed ? "unavailable" : "computing")}</dd>
+        </div>}
+      </dl>
+      <textarea
+        ref={textareaRef}
+        data-testid="instructions-raw-editor"
+        aria-label="Raw instruction file editor"
+        value={session.draft}
+        readOnly={!editable}
+        spellCheck={false}
+        autoCapitalize="off"
+        autoCorrect="off"
+        autoComplete="off"
+        data-gramm="false"
+        onChange={(event) => updateDraft(event.target.value)}
+        className="min-h-(--sz-420px) w-full min-w-0 rounded-md border border-border bg-transparent px-3 py-2 font-mono text-sm outline-none"
+      />
+      {session.kind === "verified" && (
+        <div className="space-y-1">
+          <label className="text-xs text-muted-foreground" htmlFor={`raw-expected-hash-${agentId}`}>Expected SHA-256 of the content to install</label>
+          <Input
+            id={`raw-expected-hash-${agentId}`}
+            aria-label="Expected SHA-256"
+            value={session.expectedInput}
+            disabled={!editable}
+            spellCheck={false}
+            autoCapitalize="off"
+            autoCorrect="off"
+            autoComplete="off"
+            className="font-mono"
+            onChange={(event) => {
+              const value = event.target.value;
+              setSession((cur) => cur && RAW_EDITABLE_PHASES.includes(cur.phase) ? { ...cur, expectedInput: value } : cur);
+            }}
+          />
+          {session.expectedInput !== "" && <p role="status" className="text-xs text-muted-foreground" data-testid="instructions-raw-expected-status">
+            {!expectedParsed ? "Not a valid SHA-256." : !digestCurrent ? "Waiting for the content hash." : expectedMatches ? "Matches the content to install." : "Does not match the content to install."}
+          </p>}
+        </div>
+      )}
+      {session.phase === "editing" && blockReason && <p role="note" className="text-sm text-muted-foreground" data-testid="instructions-raw-block-reason">{blockReason}</p>}
+      {session.phase === "saving" && <p role="status" className="text-sm text-muted-foreground">Saving. Do not close this page.</p>}
+      {session.phase === "conflict" && <p role="alert" className="text-sm text-destructive">The file changed on the server, so this save was rejected and nothing was written. Your raw draft is kept. Copy it if needed, then discard and start again from the current file.</p>}
+      {session.phase === "rejected" && <p role="alert" className="text-sm text-destructive">{session.errorMessage ?? "The server rejected this save."} Nothing was written. Your raw draft is kept.</p>}
+      {session.phase === "unknown" && <p role="alert" className="text-sm text-destructive">The save outcome is unknown. Saving is disabled and will not be retried. You can check the current saved file without changing it, or discard this raw edit.</p>}
+      {session.phase === "unconfirmed" && <p role="alert" className="text-sm text-destructive">The server response did not confirm the submitted SHA-256, so this is not reported as a success. Saving is disabled. You can check the current saved file without changing it, or discard this raw edit.</p>}
+      {(session.phase === "unknown" || session.phase === "unconfirmed") && session.reconcile && session.reconcile !== "checking" && (
+        <p role="status" className="text-sm text-muted-foreground" data-testid="instructions-raw-reconcile">
+          {session.reconcile === "submitted" ? "The current saved file matches the submitted SHA-256. This does not prove that the save's audit record exists."
+            : session.reconcile === "base" ? "The current saved file still matches the original SHA-256. The submitted content is not on the server."
+              : session.reconcile === "other" ? "The current saved file matches neither the submitted nor the original SHA-256."
+                : "The current saved file could not be read."}
+        </p>
+      )}
+      <div className="flex flex-wrap items-center gap-2">
+        <Button type="button" size="sm" disabled={blockReason !== null} onClick={save}>
+          {session.phase === "saving" ? "Saving…" : session.kind === "verified" ? "Save verified installation" : "Save raw edit"}
+        </Button>
+        {(session.phase === "unknown" || session.phase === "unconfirmed") && (
+          <Button type="button" size="sm" variant="outline" disabled={session.reconcile === "checking"} onClick={reconcile}>Check current saved file</Button>
+        )}
+        <Button type="button" size="sm" variant="ghost" disabled={session.phase === "saving"} onClick={discard}>Discard raw edit</Button>
+      </div>
+    </div>
+  );
+}
+
 /* ---- Prompts Tab ---- */
 
 export function PromptsTab({
@@ -2199,6 +2585,8 @@ export function PromptsTab({
   const [instructionMode, setInstructionMode] = useState<"read" | "edit" | "raw">("read");
   const [showFilePanel, setShowFilePanel] = useState(false);
   const [draft, setDraft] = useState<string | null>(null);
+  const [rawSession, setRawSession] = useState<{ active: boolean; saving: boolean }>({ active: false, saving: false });
+  const rawActive = rawSession.active;
   const draftBaseRevisionRef = useRef<string | null | undefined>(undefined);
   const draftBaseHashRef = useRef<string | null | undefined>(undefined);
   const [candidateRunId, setCandidateRunId] = useState<string | null>(null);
@@ -2263,7 +2651,7 @@ export function PromptsTab({
     queryKey: queryKeys.agents.instructionsBundle(agent.id),
     queryFn: () => agentsApi.instructionsBundle(agent.id, companyId),
     enabled: Boolean(companyId && isLocal),
-    refetchInterval: draft === null ? 5000 : false,
+    refetchInterval: draft === null && !rawActive ? 5000 : false,
   });
 
   const persistedMode = bundle?.mode ?? "managed";
@@ -2301,7 +2689,7 @@ export function PromptsTab({
     queryKey: queryKeys.agents.instructionsFile(agent.id, selectedOrEntryFile),
     queryFn: () => agentsApi.instructionsFile(agent.id, selectedOrEntryFile, companyId),
     enabled: Boolean(companyId && isLocal && selectedFileExists),
-    refetchInterval: draft === null ? 5000 : false,
+    refetchInterval: draft === null && !rawActive ? 5000 : false,
   });
 
   const candidates = useQuery({
@@ -2433,6 +2821,10 @@ export function PromptsTab({
 
   useEffect(() => {
     if (!bundle) return;
+    // A raw session owns the selection until it is discarded or saved. Any
+    // bundle refetch (window focus, reconnect, invalidation) must not remount
+    // the raw editor and silently drop its draft, expected hash or guard.
+    if (rawActive) return;
     if (!bundleMatchesDraft) {
       if (selectedFile !== currentEntryFile) setSelectedFile(currentEntryFile);
       return;
@@ -2445,7 +2837,7 @@ export function PromptsTab({
     if (!availablePaths.includes(selectedFile) && selectedFile !== currentEntryFile && !pendingFiles.includes(selectedFile)) {
       setSelectedFile(availablePaths.includes(bundle.entryFile) ? bundle.entryFile : availablePaths[0]!);
     }
-  }, [bundle, bundleMatchesDraft, currentEntryFile, pendingFiles, selectedFile]);
+  }, [bundle, bundleMatchesDraft, currentEntryFile, pendingFiles, rawActive, selectedFile]);
 
   useEffect(() => {
     const nextExpanded = new Set<string>();
@@ -2536,10 +2928,27 @@ export function PromptsTab({
   );
   const fileDirty = draft !== null && draft !== currentContent;
   const isDirty = bundleDirty || fileDirty || candidateRunId !== null;
-  const isSaving = updateBundle.isPending || saveFile.isPending || resolveCandidate.isPending || loadCandidate.isPending || refreshCandidateBase.isPending || deleteFile.isPending || awaitingRefresh;
+  const editorSaving = updateBundle.isPending || saveFile.isPending || resolveCandidate.isPending || loadCandidate.isPending || refreshCandidateBase.isPending || deleteFile.isPending || awaitingRefresh;
+  const isSaving = editorSaving || rawSession.saving;
+  // The raw editor owns its own save. Before it may start, every other edit
+  // path must be idle so its draft can never mix with a rich-editor draft.
+  const rawBlockedReason = !selectedFileExists ? "Raw editing is available only for saved files."
+    : currentMode !== "managed" || persistedMode !== "managed" ? "Raw editing is available only for managed instruction files."
+      : !bundleMatchesDraft || bundleDirty ? "Save or discard the instruction bundle settings change first."
+        : selectedOrEntryFile === "promptTemplate.legacy.md" || selectedFileSummary?.deprecated || selectedFileSummary?.virtual
+          || selectedFileDetail?.deprecated || selectedFileDetail?.virtual || selectedFileDetail?.binary ? "This file cannot be edited as raw text."
+          : selectedFileDetail && !selectedFileDetail.editable ? "This file is not editable."
+            : bundle?.legacyPromptTemplateActive || bundle?.legacyBootstrapPromptTemplateActive ? "A legacy prompt template is active. Save once with the editor to migrate it first."
+              : draft !== null || candidateRunId !== null ? "Save or discard the current editor draft first."
+                : editorSaving ? "Wait for the current save to finish."
+                  : null;
+  const handleRawSaved = useCallback((file: AgentInstructionsFileDetail) => {
+    queryClient.setQueryData(queryKeys.agents.instructionsFile(agent.id, file.path), file);
+    queryClient.invalidateQueries({ queryKey: queryKeys.agents.instructionsBundle(agent.id), exact: true });
+  }, [agent.id, queryClient]);
 
   useEffect(() => { onSavingChange(isSaving); }, [onSavingChange, isSaving]);
-  useEffect(() => { onDirtyChange(isDirty); }, [onDirtyChange, isDirty]);
+  useEffect(() => { onDirtyChange(isDirty || rawActive); }, [onDirtyChange, isDirty, rawActive]);
 
   useEffect(() => () => {
     onSaveActionChange(null);
@@ -2549,7 +2958,7 @@ export function PromptsTab({
   }, [onCancelActionChange, onDirtyChange, onSaveActionChange, onSavingChange]);
 
   useEffect(() => {
-    onSaveActionChange(isDirty ? () => {
+    onSaveActionChange(isDirty && !rawActive ? () => {
       const save = async () => {
         const shouldClearLegacy =
           Boolean(bundle?.legacyPromptTemplateActive) || Boolean(bundle?.legacyBootstrapPromptTemplateActive);
@@ -2584,6 +2993,7 @@ export function PromptsTab({
     displayValue,
     fileDirty,
     isDirty,
+    rawActive,
     onSaveActionChange,
     selectedFileDetail?.revision?.id,
     currentEntryFile,
@@ -2594,7 +3004,7 @@ export function PromptsTab({
   ]);
 
   useEffect(() => {
-    onCancelActionChange(isDirty ? () => {
+    onCancelActionChange(isDirty && !rawActive ? () => {
       draftBaseRevisionRef.current = undefined;
       draftBaseHashRef.current = undefined;
       setCandidateRunId(null);
@@ -2608,7 +3018,7 @@ export function PromptsTab({
         });
       }
     } : null);
-  }, [bundle, isDirty, onCancelActionChange, persistedMode, persistedRootPath, resolveCandidate]);
+  }, [bundle, isDirty, rawActive, onCancelActionChange, persistedMode, persistedRootPath, resolveCandidate]);
 
   const handleSeparatorDrag = useCallback((event: React.MouseEvent) => {
     event.preventDefault();
@@ -2644,7 +3054,9 @@ export function PromptsTab({
     );
   }
 
-  if (bundleLoading && !bundle) {
+  // A reset bundle query (for example the sign-out cache sweep) must not
+  // unmount an open raw session; its existing gates continue to control Save.
+  if (bundleLoading && !bundle && !rawActive) {
     return <PromptsTabSkeleton />;
   }
 
@@ -2688,6 +3100,7 @@ export function PromptsTab({
                     type="button"
                     size="sm"
                     variant={currentMode === "managed" ? "default" : "outline"}
+                    disabled={rawActive}
                     onClick={() => {
                       if (currentMode === "external") {
                         externalBundleRef.current = {
@@ -2711,6 +3124,7 @@ export function PromptsTab({
                     type="button"
                     size="sm"
                     variant={currentMode === "external" ? "default" : "outline"}
+                    disabled={rawActive}
                     onClick={() => {
                       const externalBundle = externalBundleRef.current;
                       const nextEntryFile = externalBundle?.entryFile ?? currentEntryFile ?? "AGENTS.md";
@@ -2751,6 +3165,7 @@ export function PromptsTab({
                   <div className="flex items-center gap-1.5">
                     <Input
                       value={currentRootPath}
+                      disabled={rawActive}
                       onChange={(event) => {
                         const nextRootPath = event.target.value;
                         externalBundleRef.current = {
@@ -2789,6 +3204,7 @@ export function PromptsTab({
                 </span>
                 <Input
                   value={currentEntryFile}
+                  disabled={rawActive}
                   onChange={(event) => {
                     const nextEntryFile = event.target.value || "AGENTS.md";
                     const nextSelectedFile = selectedOrEntryFile === currentEntryFile
@@ -2879,7 +3295,7 @@ export function PromptsTab({
                   size="sm"
                   variant="default"
                   className="flex-1"
-                  disabled={!newFilePath.trim() || newFilePath.includes("..")}
+                  disabled={rawActive || !newFilePath.trim() || newFilePath.includes("..")}
                   onClick={() => {
                     const candidate = newFilePath.trim();
                     if (!candidate || candidate.includes("..")) return;
@@ -2919,6 +3335,7 @@ export function PromptsTab({
               return next;
             })}
             onSelectFile={(filePath) => {
+              if (rawActive) return;
               setSelectedFile(filePath);
               setInstructionMode("read");
               if (!fileOptions.includes(filePath)) setDraft("");
@@ -2996,6 +3413,7 @@ export function PromptsTab({
                     variant={instructionMode === mode ? "secondary" : "ghost"}
                     className="capitalize"
                     aria-pressed={instructionMode === mode}
+                    disabled={rawActive && mode !== instructionMode}
                     onClick={() => setInstructionMode(mode)}
                   >
                     {mode}
@@ -3028,7 +3446,7 @@ export function PromptsTab({
                       });
                     }
                   }}
-                  disabled={deleteFile.isPending}
+                  disabled={deleteFile.isPending || rawActive}
                 >
                   Delete
                 </Button>
@@ -3045,7 +3463,7 @@ export function PromptsTab({
                   <span className="font-mono text-xs text-muted-foreground">{candidate.runId.slice(0, 8)}</span>
                   <span className="text-sm text-muted-foreground">{candidate.entryFile} · {formatDate(candidate.createdAt)}</span>
                   <Button type="button" variant="outline" size="sm"
-                    disabled={candidate.content === null || (candidate.entryFile === currentEntryFile && (isDirty || isSaving))}
+                    disabled={candidate.content === null || (candidate.entryFile === currentEntryFile && (isDirty || isSaving || rawActive))}
                     aria-expanded={candidate.entryFile !== currentEntryFile ? readOnlyCandidateRunId === candidate.runId : undefined}
                     onClick={() => {
                       if (candidate.entryFile !== currentEntryFile) {
@@ -3083,7 +3501,7 @@ export function PromptsTab({
           {selectedFileDetail?.receipt?.materialization === "pending" && <p role="status" className="text-sm text-muted-foreground">Revision saved. The instruction file still needs to be rebuilt from the saved revision.</p>}
           {selectedFileDetail?.revision && currentMode === "managed" && bundle?.persistence !== "agent_files" && <InstructionHistory
             key={selectedOrEntryFile} agentId={agent.id} companyId={companyId} path={selectedOrEntryFile}
-            currentRevisionId={selectedFileDetail.revision.id} disabled={isDirty || isSaving}
+            currentRevisionId={selectedFileDetail.revision.id} disabled={isDirty || isSaving || rawActive}
             onRestored={(file) => {
               setDraft(null);
               draftBaseRevisionRef.current = undefined;
@@ -3092,12 +3510,14 @@ export function PromptsTab({
               queryClient.invalidateQueries({ queryKey: queryKeys.agents.instructionsBundle(agent.id) });
             }}
           />}
-          {selectedFileDetail?.binary ? (
+          {/* An open raw session stays mounted if a refetch reports the file as
+              binary or loading; its existing gates continue to control Save. */}
+          {selectedFileDetail?.binary && !rawActive ? (
             <div className="space-y-3 rounded-md border border-border p-4">
               <p className="text-sm text-muted-foreground">This file is preserved with the agent directory. Download it to view its contents.</p>
               <a className="text-sm text-primary underline" href={agentsApi.downloadInstructionsFile(agent.id, selectedOrEntryFile, companyId)} download>Download {selectedOrEntryFile}</a>
             </div>
-          ) : selectedFileExists && fileLoading && !selectedFileDetail ? (
+          ) : selectedFileExists && fileLoading && !selectedFileDetail && !rawActive ? (
             <PromptEditorSkeleton />
           ) : instructionMode === "read" ? (
             <div className="min-h-(--sz-420px) rounded-md border border-border bg-background p-4">
@@ -3114,12 +3534,17 @@ export function PromptsTab({
               )}
             </div>
           ) : instructionMode === "raw" ? (
-            <pre
-              data-testid="instructions-raw-source"
-              className="min-h-(--sz-420px) overflow-x-auto whitespace-pre-wrap break-words rounded-md border border-border bg-muted p-4 font-mono text-sm leading-7"
-            >
-              {displayValue}
-            </pre>
+            <RawInstructionEditor
+              key={`${agent.id}:${selectedOrEntryFile}`}
+              agentId={agent.id}
+              companyId={companyId}
+              path={selectedOrEntryFile}
+              detail={selectedFileExists ? selectedFileDetail : undefined}
+              blockedReason={rawBlockedReason}
+              readOnlyContent={displayValue}
+              onSessionChange={setRawSession}
+              onSaved={handleRawSaved}
+            />
           ) : useMarkdownEditor ? (
             <div
               onBeforeInputCapture={markEditorInteracted}
