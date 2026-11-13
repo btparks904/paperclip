@@ -2821,6 +2821,10 @@ export function PromptsTab({
 
   useEffect(() => {
     if (!bundle) return;
+    // A raw session owns the selection until it is discarded or saved. Any
+    // bundle refetch (window focus, reconnect, invalidation) must not remount
+    // the raw editor and silently drop its draft, expected hash or guard.
+    if (rawActive) return;
     if (!bundleMatchesDraft) {
       if (selectedFile !== currentEntryFile) setSelectedFile(currentEntryFile);
       return;
@@ -2833,7 +2837,7 @@ export function PromptsTab({
     if (!availablePaths.includes(selectedFile) && selectedFile !== currentEntryFile && !pendingFiles.includes(selectedFile)) {
       setSelectedFile(availablePaths.includes(bundle.entryFile) ? bundle.entryFile : availablePaths[0]!);
     }
-  }, [bundle, bundleMatchesDraft, currentEntryFile, pendingFiles, selectedFile]);
+  }, [bundle, bundleMatchesDraft, currentEntryFile, pendingFiles, rawActive, selectedFile]);
 
   useEffect(() => {
     const nextExpanded = new Set<string>();

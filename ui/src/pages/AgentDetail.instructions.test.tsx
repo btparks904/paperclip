@@ -993,6 +993,73 @@ describe("PromptsTab raw instruction editor", () => {
     expect(buttonByText(container, "Managed").disabled).toBe(false);
   });
 
+  // A non-entry file in a raw session; a later bundle refetch can drop it.
+  async function renderNotesRawSession(label: "Edit raw" | "Verified installation") {
+    const notesSummary = makeSummary("NOTES.md", "AGENTS.md", { contentHash: sha(ORIGINAL) });
+    const notes = makeDetail(notesSummary, ORIGINAL, { contentHash: sha(ORIGINAL) });
+    const entry = entryDetail("# Entry file\n");
+    const entrySummary = makeSummary("AGENTS.md", "AGENTS.md", { contentHash: entry.contentHash });
+    mockAgentsApi.instructionsBundle.mockResolvedValue(makeBundle("AGENTS.md", [entrySummary, notesSummary], { persistence: "agent_files" }));
+    mockAgentsApi.instructionsFile.mockImplementation(async (_agentId: string, path: string) => (path === "NOTES.md" ? notes : entry));
+    root = createRoot(container);
+    await act(async () => {
+      root?.render(
+        <QueryClientProvider client={queryClient}>
+          <PromptsTab agent={makeAgent()} companyId="company-1" onDirtyChange={vi.fn()}
+            onSaveActionChange={(next) => { parentSave = next; }} onCancelActionChange={vi.fn()} onSavingChange={vi.fn()} />
+        </QueryClientProvider>,
+      );
+    });
+    await flushReact();
+    const notesNode = await waitFor(() => {
+      const node = Array.from(container.querySelectorAll<HTMLElement>("button, [role='treeitem'], span, div"))
+        .reverse().find((el) => el.textContent?.trim() === "NOTES.md");
+      expect(node).toBeDefined();
+      return node!;
+    });
+    await act(async () => { notesNode.click(); });
+    await flushReact();
+    await act(async () => { buttonByText(container, "raw").click(); });
+    await flushReact();
+    await waitFor(() => expect(container.querySelector('[data-testid="instructions-raw-source"]')?.textContent).toBe(ORIGINAL));
+    await enter(label);
+    await typeDraft(PROPOSED);
+    // Another tab deletes NOTES.md; a focus refetch would deliver this bundle.
+    return async () => {
+      await act(async () => { queryClient.setQueryData(queryKeys.agents.instructionsBundle("agent-1"), makeBundle("AGENTS.md", [entrySummary], { persistence: "agent_files" })); });
+      for (let i = 0; i < 3; i++) await flushReact();
+    };
+  }
+
+  it("keeps a raw session's draft and expected hash when a bundle refetch drops its file", async () => {
+    const dropFile = await renderNotesRawSession("Verified installation");
+    await typeExpected(sha(PROPOSED));
+    await waitFor(() => expect(saveButton("Save verified installation").disabled).toBe(false));
+    await dropFile();
+    // The session is not silently destroyed; Save is blocked until an explicit discard.
+    expect(rawEditor()?.value).toBe(PROPOSED);
+    expect(expectedInput()?.value).toBe(sha(PROPOSED));
+    expect(saveButton("Save verified installation").disabled).toBe(true);
+    expect(buttonByText(container, "Discard raw edit")).toBeDefined();
+    expect(mockAgentsApi.saveInstructionsFile).not.toHaveBeenCalled();
+  });
+
+  it("keeps the unknown-outcome state and its no-retry guard when a bundle refetch drops the file", async () => {
+    const dropFile = await renderNotesRawSession("Edit raw");
+    await waitFor(() => expect(saveButton("Save raw edit").disabled).toBe(false));
+    mockAgentsApi.saveInstructionsFile.mockRejectedValue(new TypeError("Failed to fetch"));
+    await act(async () => { saveButton("Save raw edit").click(); });
+    await waitFor(() => expect(container.textContent).toContain("The save outcome is unknown"));
+    await dropFile();
+    expect(container.textContent).toContain("The save outcome is unknown");
+    expect(rawEditor()?.value).toBe(PROPOSED);
+    expect(saveButton("Save raw edit").disabled).toBe(true);
+    expect(buttonByText(container, "Check current saved file")).toBeDefined();
+    saveButton("Save raw edit").click();
+    for (let i = 0; i < 5; i++) await flushReact();
+    expect(mockAgentsApi.saveInstructionsFile).toHaveBeenCalledTimes(1);
+  });
+
   it("refuses ill-formed and oversized drafts", async () => {
     await renderRaw(entryDetail(ORIGINAL));
     await enter("Edit raw");
