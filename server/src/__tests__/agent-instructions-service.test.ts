@@ -38,6 +38,7 @@ function lockedBundle(agent: TestAgent) {
   const tx = {
     select: () => ({ from: () => ({ where: () => Object.assign(Promise.resolve([]), { for: async () => [agent] }) }) }),
     insert: () => ({ values: async () => undefined }),
+    execute: async () => [],
   };
   const db = { transaction: async (fn: (t: typeof tx) => Promise<unknown>) => fn(tx) };
   const options = async (): Promise<UpdateBundleOptions> => ({

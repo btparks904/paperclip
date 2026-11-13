@@ -9,6 +9,7 @@ import { instructionPath, instructionPathKey, matchesInstructionEntry, assertIns
 import { conflict, notFound, unprocessable } from "../errors.js";
 import { resolveHomeAwarePath, resolvePaperclipInstanceRoot } from "../home-paths.js";
 import { logger } from "../middleware/logger.js";
+import { assertExclusiveInstructionRoot } from "./instruction-root-exclusivity.js";
 
 const ENTRY_FILE_DEFAULT = "AGENTS.md";
 const MODE_KEY = "instructionsBundleMode";
@@ -854,9 +855,18 @@ export function agentInstructionsService(db?: Db) {
   async function ensureWritableBundle(
     agent: AgentLike,
     options?: { clearLegacyPromptTemplate?: boolean },
+    tx?: InstructionTx,
   ): Promise<{ adapterConfig: Record<string, unknown>; state: BundleState }> {
     const derived = deriveBundleState(agent);
     const current = await recoverManagedBundleState(agent, derived);
+    // WS-2 PR-W1: a save that binds a root the configuration does not name yet
+    // (none, or a recovered managed root) is a root activation. It refuses a
+    // root that overlaps another agent before the first folder is created.
+    const bindRoot = current.rootPath && current.mode ? current.rootPath : resolveManagedInstructionsRoot(agent);
+    if (!derived.rootPath || path.resolve(derived.rootPath) !== path.resolve(bindRoot)) {
+      if (tx) await assertExclusiveRoot(tx, agent, bindRoot, { isInstanceAdmin: false });
+      else if (db) throw unprocessable("Binding an instructions root requires the agent's locked transaction");
+    }
     if (current.rootPath && current.mode) {
       const adapterConfig = buildPersistedBundleConfig(derived, current, options);
       return {
@@ -1169,6 +1179,29 @@ export function agentInstructionsService(db?: Db) {
     await classifyCopyIntents(tx, agent, { isInstanceAdmin }, identity, resolved, false, null);
   }
 
+  /**
+   * WS-2 PR-W1 exclusive roots (instruction-root-exclusivity.ts). With lock
+   * (the default), conn is the caller's transaction, after its agent row lock.
+   */
+  async function assertExclusiveRoot(
+    conn: InstructionTx | Db,
+    agent: AgentLike,
+    rootPath: string,
+    options: { isInstanceAdmin: boolean; lock?: boolean },
+  ) {
+    await assertExclusiveInstructionRoot(conn as unknown as Db, agent, rootPath, {
+      ...options,
+      deriveRoot: (other) => deriveBundleState(other).rootPath,
+    });
+  }
+
+  /** The unlocked create and hire pre-check of the root a new configuration names, if any. */
+  async function precheckExclusiveRoot(conn: Db, agent: AgentLike, options: { isInstanceAdmin: boolean }) {
+    const rootPath = deriveBundleState(agent).rootPath;
+    if (!rootPath) return;
+    await assertExclusiveRoot(conn, agent, rootPath, { isInstanceAdmin: options.isInstanceAdmin, lock: false });
+  }
+
   async function updateBundle(
     agent: AgentLike,
     input: UpdateBundleInput,
@@ -1180,7 +1213,7 @@ export function agentInstructionsService(db?: Db) {
     const result = await db.transaction(async (tx) => {
       // Step 1: lock, then recheck what the route authorized (3.2).
       const [current] = await tx.select().from(agents)
-        .where(and(eq(agents.id, agent.id), eq(agents.companyId, agent.companyId))).for("update");
+        .where(and(eq(agents.id, agent.id), eq(agents.companyId, agent.companyId))).for("no key update");
       if (!current) throw notFound("Agent not found");
       await assertExpectedTarget(current, options.expectedTarget);
       if (agentInstructionsBundleMode(current) !== options.expectedConfigMode) throw conflict(MODE_CHANGED_MESSAGE);
@@ -1200,6 +1233,12 @@ export function agentInstructionsService(db?: Db) {
         nextRootPath = resolvedRoot;
       }
       await assertInstructionPathSafe(nextRootPath, nextEntryFile);
+      // WS-2 PR-W1: a switch to another root takes the assignment lock and
+      // refuses a root that overlaps another agent, before the first folder.
+      const configuredRoot = deriveBundleState(current).rootPath;
+      if (!configuredRoot || path.resolve(configuredRoot) !== path.resolve(nextRootPath)) {
+        await assertExclusiveRoot(tx, current, nextRootPath, { isInstanceAdmin: options.isInstanceAdmin === true });
+      }
       await fs.mkdir(nextRootPath, { recursive: true });
       const identity = await captureDestinationIdentity(nextRootPath);
       const existingFiles = await listFilesRecursive(nextRootPath);
@@ -1271,6 +1310,7 @@ export function agentInstructionsService(db?: Db) {
     relativePath: string,
     content: string,
     options?: { clearLegacyPromptTemplate?: boolean },
+    tx?: InstructionTx,
   ): Promise<{
     bundle: AgentInstructionsBundle;
     file: AgentInstructionsFileDetail;
@@ -1295,7 +1335,7 @@ export function agentInstructionsService(db?: Db) {
       throw unprocessable("Entry edits require the canonical instruction commit service and baseRevisionId", { code: "INSTRUCTION_REVISION_REQUIRED" });
     }
     if (configured.mode !== "external") agentFilePath(relativePath);
-    const prepared = await ensureWritableBundle(agent, options);
+    const prepared = await ensureWritableBundle(agent, options, tx);
     instructionBytes(content);
     await assertInstructionPathSafe(prepared.state.rootPath!, relativePath);
     const absolutePath = resolvePathWithinRoot(prepared.state.rootPath!, relativePath);
@@ -1367,7 +1407,7 @@ export function agentInstructionsService(db?: Db) {
     }
     return db.transaction(async (tx) => {
       const [current] = await tx.select().from(agents)
-        .where(and(eq(agents.id, agent.id), eq(agents.companyId, agent.companyId))).for("update");
+        .where(and(eq(agents.id, agent.id), eq(agents.companyId, agent.companyId))).for("no key update");
       if (!current) throw notFound("Agent not found");
       assertExpectedBundleMode(current, expected?.mode);
       await assertExpectedTarget(current, expected?.target);
@@ -1394,7 +1434,7 @@ export function agentInstructionsService(db?: Db) {
   ) {
     const writeOptions = options ? { clearLegacyPromptTemplate: options.clearLegacyPromptTemplate } : undefined;
     return withCurrentAgent(agent, relativePath, async (current, tx) => {
-      const result = await writeFileUnversioned(current, relativePath, content, writeOptions);
+      const result = await writeFileUnversioned(current, relativePath, content, writeOptions, tx);
       if (options?.persistConfig) {
         if (!tx) throw unprocessable("Configuration persistence requires the database-backed instructions service");
         await options.persistConfig(tx, current, result.adapterConfig);
@@ -1494,8 +1534,14 @@ export function agentInstructionsService(db?: Db) {
     if (!db) throw unprocessable("Bundle initialization requires the database-backed instructions service");
     return db.transaction(async (tx) => {
       const agent = args[0];
-      const [owner] = await tx.select({ id: agents.id }).from(agents).where(and(eq(agents.id, agent.id), eq(agents.companyId, agent.companyId))).for("update");
+      const [owner] = await tx.select({ id: agents.id }).from(agents).where(and(eq(agents.id, agent.id), eq(agents.companyId, agent.companyId))).for("no key update");
       if (!owner) throw notFound("Agent not found");
+      // WS-2 PR-W1: the first bind of the managed root is a root activation.
+      const managedRoot = resolveManagedInstructionsRoot(agent);
+      const configuredRoot = deriveBundleState(agent).rootPath;
+      if (!configuredRoot || path.resolve(configuredRoot) !== managedRoot) {
+        await assertExclusiveRoot(tx, agent, managedRoot, { isInstanceAdmin: false });
+      }
       await assertUnversionedEntry(agent, args[2]?.entryFile ? normalizeRelativeFilePath(args[2].entryFile) : ENTRY_FILE_DEFAULT, tx);
       if (args[2]?.replaceExisting) {
         const [existingHead] = await tx.select({ id: agentInstructionHeads.revisionId }).from(agentInstructionHeads)
@@ -1511,6 +1557,8 @@ export function agentInstructionsService(db?: Db) {
     readFile,
     updateBundle,
     assertNoCopyIntentForRoot,
+    assertExclusiveRoot,
+    precheckExclusiveRoot,
     writeFile,
     deleteFile,
     exportFiles,

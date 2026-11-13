@@ -8,7 +8,7 @@ import { randomUUID } from "node:crypto";
 import express from "express";
 import request from "supertest";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
-import { and, eq } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import {
   activityLog, agentConfigRevisions, agentInstructionHeads, agentInstructionRevisions, agents, authUsers, companies,
   companyMemberships, companySecrets, createDb, principalPermissionGrants, type Db,
@@ -700,7 +700,15 @@ describe("instructions bundle copy-and-switch", () => {
           pathKeyHash: fileHash(Buffer.from(intent.destination.pathKey)) } } };
       let release!: () => void;
       const gate = new Promise<void>((resolve) => { release = resolve; });
-      const open = db.transaction(async (tx) => { await tx.insert(activityLog).values(real); await gate; throw new Error("rollback"); }).catch(() => "rolled back");
+      // Like the real writer (recordCopyCompletion inside updateBundle), the
+      // completion insert runs while its transaction holds this agent's row
+      // FOR NO KEY UPDATE, until that transaction ends.
+      const open = db.transaction(async (tx) => {
+        await tx.select({ id: agents.id }).from(agents).where(eq(agents.id, agentId)).for("no key update");
+        await tx.insert(activityLog).values(real);
+        await gate;
+        throw new Error("rollback");
+      }).catch(() => "rolled back");
       await sleep(100);
       let settled = false;
       const pending = patch({ mode: "external", rootPath: ext }).then((result) => { settled = true; return result; });
@@ -745,47 +753,87 @@ describe("instructions bundle copy-and-switch", () => {
         await seedSource(otherManaged, { "AGENTS.md": "SENTINEL-OTHER-ENTRY\n", "notes/other.md": "SENTINEL-OTHER-NOTE\n" });
       });
 
-      it("both create before either scans: both refuse, nothing is written, no record remains", async () => {
-        let created = 0;
-        let bothCreated!: () => void;
-        const barrier = new Promise<void>((resolve) => { bothCreated = resolve; });
-        const real = fs.open.bind(fs);
-        vi.spyOn(fs, "open").mockImplementation((async (file: Parameters<typeof fs.open>[0], flags?: any, mode?: any) => {
-          const handle = await real(file, flags, mode);
-          if (flags === "wx" && String(file).startsWith(instructionCopyIntentsDirectory())) {
-            created += 1;
-            if (created === 2) bothCreated();
-            await Promise.race([barrier, sleep(5000)]);
-          }
-          return handle;
-        }) as typeof fs.open);
+      // WS-2 PR-W1: two agents can no longer copy into one folder at the same
+      // time. The assignment lock serializes root assignments; the second
+      // claim waits, then is refused because the first agent now owns the
+      // folder. The refused agent writes nothing and keeps its configuration.
+      const OTHER_FILES = ["AGENTS.md", "notes/other.md"];
+      const advisoryWaiters = async () => {
+        const rows = await db.execute(sql`select count(*)::int as n from pg_locks where locktype = 'advisory' and not granted`);
+        return Number((rows as unknown as Array<{ n: number }>)[0]?.n ?? 0);
+      };
+      async function waitFor(predicate: () => Promise<boolean>, timeoutMs = 5_000) {
+        const deadline = Date.now() + timeoutMs;
+        while (Date.now() < deadline) {
+          if (await predicate()) return true;
+          await sleep(20);
+        }
+        return false;
+      }
+
+      it("both start together: one copies, the other waits on the assignment lock, is refused and writes nothing; no record remains", async () => {
+        const beforeA = await configOf();
+        const beforeB = await configOf(other);
         const [a, b] = await Promise.all([patch({ mode: "external", rootPath: ext }), patch({ mode: "external", rootPath: ext }, {}, undefined, other)]);
-        expect(created).toBe(2);
-        expect(a).toMatchObject({ ok: false, status: 409, code: COPY_INCOMPLETE });
-        expect(b).toMatchObject({ ok: false, status: 409, code: COPY_INCOMPLETE });
-        expect(await ls(ext)).toEqual([]);
+        expect([a, b].filter((outcome) => outcome.ok)).toHaveLength(1);
+        const [winner, loser, loserBefore] = a.ok ? [agentId, b, beforeB] : [other, a, beforeA];
+        const loserId = winner === agentId ? other : agentId;
+        expect(loser).toMatchObject({ ok: false, status: 409, code: "INSTRUCTION_ROOT_IN_USE" });
+        // Only the winner's bundle is in the folder; the refused agent wrote nothing there.
+        expect(await ls(ext)).toEqual(winner === agentId ? ["AGENTS.md", NOTE].sort() : OTHER_FILES);
+        expect(await read(ext, "AGENTS.md")).toBe(winner === agentId ? ENTRY : "SENTINEL-OTHER-ENTRY\n");
+        expect(await configOf(winner)).toMatchObject(cfg("external", ext));
+        expect(await configOf(loserId)).toEqual(loserBefore);
+        expect(await intents()).toEqual([]);
+        // The lock was released: the refused agent can then switch to its own folder.
+        const own = `${ext}-own`;
+        const retry = await patch({ mode: "external", rootPath: own }, {}, undefined, loserId);
+        expect(retry.ok).toBe(true);
+        expect(await configOf(loserId)).toMatchObject(cfg("external", own));
         expect(await intents()).toEqual([]);
       });
 
-      it("one scans before the other creates: the later one refuses and writes nothing; the earlier one copies", async () => {
+      it("one is at persist while the other starts: the later one waits, then is refused and writes nothing; the earlier one copies", async () => {
+        // A third agent switches to an independent folder at the same time.
+        // The lock is instance-wide, so it waits too, but it is not refused.
+        const third = randomUUID();
+        const thirdManaged = resolveManagedInstructionsRoot({ companyId, id: third, name: "T", adapterConfig: {} });
+        await seedAgent(third, cfg("managed", thirdManaged));
+        await seedSource(thirdManaged, { "AGENTS.md": "SENTINEL-THIRD-ENTRY\n" });
+        const independent = `${ext}-independent`;
+        const beforeA = await configOf();
         let bAtPersist!: () => void; const bReady = new Promise<void>((resolve) => { bAtPersist = resolve; });
-        let aScanned!: () => void; const aPast = new Promise<void>((resolve) => { aScanned = resolve; });
-        let bFinished!: () => void; const bDone = new Promise<void>((resolve) => { bFinished = resolve; });
-        let first = true;
-        spyOpen(async (file, flags) => {
-          if (isDestWrite(file, flags) && first) { first = false; aScanned(); await bDone; }
-        });
+        let release!: () => void; const released = new Promise<void>((resolve) => { release = resolve; });
         const b = patch({ mode: "external", rootPath: ext }, {
-          persist: async (tx, current, adapterConfig) => { bAtPersist(); await aPast; await persistOn()(tx, current, adapterConfig); },
-        }, undefined, other).then((result) => { bFinished(); return result; });
+          persist: async (tx, current, adapterConfig) => { bAtPersist(); await released; await persistOn()(tx, current, adapterConfig); },
+        }, undefined, other);
         await bReady;
-        const a = await patch({ mode: "external", rootPath: ext });
-        const bResult = await b;
-        expect(bResult).toMatchObject({ ok: false, status: 409, code: COPY_INCOMPLETE });
-        expect(a.ok).toBe(true);
-        expect(await ls(ext)).toEqual(["AGENTS.md", NOTE]);
-        expect(await read(ext, "AGENTS.md")).toBe(ENTRY);
-        expect((await configOf(other)).instructionsBundleMode).toBe("managed");
+        let aSettled = false, cSettled = false;
+        const a = patch({ mode: "external", rootPath: ext }).finally(() => { aSettled = true; });
+        const c = patch({ mode: "external", rootPath: independent }, {}, undefined, third).finally(() => { cSettled = true; });
+        // Both wait on the assignment lock that B holds; neither has settled or written.
+        // B is released whatever the result, so a failed wait cannot deadlock the test.
+        let bothWaiting = false, pendingWhileWaiting = false;
+        try {
+          bothWaiting = await waitFor(async () => (await advisoryWaiters()) >= 2);
+          pendingWhileWaiting = !aSettled && !cSettled;
+          expect(await ls(ext)).toEqual([]);
+          expect(await ls(independent)).toEqual([]);
+        } finally {
+          release();
+        }
+        const [aResult, bResult, cResult] = await Promise.all([a, b, c]);
+        expect(bothWaiting).toBe(true);
+        expect(pendingWhileWaiting).toBe(true);
+        expect(bResult.ok).toBe(true);
+        expect(aResult).toMatchObject({ ok: false, status: 409, code: "INSTRUCTION_ROOT_IN_USE" });
+        expect(cResult.ok).toBe(true);
+        expect(await ls(ext)).toEqual(OTHER_FILES);
+        expect(await read(ext, "AGENTS.md")).toBe("SENTINEL-OTHER-ENTRY\n");
+        expect(await configOf()).toEqual(beforeA);
+        expect(await configOf(other)).toMatchObject(cfg("external", ext));
+        expect(await ls(independent)).toEqual(["AGENTS.md"]);
+        expect(await configOf(third)).toMatchObject(cfg("external", independent));
         expect(await intents()).toEqual([]);
       });
     });

@@ -12,6 +12,7 @@ import { authorizeInstructionCommit, authorizeInstructionRead } from "./agent-in
 import { assertInstructionPathSafe, instructionPath, instructionPathKey, matchesInstructionEntry, instructionBytes, materializeInstructionBytes, readInstructionBytes, MAX_INSTRUCTION_BYTES } from "./agent-instruction-files.js";
 import { agentInstructionsBundleMode, deriveBundleState, resolveManagedInstructionsRoot, resolveRecoveredManagedBundle, type RecoveredManagedBundle } from "./agent-instructions.js";
 import type { AuthorizationActor } from "./authorization.js";
+import { assertExclusiveInstructionRoot } from "./instruction-root-exclusivity.js";
 
 export type Tx = Parameters<Parameters<Db["transaction"]>[0]>[0];
 type Agent = typeof agents.$inferSelect;
@@ -118,7 +119,6 @@ async function planAgentFileAdoption(tx: Tx, agent: Agent, options?: { recovered
   const markerRoot = path.join(path.dirname(root), "file-sync");
   const marker = "adopted.json";
   await assertInstructionPathSafe(root, deriveBundleState(agent).entryFile);
-  await fs.mkdir(root, { recursive: true, mode: 0o700 });
   const filename = await assertInstructionPathSafe(markerRoot, marker);
   const adopted = await fs.readFile(filename, "utf8").catch((error: NodeJS.ErrnoException) => {
     if (error.code === "ENOENT") return null;
@@ -126,8 +126,20 @@ async function planAgentFileAdoption(tx: Tx, agent: Agent, options?: { recovered
   });
   if (adopted !== null) {
     if (JSON.parse(adopted).schema !== AGENT_FILES_CONTRACT) throw new Error("Unsupported agent file contract");
+    await fs.mkdir(root, { recursive: true, mode: 0o700 });
     return { root, markerRoot, marker, pending: null };
   }
+  // WS-2 PR-W1 (IF-1): first adoption creates the root and writes the legacy
+  // heads and the marker, also when a read triggers it. Refuse (409
+  // INSTRUCTION_ROOT_IN_USE) before any folder or file is created when the
+  // managed root or the marker folder overlaps another agent's root or
+  // managed area, for example a legacy root stored before the W1 rule. The
+  // check runs on tx under the assignment lock, after the caller's agent row
+  // lock (FOR NO KEY UPDATE; see instruction-root-exclusivity.ts). An
+  // already adopted agent (valid marker) takes no assignment lock.
+  await assertExclusiveInstructionRoot(tx as unknown as Db, agent, root, { isInstanceAdmin: false, deriveRoot: (other) => deriveBundleState(other).rootPath });
+  await assertExclusiveInstructionRoot(tx as unknown as Db, agent, markerRoot, { isInstanceAdmin: false, lock: false, deriveRoot: (other) => deriveBundleState(other).rootPath });
+  await fs.mkdir(root, { recursive: true, mode: 0o700 });
   const legacy = await tx.select({ entryFile: agentInstructionHeads.entryFile, contentBase64: agentInstructionRevisions.contentBase64 })
     .from(agentInstructionHeads).innerJoin(agentInstructionRevisions, eq(agentInstructionHeads.revisionId, agentInstructionRevisions.id))
     .where(and(eq(agentInstructionHeads.companyId, agent.companyId), eq(agentInstructionHeads.agentId, agent.id)));
@@ -273,7 +285,11 @@ export function agentFileStore(db: Db) {
     fn: (tx: Tx, agent: Agent, root: string, bound: AuthorizationActor, recovered: RecoveredManagedBundle | null, adoption: AdoptionPlan) => Promise<T>,
     options?: { recoverManaged?: boolean; allowRecoveredManaged?: boolean; deferAdoption?: boolean }) {
     return db.transaction(async tx => {
-      const [agent] = await tx.select().from(agents).where(and(eq(agents.companyId, companyId), eq(agents.id, agentId))).for("update");
+      // FOR NO KEY UPDATE, like every instruction writer that can take the
+      // instruction-root assignment lock: writers of this agent still
+      // serialize, and a foreign-key KEY SHARE lock on this row (for example a
+      // revision attributed to this agent) never waits on it.
+      const [agent] = await tx.select().from(agents).where(and(eq(agents.companyId, companyId), eq(agents.id, agentId))).for("no key update");
       if (!agent) throw notFound("Agent not found");
       const bound = write ? await authorizeInstructionCommit(tx, actor, agent) : await authorizeInstructionRead(tx, actor, agent);
       // Re-evaluate recovery on the locked row, never on the caller's earlier read.

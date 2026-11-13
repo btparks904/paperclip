@@ -990,7 +990,8 @@ export function builtInAgentService(db: Db) {
       // files. If a write or DB commit fails, the next reconciliation can accept
       // already-applied bytes and retry. This is not instruction revision history.
       const prepared = await db.transaction(async (tx) => {
-        const [current] = await tx.select().from(agents).where(and(eq(agents.companyId, agent.companyId), eq(agents.id, agent.id))).for("update");
+        // FOR NO KEY UPDATE: first adoption can take the instruction-root assignment lock (WS-2 PR-W1).
+        const [current] = await tx.select().from(agents).where(and(eq(agents.companyId, agent.companyId), eq(agents.id, agent.id))).for("no key update");
         if (!current) throw notFound("Built-in agent not found");
         if (agentInstructionsBundleMode(current) !== "managed") return false;
         const root = await adoptAgentFiles(tx, current);
@@ -1040,7 +1041,8 @@ export function builtInAgentService(db: Db) {
       });
       if (!prepared) return currentState;
       return db.transaction(async (tx) => {
-        const [current] = await tx.select().from(agents).where(and(eq(agents.companyId, agent.companyId), eq(agents.id, agent.id))).for("update");
+        // FOR NO KEY UPDATE: first adoption can take the instruction-root assignment lock (WS-2 PR-W1).
+        const [current] = await tx.select().from(agents).where(and(eq(agents.companyId, agent.companyId), eq(agents.id, agent.id))).for("no key update");
         if (!current) throw notFound("Built-in agent not found");
         if (agentInstructionsBundleMode(current) !== "managed") return currentState;
         const root = await adoptAgentFiles(tx, current);

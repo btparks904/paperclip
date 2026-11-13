@@ -25,14 +25,29 @@ function runShard(args) {
   return result.stdout.trim().split(/\s+/).filter(Boolean);
 }
 
+// The fork pins the upstream trusted workflow to the v2026.1005.0 release
+// commit. Only this exact repository, workflow path and full commit SHA is
+// accepted: no branch, tag, short or other SHA, other repository or local call.
+const PINNED_TRUSTED_PR_WORKFLOW =
+  "paperclipai/paperclip/.github/workflows/pr-trusted.yml@467125fafb47a8520856504fecc48d6e32055db1";
+
+function workflowUsesValues(workflow) {
+  return [...workflow.matchAll(/^\s*(?:-\s*)?uses:\s*(.*?)\s*$/gm)].map((match) => match[1]);
+}
+
+function isPinnedTrustedPrCaller(caller) {
+  const calls = workflowUsesValues(caller);
+  return calls.length === 1 && calls[0] === PINNED_TRUSTED_PR_WORKFLOW;
+}
+
 function readTrustedPrWorkflow() {
   const caller = readFileSync(prCallerWorkflow, "utf8");
-  assert.match(
-    caller,
-    /^\s+uses: paperclipai\/paperclip\/\.github\/workflows\/pr-trusted\.yml@master\s*$/m,
-    "pr.yml must call the trusted workflow from CODEOWNERS-protected master",
+  assert.ok(
+    isPinnedTrustedPrCaller(caller),
+    `pr.yml must call only ${PINNED_TRUSTED_PR_WORKFLOW}; found ${JSON.stringify(workflowUsesValues(caller))}`,
   );
-  // Validate proposed workflow changes locally; CI executes the merged master version.
+  // Validate the local copy; CI executes the upstream copy at the pinned
+  // commit, which is byte-identical to this file.
   return readFileSync(trustedPrWorkflow, "utf8");
 }
 
@@ -338,4 +353,37 @@ test("the trusted PR workflow regenerates stale stacked lockfiles", () => {
     /Restore regenerated PR lockfile|lockfile_regenerated|name: pr-lockfile/,
     "the policy lockfile artifact chain must stay removed; it put the policy job on every lane's critical path",
   );
+});
+
+test("pr.yml pin check rejects any caller other than the exact pinned upstream workflow", () => {
+  const caller = readFileSync(prCallerWorkflow, "utf8");
+  assert.ok(isPinnedTrustedPrCaller(caller));
+
+  const pinnedLine = `uses: ${PINNED_TRUSTED_PR_WORKFLOW}`;
+  assert.equal(caller.split(pinnedLine).length, 2, "pr.yml must contain the pinned call once");
+  const withUses = (value) => caller.replace(pinnedLine, `uses: ${value}`);
+  const workflowPath = "paperclipai/paperclip/.github/workflows/pr-trusted.yml";
+  const rejected = {
+    "branch ref": `${workflowPath}@master`,
+    "qualified branch ref": `${workflowPath}@refs/heads/master`,
+    "tag ref": `${workflowPath}@v2026.1005.0`,
+    "short SHA": `${workflowPath}@467125fa`,
+    "other full SHA": `${workflowPath}@334b2ae066953e293d40571cd3e205dcf916a731`,
+    "uppercase SHA": `${workflowPath}@467125FAFB47A8520856504FECC48D6E32055DB1`,
+    "alternate repository": "btparks904/paperclip/.github/workflows/pr-trusted.yml@467125fafb47a8520856504fecc48d6e32055db1",
+    "look-alike repository": "paperclipai/paperclip-fork/.github/workflows/pr-trusted.yml@467125fafb47a8520856504fecc48d6e32055db1",
+    "other workflow path": "paperclipai/paperclip/.github/workflows/pr.yml@467125fafb47a8520856504fecc48d6e32055db1",
+    "local invocation": "./.github/workflows/pr-trusted.yml",
+    "quoted value": `"${PINNED_TRUSTED_PR_WORKFLOW}"`,
+    "trailing text": `${PINNED_TRUSTED_PR_WORKFLOW} # master`,
+  };
+  for (const [label, value] of Object.entries(rejected)) {
+    assert.equal(isPinnedTrustedPrCaller(withUses(value)), false, label);
+  }
+  assert.equal(
+    isPinnedTrustedPrCaller(`${caller}  other:\n    uses: ./.github/workflows/pr-trusted.yml\n`),
+    false,
+    "a second workflow call",
+  );
+  assert.equal(isPinnedTrustedPrCaller(caller.replace(pinnedLine, "")), false, "no workflow call");
 });

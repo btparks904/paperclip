@@ -2927,6 +2927,17 @@ export function agentRoutes(
     };
   }
 
+  // WS-2 PR-W1: the unlocked exclusive-root pre-check of a create or hire,
+  // before the route's own secret normalization. svc.create repeats it under
+  // the assignment lock; a root claimed in between is the tracked PG-3 window.
+  async function precheckNewAgentInstructionRoot(
+    req: Request,
+    agent: { id: string; companyId: string; name: string },
+    adapterConfig: Record<string, unknown>,
+  ) {
+    await instructions.precheckExclusiveRoot(db, { ...agent, adapterConfig }, { isInstanceAdmin: isInstanceAdminActor(req) });
+  }
+
   // Server-side instance-admin determination (never from the request body,
   // query or headers); it only selects the detail level of a copy 409.
   function isInstanceAdminActor(req: Request): boolean {
@@ -2941,7 +2952,7 @@ export function agentRoutes(
     expectedTarget: Awaited<ReturnType<typeof resolveInstructionWriteTarget>>,
   ) {
     const [current] = await tx.select().from(agentsTable)
-      .where(and(eq(agentsTable.id, existing.id), eq(agentsTable.companyId, existing.companyId))).for("update");
+      .where(and(eq(agentsTable.id, existing.id), eq(agentsTable.companyId, existing.companyId))).for("no key update");
     if (!current) return null;
     const target = await resolveInstructionWriteTarget(current);
     if (target.mode !== expectedTarget.mode || target.rootPath !== expectedTarget.rootPath
@@ -4605,6 +4616,7 @@ export function agentRoutes(
       ),
       "add",
     );
+    await precheckNewAgentInstructionRoot(req, { id: hiredAgentId, companyId, name: hireInput.name }, desiredSkillAssignment.adapterConfig);
     const normalizedAdapterConfig = await normalizeMediatedAdapterConfigForPersistence({
       companyId,
       adapterType: hireInput.adapterType,
@@ -4906,6 +4918,7 @@ export function agentRoutes(
       ),
       "add",
     );
+    await precheckNewAgentInstructionRoot(req, { id: agentId, companyId, name: createInput.name }, desiredSkillAssignment.adapterConfig);
     const normalizedAdapterConfig = await normalizeMediatedAdapterConfigForPersistence({
       companyId,
       adapterType: createInput.adapterType,
@@ -5683,6 +5696,8 @@ export function agentRoutes(
     const agent = await svc.update(id, patchData, {
       instructionConfigWrite,
       secretNormalization: { strictMode: strictSecretsMode },
+      // WS-2 PR-W1: only the detail level of an exclusive-root 409.
+      instructionRootGuard: { isInstanceAdmin: isInstanceAdminActor(req) },
       recordRevision: {
         createdByAgentId: actor.agentId,
         createdByUserId: actor.actorType === "user" ? actor.actorId : null,
