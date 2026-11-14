@@ -12,6 +12,7 @@ import request from "supertest";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { eq } from "drizzle-orm";
 import { companies, companySecrets, createDb } from "@paperclipai/db";
+import { resolveCodexAuthCacheDir } from "@paperclipai/adapter-codex-local/server";
 import { AdapterAuthSessionConflictError } from "../services/device-login-service.js";
 import type {
   AdapterAuthSessionRow,
@@ -238,7 +239,9 @@ describe("PG-1: a failed Codex device-login promotion keeps the account home it 
     return app;
   }
   const loginPath = () => `/api/companies/${companyId}/adapters/codex_local/login-sessions`;
-  const accountHomeDir = () => path.join(home, "instances", "default", "companies", companyId, "codex-auth-cache", ACCOUNT_ID);
+  // The same resolver the promotion uses, so the path follows PAPERCLIP_HOME
+  // and PAPERCLIP_INSTANCE_ID (the CI runner sets a per-run instance id).
+  const accountHomeDir = () => path.join(resolveCodexAuthCacheDir(process.env, companyId), ACCOUNT_ID);
 
   /** Starts a login, lets the fake sandbox finish, and waits for the failed terminal state. */
   async function runFailedLogin() {
