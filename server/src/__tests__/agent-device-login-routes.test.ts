@@ -1251,10 +1251,10 @@ describe("adapter device-login routes", () => {
     expect(mockSecretService.create).not.toHaveBeenCalled();
   });
 
-  it("fails closed and removes the account home when secret creation fails", async () => {
-    // This login created the account home, so a secret-creation failure must
-    // fail the login and remove the directory it just created, so the
-    // operation stays atomic.
+  it("fails closed and keeps the account home it created when secret creation fails (PG-1)", async () => {
+    // This login created the account home. A secret-creation failure must
+    // fail the login, and the directory it just created is kept (PG-1): no
+    // claimant scan runs and nothing deletes it.
     const accountHomeDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-codex-account-home-test-"));
     accountHomeTestDirs.push(accountHomeDir);
     mockDeviceLoginPromotion.mockResolvedValueOnce({
@@ -1279,7 +1279,8 @@ describe("adapter device-login routes", () => {
       expect(status.body.failure?.reason).toBe("promotion_failed");
     });
 
-    await expect(lstat(accountHomeDir)).rejects.toThrow();
+    expect(mockSecretService.list).not.toHaveBeenCalled();
+    await expect(lstat(accountHomeDir)).resolves.toBeDefined();
   });
 
   it("a secret creation failure keeps an account home that already existed", async () => {
@@ -1524,18 +1525,16 @@ describe("adapter device-login routes", () => {
       expect(status.body.failure?.reason).toBe("promotion_failed");
     });
 
-    expect(mockSecretService.resolveSecretValueForDeviceLoginCheck).toHaveBeenCalledWith(
-      COMPANY_1,
-      "aws-secret",
-      expect.objectContaining({ configPath: "secrets.MY_CODEX_HOME" }),
-    );
+    // PG-1: a failed promotion no longer scans or deletes, so the directory
+    // is kept without resolving any secret.
+    expect(mockSecretService.resolveSecretValueForDeviceLoginCheck).not.toHaveBeenCalled();
     await expect(lstat(accountHomeDir)).resolves.toBeDefined();
   });
 
-  it("removes the account home when the cleanup scan finds no claimant", async () => {
-    // No secret, under any name, resolves to this directory, so the cleanup
-    // must still remove it — the broader scan must not make cleanup any less
-    // eager than the old name-only check when nothing claims the directory.
+  it("keeps the account home even when no secret names it (PG-1)", async () => {
+    // No secret, under any name, resolves to this directory. PG-1: the
+    // failed promotion still keeps the directory it created; there is no
+    // automatic cleanup.
     const accountHomeDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-codex-account-home-test-"));
     accountHomeTestDirs.push(accountHomeDir);
     mockDeviceLoginPromotion.mockResolvedValueOnce({
@@ -1565,7 +1564,7 @@ describe("adapter device-login routes", () => {
       expect(status.body.failure?.reason).toBe("promotion_failed");
     });
 
-    await expect(lstat(accountHomeDir)).rejects.toThrow();
+    await expect(lstat(accountHomeDir)).resolves.toBeDefined();
   });
 
   it("preserves the account home when the cleanup scan cannot resolve a secret's value", async () => {

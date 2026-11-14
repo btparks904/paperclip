@@ -17,7 +17,7 @@ import { paperclipRunnerTransitionConfig, normalizeLegacyRunnerProvider, isPaper
 import { executionProjectionForRun, executionProjectionsForRuns } from "../services/execution-projection.js";
 import { Router, type NextFunction, type Request, type Response } from "express";
 import { generateKeyPairSync, randomUUID } from "node:crypto";
-import { readFile, rm } from "node:fs/promises";
+import { readFile } from "node:fs/promises";
 import path from "node:path";
 import type { Db } from "@paperclipai/db";
 import type { ChatChannelService } from "../services/chat-channels.js";
@@ -353,84 +353,6 @@ async function assertAccountHomeSecretMatches(
       `device-login credential promotion rejected: the existing ${secretName} secret does not name this account's own home`,
     );
   }
-}
-
-// Confirms no company secret, under any name or provider, still names this
-// account home before a failed promotion deletes the directory. The
-// generated `CODEX_HOME_<handle>` name is not the only secret that can
-// reference this directory: a user can bind a hand-named secret to the same
-// account home, so a check that reads only the generated name misses that
-// secret and deletes a directory it still needs. A bound agent then reads a
-// `CODEX_HOME` value that points at nothing. A secret's value is a plain
-// string regardless of its provider, so an AWS Secrets Manager-backed secret
-// (or any other provider) can equal this directory's path just as a
-// `local_encrypted` secret can; the scan resolves every secret's value, not
-// only `local_encrypted` ones.
-//
-// A secret whose value fails to resolve is NOT proof that secret names a
-// different directory: the resolve call can fail for a secret that would
-// have matched. Treating that failure as a non-match would let the cleanup
-// delete a directory a secret still needs. So the scan fails closed: any
-// resolution failure makes the whole scan report a claim, even when every
-// secret that DID resolve named a different directory.
-//
-// The scan lists every secret once, then resolves each secret's value in
-// turn, and each resolve call is its own round trip. A new secret can enter
-// the company between the initial list and the last resolve call, so a
-// single pass can finish, find no claimant among the secrets it read, and
-// still miss a secret that named this directory moments later. So the scan
-// re-lists after every pass and resolves only the secrets it has not yet
-// checked, and it only reports "no claimant" once a pass finds nothing new
-// to check. A scan that keeps finding new secrets on every pass fails
-// closed after a bounded number of passes, so a fast stream of concurrent
-// secret creation cannot force an unsafe delete.
-//
-// The scan alone still cannot rule out a secret write that commits after the
-// scan's own last pass finishes but before the caller's delete runs: the
-// scan and that write are two separate operations with no shared state, so
-// neither can see the other. The caller closes that window by running the
-// scan and the delete inside `withAccountHomeSecretMutationLock`, the same
-// lock every `local_encrypted` secret create or rotate holds for its whole
-// write. That lock is the atomic protection; the multi-pass scan above stays
-// as a defense-in-depth check for a write path that has not taken the lock.
-const ACCOUNT_HOME_CLAIM_SCAN_MAX_PASSES = 5;
-
-async function anySecretNamesAccountHome(
-  secretsSvc: {
-    list: (companyId: string) => Promise<Array<{ id: string; name: string; provider: string }>>;
-    resolveSecretValueForDeviceLoginCheck: (
-      companyId: string,
-      secretId: string,
-      context: { configPath: string },
-    ) => Promise<string>;
-  },
-  companyId: string,
-  accountHomeDir: string,
-): Promise<boolean> {
-  const checkedSecretIds = new Set<string>();
-  for (let pass = 0; pass < ACCOUNT_HOME_CLAIM_SCAN_MAX_PASSES; pass += 1) {
-    const secrets = await secretsSvc.list(companyId);
-    const uncheckedSecrets = secrets.filter((secret) => !checkedSecretIds.has(secret.id));
-    if (uncheckedSecrets.length === 0) return false;
-    let resolutionFailed = false;
-    for (const secret of uncheckedSecrets) {
-      checkedSecretIds.add(secret.id);
-      const storedValue = await secretsSvc
-        .resolveSecretValueForDeviceLoginCheck(companyId, secret.id, {
-          configPath: `secrets.${secret.name}`,
-        })
-        .catch(() => {
-          resolutionFailed = true;
-          return null;
-        });
-      if (storedValue === accountHomeDir) return true;
-    }
-    if (resolutionFailed) return true;
-  }
-  // Every pass found a secret it had not yet checked. Fail closed: an
-  // endless stream of new secrets is not proof that none of them claims
-  // this directory.
-  return true;
 }
 
 // Serializes hire requests that share a company and run, so a retried POST
@@ -981,36 +903,24 @@ export function agentRoutes(
                 return;
               }
               // The account home write failed for a reason other than a naming
-              // conflict. Remove the directory only when this exact login created
-              // it AND no secret, under any name, still names it. The lock
-              // around this whole method already rules out another
-              // SAME-ACCOUNT LOGIN from being mid-sequence here, but it does
-              // not rule out a secret a different path created at this exact
-              // directory in between the read above and this failure — for
-              // example, a concurrent login for the same account that won a
-              // race on this exact name, or a user who names a secret by hand
-              // under a different name entirely. The re-check is this call's
-              // only signal for that case, so it stays even under the lock:
-              // `accountHomeCreated` alone is not proof no such secret now
-              // claims the directory, and a same-name check alone is not proof
-              // either, because the claiming secret can carry any name.
+              // conflict. The promotion fails, and the account home directory is
+              // kept, even when this login created it (PG-1). It is not deleted
+              // here, and nothing else removes it automatically.
               //
-              // The check and the delete run inside `withAccountHomeSecretMutationLock`,
-              // the same lock the secrets service holds for the whole of a
-              // `local_encrypted` secret's create or rotate call. That closes the
-              // window `anySecretNamesAccountHome`'s own multi-pass scan cannot: a
-              // secret write that commits after this check's last pass but before
-              // the delete runs. Under the shared lock, a write either finishes
-              // (and becomes visible to the check) before this section acquires the
-              // lock, or it waits for this section to finish before it can commit.
-              if (result.accountHomeCreated) {
-                await withAccountHomeSecretMutationLock(undefined, context.companyId, async () => {
-                  const claimed = await anySecretNamesAccountHome(secretsSvc, context.companyId, accountHomeDir);
-                  if (!claimed) {
-                    await rm(accountHomeDir, { recursive: true, force: true }).catch(() => undefined);
-                  }
-                });
-              }
+              // A delete here would first have to prove that no secret names
+              // the directory, and that proof is not available: a secret write
+              // in another database transaction (for example, an agent
+              // configuration save that normalizes a raw value into a
+              // `local_encrypted` secret) takes and releases
+              // `withAccountHomeSecretMutationLock` before its transaction
+              // commits. A scan run in that gap cannot see the uncommitted row,
+              // so it would delete a directory the secret names once it commits.
+              //
+              // Trade-off: the kept directory holds this account's credential
+              // (`auth.json`) with no company secret naming it. It stays private
+              // (directory 0700, file 0600, under the company's account-home
+              // cache root), and a later login for the same account reuses it.
+              // An operator removes it by hand if it is not wanted.
               throw new Error(
                 "device-login credential promotion rejected: failed to record the account home secret",
               );
