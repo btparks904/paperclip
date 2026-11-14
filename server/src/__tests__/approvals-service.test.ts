@@ -17,6 +17,16 @@ vi.mock("../services/hire-hook.js", () => ({
   notifyHireApproved: mockNotifyHireApproved,
 }));
 
+// PG-4: the hire guard reads the database; its rules have their own suite.
+const mockHireGuard = vi.hoisted(() => ({
+  authorizeHireActivation: vi.fn(async () => undefined),
+  authorizeHireApprovalCreate: vi.fn(async () => undefined),
+}));
+
+vi.mock("../services/hire-approval-authorization.js", () => mockHireGuard);
+
+const BOARD_DECIDER = { type: "board" as const, userId: "board", source: "local_implicit" as const };
+
 type ApprovalRecord = {
   id: string;
   companyId: string;
@@ -24,7 +34,11 @@ type ApprovalRecord = {
   status: string;
   payload: Record<string, unknown>;
   requestedByAgentId: string | null;
+  updatedAt: Date;
 };
+
+// PG-4: the approval version a reviewer saw; an open hire is approved with it.
+const REVIEWED_AT = new Date("2026-11-13T12:00:00.000Z");
 
 function createApproval(status: string): ApprovalRecord {
   return {
@@ -34,12 +48,17 @@ function createApproval(status: string): ApprovalRecord {
     status,
     payload: { agentId: "agent-1" },
     requestedByAgentId: "requester-1",
+    updatedAt: REVIEWED_AT,
   };
 }
 
 function createDbStub(selectResults: ApprovalRecord[][], updateResults: ApprovalRecord[]) {
   const pendingSelectResults = [...selectResults];
-  const selectWhere = vi.fn(async () => pendingSelectResults.shift() ?? []);
+  // PG-4: approve locks the approval row first (select ... for update).
+  const selectWhere = vi.fn(() => {
+    const next = async () => pendingSelectResults.shift() ?? [];
+    return { then: (resolve: any, reject: any) => next().then(resolve, reject), for: vi.fn(() => next()) };
+  });
   const from = vi.fn(() => ({ where: selectWhere }));
   const select = vi.fn(() => ({ from }));
 
@@ -73,7 +92,7 @@ describe("approvalService resolution idempotency", () => {
     );
 
     const svc = approvalService(dbStub.db as any);
-    const result = await svc.approve("approval-1", "board", "ship it");
+    const result = await svc.approve("approval-1", "board", "ship it", { decider: BOARD_DECIDER, expectedUpdatedAt: REVIEWED_AT });
 
     expect(result.applied).toBe(false);
     expect(result.approval.status).toBe("approved");
@@ -97,13 +116,17 @@ describe("approvalService resolution idempotency", () => {
 
   it("still performs side effects when the resolution update is newly applied", async () => {
     const approved = createApproval("approved");
-    const dbStub = createDbStub([[createApproval("pending")]], [approved]);
+    const dbStub = createDbStub([[createApproval("pending")], [createApproval("pending")]], [approved]);
 
     const svc = approvalService(dbStub.db as any);
-    const result = await svc.approve("approval-1", "board", "ship it");
+    const result = await svc.approve("approval-1", "board", "ship it", { decider: BOARD_DECIDER, expectedUpdatedAt: REVIEWED_AT });
 
     expect(result.applied).toBe(true);
-    expect(mockAgentService.activatePendingApproval).toHaveBeenCalledWith("agent-1", approved.payload);
+    expect(mockAgentService.activatePendingApproval).toHaveBeenCalledWith(
+      "agent-1",
+      approved.payload,
+      expect.objectContaining({ authorize: expect.any(Function) }),
+    );
     expect(mockNotifyHireApproved).toHaveBeenCalledTimes(1);
   });
 
@@ -123,10 +146,11 @@ describe("approvalService resolution idempotency", () => {
         },
       },
     };
-    const dbStub = createDbStub([[{ ...createApproval("pending"), payload: approved.payload }]], [approved]);
+    const pendingRow = { ...createApproval("pending"), payload: approved.payload };
+    const dbStub = createDbStub([[pendingRow], [pendingRow]], [approved]);
 
     const svc = approvalService(dbStub.db as any);
-    const result = await svc.approve("approval-1", "board", "ship it");
+    const result = await svc.approve("approval-1", "board", "ship it", { decider: BOARD_DECIDER, expectedUpdatedAt: REVIEWED_AT });
 
     expect(result.applied).toBe(true);
     expect(mockAgentService.create).toHaveBeenCalledWith(

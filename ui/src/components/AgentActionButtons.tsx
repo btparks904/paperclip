@@ -33,6 +33,7 @@ import { AgentStatusBadge } from "./StatusBadge";
 import { agentsApi } from "../api/agents";
 import { ApiError } from "../api/client";
 import { queryKeys } from "../lib/queryKeys";
+import { approvalReviewPath } from "../lib/approval-review";
 import { agentRouteRef } from "../lib/utils";
 import { copyTextToClipboard } from "../lib/clipboard";
 import { useDialogActions } from "../context/DialogContext";
@@ -291,6 +292,13 @@ export function AgentActionButtons({
       }
     },
     onError: (err) => {
+      // PG-4: an open hire approval is approved from its own review page.
+      const reviewPath = approvalReviewPath(err);
+      if (reviewPath) {
+        onActionError?.(null);
+        navigate(reviewPath);
+        return;
+      }
       reportError(err instanceof Error ? err.message : "Action failed");
     },
   });

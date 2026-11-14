@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { useNavigate, useLocation } from "@/lib/router";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
-import { approvalsApi } from "../api/approvals";
+import { approvalsApi, type ApprovalReviewVersion } from "../api/approvals";
 import { agentsApi } from "../api/agents";
 import { useCompany } from "../context/CompanyContext";
 import { useBreadcrumbs } from "../context/BreadcrumbContext";
@@ -43,11 +43,11 @@ export function Approvals() {
   });
 
   const approveMutation = useMutation({
-    mutationFn: (id: string) => approvalsApi.approve(id),
-    onSuccess: (_approval, id) => {
+    mutationFn: (reviewed: ApprovalReviewVersion) => approvalsApi.approve(reviewed),
+    onSuccess: (_approval, reviewed) => {
       setActionError(null);
       queryClient.invalidateQueries({ queryKey: queryKeys.approvals.list(selectedCompanyId!) });
-      navigate(`/approvals/${id}?resolved=approved`);
+      navigate(`/approvals/${reviewed.id}?resolved=approved`);
     },
     onError: (err) => {
       setActionError(err instanceof Error ? err.message : "Failed to approve");
@@ -120,7 +120,7 @@ export function Approvals() {
               key={approval.id}
               approval={approval}
               requesterAgent={approval.requestedByAgentId ? (agents ?? []).find((a) => a.id === approval.requestedByAgentId) ?? null : null}
-              onApprove={() => approveMutation.mutate(approval.id)}
+              onApprove={() => approveMutation.mutate(approval)}
               onReject={() => rejectMutation.mutate(approval.id)}
               detailLink={`/approvals/${approval.id}`}
               isPending={approveMutation.isPending || rejectMutation.isPending}

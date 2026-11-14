@@ -1,5 +1,5 @@
 import { connectionIntentService } from "../services/connection-intents.js";
-import { completeConnectionIntentSchema } from "@paperclipai/shared";
+import { approvePendingAgentSchema, completeConnectionIntentSchema } from "@paperclipai/shared";
 import { agentFileStore, agentFileTokenFromHash, type AgentFileConfigRepair } from "../services/agent-file-store.js";
 import { pipeline } from "node:stream/promises";
 import { resolveAgentAppearance, agentAvatarUrl } from "@paperclipai/shared";
@@ -263,6 +263,9 @@ import {
 } from "../services/native-runtime/provider-profile.js";
 import { managedAgentProfileService } from "../services/managed-agent-profiles.js";
 import { remoteAgentProfileService } from "../services/remote-agent-profiles.js";
+import { authorizeHireActivation } from "../services/hire-approval-authorization.js";
+import { APPROVAL_REVIEW_VERSION_REQUIRED } from "../services/approvals.js";
+import { providerTraceSettingChanges } from "../services/provider-trace-setting.js";
 
 const AGENT_SKILL_ASSIGNMENT_MODES = ["add", "remove", "replace"] as const;
 
@@ -2268,11 +2271,8 @@ export function agentRoutes(
     nextRuntimeConfig: unknown,
     previousRuntimeConfig?: unknown,
   ): void {
-    const previousRaw =
-      asRecord(asRecord(previousRuntimeConfig)?.debug)?.providerTrace === "raw";
-    const nextRaw =
-      asRecord(asRecord(nextRuntimeConfig)?.debug)?.providerTrace === "raw";
-    if (previousRaw !== nextRaw) assertInstanceAdmin(req);
+    // PG-4: the same predicate guards hire approvals (hire-approval-authorization.ts).
+    if (providerTraceSettingChanges(nextRuntimeConfig, previousRuntimeConfig)) assertInstanceAdmin(req);
   }
 
   async function assertAgentDefaultEnvironmentSelection(
@@ -5846,10 +5846,36 @@ export function agentRoutes(
 
     let agent: Awaited<ReturnType<typeof svc.getById>> | null = null;
     if (openApproval) {
-      await approvalsSvc.approve(openApproval.id, decidedByUserId);
+      // PG-4: the open hire approval's payload is what activation applies, so
+      // the caller must name the approval version it reviewed. The version is
+      // checked under the approval row lock; without it nothing is decided.
+      const body = approvePendingAgentSchema.safeParse(req.body ?? {});
+      if (!body.success) throw badRequest("Invalid request body", body.error.issues);
+      const reviewed = body.data.expectedApprovalUpdatedAt;
+      if (!reviewed) {
+        throw new HttpError(428, "This agent has an open hire approval. Review that approval and approve it with the reviewed version. Nothing was changed.", {
+          code: APPROVAL_REVIEW_VERSION_REQUIRED,
+          approvalId: openApproval.id,
+        });
+      }
+      await approvalsSvc.approve(openApproval.id, decidedByUserId, null, {
+        decider: req.actor,
+        expectedUpdatedAt: new Date(reviewed),
+      });
       agent = await svc.getById(id);
     } else {
-      const approval = await svc.activatePendingApproval(id);
+      // PG-4: the unlinked historical fallback is authorized like a linked
+      // activation (board, current agents:create, instance admin for an
+      // external root), inside the activation transaction.
+      const approval = await svc.activatePendingApproval(id, null, {
+        authorize: (txDb, locked) => authorizeHireActivation(txDb, req.actor, {
+          companyId: existing.companyId,
+          agent: locked,
+          payload: null,
+          requestedByAgentId: null,
+          approvalId: null,
+        }),
+      });
       if (!approval) {
         res.status(404).json({ error: "Agent not found" });
         return;

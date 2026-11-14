@@ -1,13 +1,33 @@
+import { randomUUID } from "node:crypto";
 import { agentAppearanceSchema } from "@paperclipai/shared";
 import { and, asc, eq, inArray, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { approvalComments, approvals } from "@paperclipai/db";
-import { notFound, unprocessable } from "../errors.js";
+import { agents, approvalComments, approvals } from "@paperclipai/db";
+import { HttpError, conflict, forbidden, notFound, unprocessable } from "../errors.js";
 import { redactCurrentUserText } from "../log-redaction.js";
 import { agentService } from "./agents.js";
 import { budgetService } from "./budgets.js";
 import { notifyHireApproved } from "./hire-hook.js";
+import {
+  authorizeHireActivation,
+  authorizeHireApprovalCreate,
+  changesLinkedInstructions,
+  recordHireInstructionAmendment,
+  type HireApprovalActor,
+} from "./hire-approval-authorization.js";
 import { instanceSettingsService } from "./instance-settings.js";
+
+export const APPROVAL_REVIEW_VERSION_REQUIRED = "approval_review_version_required";
+
+/**
+ * PG-4: the version written by a change to an open approval. It is strictly
+ * later than the stored version at millisecond precision (the precision a
+ * client reads it at), so a reviewed version never names a later payload,
+ * even when two writes fall in the same millisecond.
+ */
+function nextApprovalVersion() {
+  return sql`greatest(now(), date_trunc('milliseconds', ${approvals.updatedAt}) + interval '1 millisecond')`;
+}
 
 export function approvalService(db: Db) {
   const agentsSvc = agentService(db);
@@ -142,7 +162,27 @@ export function approvalService(db: Db) {
       return updated;
     },
 
-    approve: async (id: string, decidedByUserId: string, decisionNote?: string | null) => {
+    approve: async (
+      id: string,
+      decidedByUserId: string,
+      decisionNote?: string | null,
+      options?: {
+        /**
+         * PG-4: the board actor deciding. Required for a `hire_agent`
+         * approval; it is re-authorized inside the approval transaction.
+         */
+        decider?: HireApprovalActor;
+        /**
+         * The approval version the reviewer decided on. When set, the decision
+         * is refused with 409 if the approval changed since. PG-4: required
+         * for an open `hire_agent` approval (428 without it), so a payload
+         * that changed after review cannot be approved as the reviewed one.
+         * Every write that can change an open approval's payload advances
+         * `updatedAt` by at least one millisecond (see `nextApprovalVersion`).
+         */
+        expectedUpdatedAt?: Date;
+      },
+    ) => {
       // WS-2 PR-W1: the decision and a hire's activation or creation commit or
       // roll back together. A refused activation (for example a 409 on the
       // instructions root) leaves the approval pending or revision requested,
@@ -152,18 +192,61 @@ export function approvalService(db: Db) {
       const now = new Date();
       const { updated, applied, hireApprovedAgentId } = await db.transaction(async (tx) => {
         const txDb = tx as unknown as Db;
+        // PG-4: lock the approval row first, so a resubmit, a revision request
+        // or a second approval of the same row waits for this decision, and
+        // this decision reads, authorizes and applies one payload version.
+        const [locked] = await tx.select().from(approvals).where(eq(approvals.id, id)).for("update");
+        if (!locked) throw notFound("Approval not found");
+        if (options?.expectedUpdatedAt && canResolveStatuses.has(locked.status)
+          && locked.updatedAt.getTime() !== options.expectedUpdatedAt.getTime()) {
+          throw conflict("The approval changed after it was reviewed. Nothing was changed. Reload and review it again.", {
+            code: "approval_changed_since_review",
+          });
+        }
+        const isOpenHire = locked.type === "hire_agent" && canResolveStatuses.has(locked.status);
+        if (isOpenHire && options?.decider?.type !== "board") {
+          throw forbidden("A hire approval can only be decided by an authorized board user");
+        }
+        if (isOpenHire && !options?.expectedUpdatedAt) {
+          throw new HttpError(428, "Approving a hire needs the approval version that was reviewed. Nothing was changed. Reload the approval, review it and approve again.", {
+            code: APPROVAL_REVIEW_VERSION_REQUIRED,
+            approvalId: locked.id,
+          });
+        }
         const resolution = await resolveApproval(id, "approved", decidedByUserId, decisionNote, txDb);
         let hiredAgentId: string | null = null;
         if (resolution.applied && resolution.approval.type === "hire_agent") {
           const updated = resolution.approval;
+          const decider = options!.decider!;
           const payload = updated.payload as Record<string, unknown>;
           const payloadAgentId = typeof payload.agentId === "string" ? payload.agentId : null;
           const txAgents = agentService(txDb);
           if (payloadAgentId) {
-            await txAgents.activatePendingApproval(payloadAgentId, payload);
+            // Decision and activation commit together; the guard runs under
+            // the activation's agent row lock, on the exact payload approved.
+            const activation = await txAgents.activatePendingApproval(payloadAgentId, payload, {
+              authorize: (activationDb, agent) => authorizeHireActivation(activationDb, decider, {
+                companyId: updated.companyId,
+                agent,
+                payload,
+                requestedByAgentId: updated.requestedByAgentId ?? null,
+                approvalId: updated.id,
+              }),
+            });
+            if (!activation?.activated) {
+              throw conflict("The hire approval's agent is no longer pending approval. Nothing was changed.");
+            }
             hiredAgentId = payloadAgentId;
           } else {
+            const newAgentId = randomUUID();
+            await authorizeHireApprovalCreate(txDb, decider, {
+              companyId: updated.companyId,
+              payload,
+              requestedByAgentId: updated.requestedByAgentId ?? null,
+              newAgentId,
+            });
             const created = await txAgents.create(updated.companyId, {
+              id: newAgentId,
               name: String(payload.name ?? "New Agent"),
               appearance: payload.appearance == null ? undefined : agentAppearanceSchema.parse(payload.appearance),
               role: String(payload.role ?? "general"),
@@ -250,41 +333,93 @@ export function approvalService(db: Db) {
         throw unprocessable("Only pending approvals can request revision");
       }
 
+      // PG-4: conditional on the status, so a revision request that loses a
+      // race with a decision cannot reopen the decided approval.
       const now = new Date();
-      return db
+      const updated = await db
         .update(approvals)
         .set({
           status: "revision_requested",
           decidedByUserId,
           decisionNote: decisionNote ?? null,
           decidedAt: now,
-          updatedAt: now,
+          updatedAt: nextApprovalVersion(),
         })
-        .where(eq(approvals.id, id))
+        .where(and(eq(approvals.id, id), eq(approvals.status, "pending")))
         .returning()
-        .then((rows) => rows[0]);
+        .then((rows) => rows[0] ?? null);
+      if (!updated) throw unprocessable("Only pending approvals can request revision");
+      return updated;
     },
 
-    resubmit: async (id: string, payload?: Record<string, unknown>) => {
+    /**
+     * PG-4: `expected` is the approval version the caller read and authorized.
+     * The update applies only while the row is still revision requested at
+     * that version, so a resubmit cannot replace a payload that changed since,
+     * or reopen an approval that was decided in between. Without a payload the
+     * expected version's payload is kept.
+     */
+    resubmit: async (
+      id: string,
+      payload?: Record<string, unknown>,
+      expected?: { updatedAt: Date; payload: Record<string, unknown> },
+      options?: {
+        /**
+         * PG-4: an authorized board user's explicit amendment of a linked
+         * hire's instruction configuration. When the stored payload changes
+         * the agent's instruction keys, the amendment is recorded in the same
+         * transaction, bound to the exact payload.
+         */
+        instructionAmendment?: { actorUserId: string };
+      },
+    ) => {
       const existing = await getExistingApproval(id);
       if (existing.status !== "revision_requested") {
         throw unprocessable("Only revision requested approvals can be resubmitted");
       }
+      const version = expected ?? { updatedAt: existing.updatedAt, payload: existing.payload as Record<string, unknown> };
 
-      const now = new Date();
-      return db
-        .update(approvals)
-        .set({
-          status: "pending",
-          payload: payload ?? existing.payload,
-          decisionNote: null,
-          decidedByUserId: null,
-          decidedAt: null,
-          updatedAt: now,
-        })
-        .where(eq(approvals.id, id))
-        .returning()
-        .then((rows) => rows[0]);
+      return db.transaction(async (tx) => {
+        const txDb = tx as unknown as Db;
+        const updated = await tx
+          .update(approvals)
+          .set({
+            status: "pending",
+            payload: payload ?? version.payload,
+            decisionNote: null,
+            decidedByUserId: null,
+            decidedAt: null,
+            updatedAt: nextApprovalVersion(),
+          })
+          .where(and(
+            eq(approvals.id, id),
+            eq(approvals.status, "revision_requested"),
+            // Millisecond precision: the version was read into a JS Date.
+            sql`date_trunc('milliseconds', ${approvals.updatedAt}) = ${version.updatedAt.toISOString()}::timestamptz`,
+          ))
+          .returning()
+          .then((rows) => rows[0] ?? null);
+        if (!updated) {
+          throw conflict("The approval changed while it was being resubmitted. Nothing was changed. Reload and retry.");
+        }
+        const stored = updated.payload as Record<string, unknown>;
+        const linkedAgentId = typeof stored.agentId === "string" ? stored.agentId : null;
+        if (options?.instructionAmendment && updated.type === "hire_agent" && linkedAgentId) {
+          const [agent] = await tx.select({ id: agents.id, companyId: agents.companyId, adapterConfig: agents.adapterConfig })
+            .from(agents).where(eq(agents.id, linkedAgentId));
+          if (agent && agent.companyId === updated.companyId && changesLinkedInstructions(stored, agent.adapterConfig)) {
+            await recordHireInstructionAmendment(txDb, {
+              companyId: updated.companyId,
+              approvalId: updated.id,
+              actorUserId: options.instructionAmendment.actorUserId,
+              agentId: agent.id,
+              payload: stored,
+              agentAdapterConfig: agent.adapterConfig,
+            });
+          }
+        }
+        return updated;
+      });
     },
 
     listComments: async (approvalId: string) => {

@@ -1323,7 +1323,10 @@ describe.sequential("agent permission routes", () => {
       .send({}));
 
     expect(res.status).toBe(200);
-    expect(mockAgentService.activatePendingApproval).toHaveBeenCalledWith(agentId);
+    // PG-4: the unlinked fallback activation runs the hire guard inside its transaction.
+    expect(mockAgentService.activatePendingApproval).toHaveBeenCalledWith(agentId, null, {
+      authorize: expect.any(Function),
+    });
     expect(mockApprovalService.approve).not.toHaveBeenCalled();
     expect(mockLogActivity).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
       companyId,
@@ -1370,13 +1373,18 @@ describe.sequential("agent permission routes", () => {
       companyIds: [companyId],
     });
 
+    // PG-4: the open hire approval's reviewed version is sent and passed on.
     const res = await requestApp(app, (baseUrl) => request(baseUrl)
       .post(`/api/agents/${agentId}/approve`)
-      .send({}));
+      .send({ expectedApprovalUpdatedAt: "2026-11-13T12:00:00.000Z" }));
 
     expect(res.status).toBe(200);
     // The shared approval flow handles activation; we must not double-activate.
-    expect(mockApprovalService.approve).toHaveBeenCalledWith("approval-1", "board-user");
+    // PG-4: the deciding board actor is passed for the in-transaction re-check.
+    expect(mockApprovalService.approve).toHaveBeenCalledWith("approval-1", "board-user", null, {
+      decider: expect.objectContaining({ type: "board", userId: "board-user" }),
+      expectedUpdatedAt: new Date("2026-11-13T12:00:00.000Z"),
+    });
     expect(mockAgentService.activatePendingApproval).not.toHaveBeenCalled();
     expect(mockLogActivity).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
       action: "agent.approved",

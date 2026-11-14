@@ -1643,10 +1643,14 @@ export interface PluginApprovalsClient {
    *
    * `applied` is `true` when this call performed the decision and `false` when
    * the approval had already converged to a decided state (idempotent replays).
+   *
+   * `expectedUpdatedAt` is the `updatedAt` of the approval as the plugin showed
+   * it to the user. The host refuses the decision if the approval changed
+   * since, and requires it to approve an open `hire_agent` approval.
    */
   decide(
     approvalId: string,
-    input: { action: "approve" | "reject"; actorUserId?: string; decisionNote?: string | null },
+    input: { action: "approve" | "reject"; actorUserId?: string; decisionNote?: string | null; expectedUpdatedAt?: string },
     companyId: string,
   ): Promise<{ approval: Approval; applied: boolean }>;
 }

@@ -633,11 +633,13 @@ export {
 export {
   createApprovalSchema,
   resolveApprovalSchema,
+  approvePendingAgentSchema,
   requestApprovalRevisionSchema,
   resubmitApprovalSchema,
   addApprovalCommentSchema,
   type CreateApproval,
   type ResolveApproval,
+  type ApprovePendingAgent,
   type RequestApprovalRevision,
   type ResubmitApproval,
   type AddApprovalComment,

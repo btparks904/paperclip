@@ -13,9 +13,25 @@ export type CreateApproval = z.infer<typeof createApprovalSchema>;
 
 export const resolveApprovalSchema = z.object({
   decisionNote: multilineTextSchema.optional().nullable(),
+  /**
+   * The approval version (its `updatedAt`) the reviewer decided on. When set,
+   * an approval decision is refused if the approval changed since. PG-4:
+   * required to approve an open `hire_agent` approval.
+   */
+  expectedUpdatedAt: z.string().datetime({ offset: true }).optional(),
 });
 
 export type ResolveApproval = z.infer<typeof resolveApprovalSchema>;
+
+/**
+ * PG-4: approving a pending agent directly. When the agent has an open hire
+ * approval, `expectedApprovalUpdatedAt` is that approval's reviewed version.
+ */
+export const approvePendingAgentSchema = z.object({
+  expectedApprovalUpdatedAt: z.string().datetime({ offset: true }).optional(),
+});
+
+export type ApprovePendingAgent = z.infer<typeof approvePendingAgentSchema>;
 
 export const requestApprovalRevisionSchema = z.object({
   decisionNote: multilineTextSchema.optional().nullable(),
@@ -25,6 +41,12 @@ export type RequestApprovalRevision = z.infer<typeof requestApprovalRevisionSche
 
 export const resubmitApprovalSchema = z.object({
   payload: z.record(z.string(), z.unknown()).optional(),
+  /**
+   * A board user's explicit amendment of a linked hire's instruction
+   * configuration. Without it, a payload that changes the pending agent's
+   * instruction keys is refused as stale.
+   */
+  instructionAmendment: z.boolean().optional(),
 });
 
 export type ResubmitApproval = z.infer<typeof resubmitApprovalSchema>;

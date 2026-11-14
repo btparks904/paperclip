@@ -86,7 +86,11 @@ export function ApprovalDetail() {
   };
 
   const approveMutation = useMutation({
-    mutationFn: () => approvalsApi.approve(approvalId!),
+    // PG-4: approve the version shown on this page.
+    mutationFn: () => {
+      if (!approval) throw new Error("The approval is not loaded. Reload and review it again.");
+      return approvalsApi.approve(approval);
+    },
     onSuccess: () => {
       setError(null);
       refresh();

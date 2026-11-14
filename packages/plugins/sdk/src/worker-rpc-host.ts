@@ -1123,7 +1123,7 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
 
         async decide(
           approvalId: string,
-          input: { action: "approve" | "reject"; actorUserId?: string; decisionNote?: string | null },
+          input: { action: "approve" | "reject"; actorUserId?: string; decisionNote?: string | null; expectedUpdatedAt?: string },
           companyId: string,
         ) {
           return callHost("approvals.decide", {
@@ -1132,6 +1132,7 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
             action: input.action,
             actorUserId: input.actorUserId,
             decisionNote: input.decisionNote,
+            ...(input.expectedUpdatedAt !== undefined ? { expectedUpdatedAt: input.expectedUpdatedAt } : {}),
           });
         },
       },

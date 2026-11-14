@@ -10,6 +10,7 @@ import { InstructionHistory } from "../components/InstructionHistory";
 import { AgentCharacter } from "../components/AgentCharacter";
 import { characterStateForAgent } from "@paperclipai/shared";
 import { mergeRunLogChunks, readChunkSeq } from "../lib/run-log-chunks";
+import { approvalReviewPath } from "../lib/approval-review";
 import { getPageVisibility, usePageVisibility } from "../lib/page-visibility";
 import { useCallback, useEffect, useLayoutEffect, useMemo, useState, useRef } from "react";
 import { useParams, useNavigate, Link, Navigate, useBeforeUnload, type NavigateFunction } from "@/lib/router";
@@ -1020,6 +1021,13 @@ export function AgentDetail() {
       }
     },
     onError: (err) => {
+      // PG-4: an open hire approval is approved from its own review page.
+      const reviewPath = approvalReviewPath(err);
+      if (reviewPath) {
+        setActionError(null);
+        navigate(reviewPath);
+        return;
+      }
       setActionError(err instanceof Error ? err.message : "Action failed");
     },
   });
