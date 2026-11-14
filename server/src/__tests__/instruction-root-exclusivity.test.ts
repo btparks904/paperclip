@@ -100,6 +100,13 @@ describe("WS-2 PR-W1: exclusive instruction roots", () => {
   const configOf = async (id = agentId) => (await loadAgent(id))!.adapterConfig as Config;
   const secretCount = async () => (await db.select({ id: companySecrets.id }).from(companySecrets)
     .where(eq(companySecrets.companyId, companyId))).length;
+  /** PG-3: a schema-secret field takes only an existing same-company secret reference. */
+  const storedApiKeyRef = async () => {
+    const stored = await secretService(db).create(companyId, {
+      name: `w1-api-key-${randomUUID()}`, provider: "local_encrypted", value: RAW_API_KEY,
+    });
+    return { type: "secret_ref", secretId: stored.id, version: "latest" };
+  };
   const agentCount = async () => (await db.select({ id: agents.id }).from(agents).where(eq(agents.companyId, companyId))).length;
   const exists = (target: string) => fs.lstat(target).then(() => true, () => false);
   const persistOn = (): InstructionConfigPersist => async (tx, current, adapterConfig) => {
@@ -656,12 +663,13 @@ describe("WS-2 PR-W1: exclusive instruction roots", () => {
       expect(updated?.adapterConfig).toMatchObject({ instructionsRootPath: ownerRoot, model: "m2" });
     });
 
-    it("generic PATCH activates an independent root and stores the secret as before", async () => {
+    it("generic PATCH activates an independent root and stores the secret reference", async () => {
       const ext = fresh("ok-patch");
       await seed(ext, { "AGENTS.md": ENTRY });
-      const res = await request(app()).patch(`/api/agents/${agentId}`).send({ adapterConfig: { ...cfg("external", ext), apiKey: RAW_API_KEY } });
+      const apiKey = await storedApiKeyRef();
+      const res = await request(app()).patch(`/api/agents/${agentId}`).send({ adapterConfig: { ...cfg("external", ext), apiKey } });
       expect(res.status, JSON.stringify(res.body)).toBe(200);
-      expect(await configOf()).toMatchObject({ ...cfg("external", ext), apiKey: { type: "secret_ref" } });
+      expect(await configOf()).toMatchObject({ ...cfg("external", ext), apiKey: { type: "secret_ref", secretId: apiKey.secretId } });
       expect(await secretCount()).toBe(1);
     });
 
@@ -676,12 +684,13 @@ describe("WS-2 PR-W1: exclusive instruction roots", () => {
       const ext = fresh("ok-create");
       const created = await agentService(db).create(companyId, { name: "Created", adapterType: "hermes_gateway", adapterConfig: cfg("external", ext) });
       expect(created.adapterConfig).toMatchObject(cfg("external", ext));
+      const apiKey = await storedApiKeyRef();
       for (const url of ["agents", "agent-hires"]) {
         const res = await request(app()).post(`/api/companies/${companyId}/${url}`).send({
-          name: `Routed-${url}`, role: "general", adapterType: "hermes_gateway", adapterConfig: { ...cfg("external", fresh(url)), apiKey: RAW_API_KEY } });
+          name: `Routed-${url}`, role: "general", adapterType: "hermes_gateway", adapterConfig: { ...cfg("external", fresh(url)), apiKey } });
         expect(res.status, JSON.stringify(res.body)).toBeLessThan(300);
       }
-      expect(await secretCount()).toBe(2);
+      expect(await secretCount()).toBe(1);
     });
 
     it("hire approval activates as before, including its approved independent root", async () => {
@@ -689,7 +698,7 @@ describe("WS-2 PR-W1: exclusive instruction roots", () => {
       await seedAgent(pending, { model: "m0" }, { status: "pending_approval", adapterType: "hermes_gateway" });
       const ext = fresh("ok-approve");
       await seed(ext, { "AGENTS.md": ENTRY });
-      const result = await agentService(db).activatePendingApproval(pending, { name: "Approved", adapterType: "hermes_gateway", adapterConfig: { ...cfg("external", ext), apiKey: RAW_API_KEY } });
+      const result = await agentService(db).activatePendingApproval(pending, { name: "Approved", adapterType: "hermes_gateway", adapterConfig: { ...cfg("external", ext), apiKey: await storedApiKeyRef() } });
       expect(result).toMatchObject({ activated: true });
       expect((await loadAgent(pending))!.status).toBe("idle");
       expect(await configOf(pending)).toMatchObject(cfg("external", ext));
@@ -827,11 +836,12 @@ describe("WS-2 PR-W1: exclusive instruction roots", () => {
   });
 
   describe("PG-3 characterization: create pre-check versus locked check", () => {
-    it("a root claimed between the two checks is refused under the lock, after the secret was stored (PG-3 window)", async () => {
+    it("a root claimed between the two checks is refused under the lock, and no secret is stored (PG-3 closed)", async () => {
       const window = fresh("pg3");
       const claimant = randomUUID();
       await seedAgent(claimant, { model: "m0" });
       const createId = randomUUID();
+      const apiKey = await storedApiKeyRef();
       let create: Promise<Outcome> | null = null;
       let createWaited = false;
       await db.transaction(async (tx) => {
@@ -839,14 +849,21 @@ describe("WS-2 PR-W1: exclusive instruction roots", () => {
         // unlocked pre-check cannot see it, its locked check waits for it.
         await agentService(tx as unknown as Db).update(claimant, { adapterConfig: cfg("external", window) }, { instructionConfigWrite: { keys: "all" } });
         create = settle(agentService(db).create(companyId, { id: createId, name: "PG3", adapterType: "hermes_gateway",
-          adapterConfig: { ...cfg("external", window), apiKey: RAW_API_KEY } }));
+          adapterConfig: { ...cfg("external", window), apiKey } }));
         createWaited = await waitFor(async () => (await advisoryWaiters()) > 0, 5_000);
       });
       const outcome = await create!;
       expect(createWaited).toBe(true);
       expect(outcome).toMatchObject({ ok: false, status: 409, code: INSTRUCTION_ROOT_IN_USE });
       expect(await loadAgent(createId)).toBeUndefined();
-      // The tracked PG-3 residual: the global normalization already stored the secret.
+      // Before PG-3 the global normalization had already stored a new secret
+      // here, an orphan. Normalization now only checks an existing reference,
+      // so the refused create leaves the secret rows as they were.
+      expect(await secretCount()).toBe(1);
+      // A raw value is refused before any write, also outside the window.
+      const raw = await settle(agentService(db).create(companyId, { name: "PG3-raw", adapterType: "hermes_gateway",
+        adapterConfig: { ...cfg("external", fresh("pg3-raw")), apiKey: RAW_API_KEY } }));
+      expect(raw).toMatchObject({ ok: false, status: 422, code: "schema_secret_field_requires_secret_ref" });
       expect(await secretCount()).toBe(1);
     });
   });

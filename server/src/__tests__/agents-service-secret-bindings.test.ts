@@ -214,10 +214,34 @@ describeEmbeddedPostgres("agent service secret binding sync", () => {
     expect(persistedAgents).toHaveLength(0);
   });
 
-  it("converts Hermes gateway apiKey strings into persisted secret refs", async () => {
+  it("refuses a raw Hermes gateway apiKey and persists an existing secret ref with its binding (PG-3)", async () => {
     const companyId = await seedCompany();
     const literalApiKey = `hermes-key-${randomUUID()}`;
+    const hermesAgent = (apiKey: unknown) => ({
+      name: "Hermes Gateway",
+      role: "engineer",
+      status: "idle",
+      adapterType: "hermes_gateway",
+      adapterConfig: { apiBaseUrl: "https://hermes.example", apiKey },
+      runtimeConfig: {},
+      spentMonthlyCents: 0,
+      lastHeartbeatAt: null,
+    });
 
+    // PG-3: a raw value is no longer converted into a managed secret; it is
+    // refused, and nothing is written.
+    await expect(agentService(db).create(companyId, hermesAgent(literalApiKey) as any)).rejects.toMatchObject({
+      status: 422,
+      details: { code: "schema_secret_field_requires_secret_ref" },
+    });
+    expect(await db.select().from(agents).where(eq(agents.companyId, companyId))).toEqual([]);
+    expect(await db.select().from(companySecrets).where(eq(companySecrets.companyId, companyId))).toEqual([]);
+
+    const stored = await secretService(db).create(companyId, {
+      name: `hermes-api-key-${randomUUID()}`,
+      provider: "local_encrypted",
+      value: literalApiKey,
+    });
     const created = await agentService(db).create(companyId, {
       name: "Hermes Gateway",
       role: "engineer",
@@ -225,7 +249,7 @@ describeEmbeddedPostgres("agent service secret binding sync", () => {
       adapterType: "hermes_gateway",
       adapterConfig: {
         apiBaseUrl: "https://hermes.example",
-        apiKey: literalApiKey,
+        apiKey: { type: "secret_ref", secretId: stored.id, version: "latest" },
       },
       runtimeConfig: {},
       spentMonthlyCents: 0,
@@ -240,8 +264,10 @@ describeEmbeddedPostgres("agent service secret binding sync", () => {
     expect(JSON.stringify(persistedConfig)).not.toContain(literalApiKey);
     expect(persistedConfig.apiKey).toMatchObject({
       type: "secret_ref",
+      secretId: stored.id,
       version: "latest",
     });
+    expect(await db.select().from(companySecrets).where(eq(companySecrets.companyId, companyId))).toHaveLength(1);
 
     const secretId = (persistedConfig.apiKey as { secretId: string }).secretId;
     const bindings = await db

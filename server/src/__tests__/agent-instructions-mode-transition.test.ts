@@ -666,6 +666,17 @@ describe("instruction writes across bundle mode transitions", () => {
       const RAW_API_KEY = "SENTINEL-SYNTHETIC-RAW-API-KEY-5e21";
       const setStatus = (status: string) => db.update(agents).set({ status }).where(eq(agents.id, agentId));
       const setHermes = () => db.update(agents).set({ adapterType: "hermes_gateway" }).where(eq(agents.id, agentId));
+      // PG-3: a schema-secret field takes only an existing same-company secret
+      // reference, so the R1 tests store the key first and configure its
+      // reference. A stored raw value (a pre-PG-3 row) is refused (R1f).
+      let apiKeyRef: { type: "secret_ref"; secretId: string; version: "latest" };
+      beforeEach(async () => {
+        const stored = await secretService(db).create(companyId, {
+          name: `r1-api-key-${randomUUID()}`, provider: "local_encrypted", value: RAW_API_KEY,
+        });
+        apiKeyRef = { type: "secret_ref", secretId: stored.id, version: "latest" };
+      });
+      const refSecretConfig = () => ({ ...b3Config(), apiKey: apiKeyRef });
       const rawSecretConfig = () => ({ ...b3Config(), apiKey: RAW_API_KEY });
       const secretRows = () => db.select().from(companySecrets).where(eq(companySecrets.companyId, companyId));
       const versionRows = async () => {
@@ -681,10 +692,10 @@ describe("instruction writes across bundle mode transitions", () => {
         return { callback, calls: () => calls };
       }
 
-      it("R1a: a pending-approval rejection after normalizing a raw schema secret leaves no secret and no change, every attempt", async () => {
+      it("R1a: a pending-approval rejection after normalizing a schema secret leaves no secret and no change, every attempt", async () => {
         await fs.rm(path.dirname(markerPath()), { recursive: true, force: true });
         await setHermes();
-        await setConfig(rawSecretConfig());
+        await setConfig(refSecretConfig());
         await setStatus("pending_approval");
         const before = await unchangedSnapshot();
         const secretsBefore = await secretState();
@@ -696,13 +707,13 @@ describe("instruction writes across bundle mode transitions", () => {
           expect(await secretState()).toEqual(secretsBefore);
         }
         expect(await unchangedSnapshot()).toEqual(before);
-        expect((await loadAgent()).adapterConfig).toEqual(rawSecretConfig());
+        expect((await loadAgent()).adapterConfig).toEqual(refSecretConfig());
         expect(await fs.readFile(path.join(managedRoot, NOTE), "utf8")).toBe(MANAGED_NOTE);
       });
 
-      it("R1b: a file-write failure after a normalizing repair rolls back the new secret with the configuration", async () => {
+      it("R1b: a file-write failure after a normalizing repair rolls back with the configuration and leaves the secrets unchanged", async () => {
         await setHermes();
-        await setConfig(rawSecretConfig());
+        await setConfig(refSecretConfig());
         const secretsBefore = await secretState();
         const revisionsBefore = (await revisions()).length;
         const activityBefore = (await activity()).length;
@@ -719,16 +730,16 @@ describe("instruction writes across bundle mode transitions", () => {
         // The repair ran (normalization executed) before the write failed.
         expect(calls()).toBe(1);
         expect(await secretState()).toEqual(secretsBefore);
-        expect((await loadAgent()).adapterConfig).toEqual(rawSecretConfig());
+        expect((await loadAgent()).adapterConfig).toEqual(refSecretConfig());
         expect(await revisions()).toHaveLength(revisionsBefore);
         expect(await activity()).toHaveLength(activityBefore);
         expect(await fs.readFile(path.join(managedRoot, NOTE), "utf8")).toBe(MANAGED_NOTE);
         expect(await fs.readFile(path.join(staleRoot, NOTE), "utf8")).toBe(STALE_NOTE);
       });
 
-      it("R1c: a successful save creates exactly one managed secret, referenced by the committed configuration", async () => {
+      it("R1c: a successful save creates no secret and commits the existing reference with its binding", async () => {
         await setHermes();
-        await setConfig(rawSecretConfig());
+        await setConfig(refSecretConfig());
         const secretsBefore = await secretState();
         const staleBefore = await tree(staleRoot);
         // A stale base is still refused before any repair or secret.
@@ -737,10 +748,10 @@ describe("instruction writes across bundle mode transitions", () => {
 
         await expect(recoveredWrite(INCOMING, hashOf(MANAGED_NOTE))).resolves.toEqual({ contentHash: hashOf(INCOMING), changed: true });
         const created = await secretRows();
-        expect(created).toHaveLength(secretsBefore.secrets + 1);
-        const secret = created[created.length - 1]!;
+        expect(created).toHaveLength(secretsBefore.secrets);
+        const secret = created.find((row) => row.id === apiKeyRef.secretId)!;
         expect(secret).toMatchObject({ companyId, status: "active" });
-        expect(await versionRows()).toHaveLength(secretsBefore.versions + 1);
+        expect(await versionRows()).toHaveLength(secretsBefore.versions);
         const stored = (await loadAgent()).adapterConfig as Record<string, unknown>;
         const { apiKey, ...rest } = stored;
         expect(apiKey).toEqual({ type: "secret_ref", secretId: secret.id, version: "latest", projectionClass: "unclassified", projectionAllowlistKey: null });
@@ -751,15 +762,31 @@ describe("instruction writes across bundle mode transitions", () => {
         expect(revisionRows).toHaveLength(1);
         expect(revisionRows[0]).toMatchObject({ source: "instructions_bundle_file_put", createdByUserId: userId });
         noRawValue(revisionRows[0]!.afterConfig);
-        // The agent service records the new binding, in the same transaction; the store audits the file update.
+        // The agent service syncs the binding row in the same transaction; the
+        // reference was already in the configuration, so it is not a new
+        // binding to audit (PG-3: no secret is created). The store audits the file update.
         const rows = await activity();
-        expect(rows.map((row) => row.action).sort()).toEqual(["agent.files_updated", "secret.binding.created"]);
+        expect(rows.map((row) => row.action).sort()).toEqual(["agent.files_updated"]);
         expect(rows.find((row) => row.action === "agent.files_updated")).toMatchObject({ details: { path: NOTE, contentHash: hashOf(INCOMING) } });
-        expect(rows.find((row) => row.action === "secret.binding.created")).toMatchObject({ details: { configPath: "apiKey", bindingType: "secret_ref" } });
         noRawValue(rows);
         expect((await bindings()).filter((row) => row.secretId === secret.id)).toHaveLength(1);
         expect(await fs.readFile(path.join(managedRoot, NOTE), "utf8")).toBe(INCOMING);
         expect(await tree(staleRoot)).toEqual(staleBefore);
+      });
+
+      it("R1f: a stored raw schema-secret value (pre-PG-3 row) is refused inside the repair with no secret, file or configuration change", async () => {
+        await setHermes();
+        await setConfig(rawSecretConfig());
+        const before = await unchangedSnapshot();
+        const secretsBefore = await secretState();
+        const { callback, calls } = countingRepair();
+        await expect(recoveredWrite(INCOMING, hashOf(MANAGED_NOTE), { allowRecoveredManaged: true, repairConfig: callback }))
+          .rejects.toMatchObject({ status: 422, details: { code: "schema_secret_field_requires_secret_ref" } });
+        expect(calls()).toBe(1);
+        expect(await secretState()).toEqual(secretsBefore);
+        expect(await unchangedSnapshot()).toEqual(before);
+        expect((await loadAgent()).adapterConfig).toEqual(rawSecretConfig());
+        expect(await fs.readFile(path.join(managedRoot, NOTE), "utf8")).toBe(MANAGED_NOTE);
       });
 
       it("R1e: a canonical Claude OAuth user_secret_ref is unchanged after a successful normalizing repair", async () => {
