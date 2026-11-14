@@ -110,8 +110,9 @@ npx paperclipai approval get <approval-id>
 # Create approval
 npx paperclipai approval create --type hire_agent --payload '{"name":"..."}' [--issue-ids <id1,id2>]
 
-# Approve
-npx paperclipai approval approve <approval-id> [--decision-note "..."]
+# Approve (an open hire needs the updatedAt shown by `approval get`;
+# the approval is refused if it changed since)
+npx paperclipai approval approve <approval-id> [--expected-updated-at <updatedAt>] [--decision-note "..."]
 
 # Reject
 npx paperclipai approval reject <approval-id> [--decision-note "..."]

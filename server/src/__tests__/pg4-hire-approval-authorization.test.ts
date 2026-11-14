@@ -690,6 +690,8 @@ describe("PG-4: guarded hire-approval path", () => {
       const missing = await send(board(), "post", `/api/agents/${agentId}/approve`, {});
       expect(missing.status, JSON.stringify(missing.body)).toBe(428);
       expect(missing.body.details?.code).toBe("approval_review_version_required");
+      // The UI opens this approval's review page from the agent page.
+      expect(missing.body.details?.approvalId).toBe(approvalId);
       const shown = await shownApproval(approvalId);
       await send(board(), "post", `/api/approvals/${approvalId}/request-revision`, {});
       await send(board(), "post", `/api/approvals/${approvalId}/resubmit`, {});

@@ -25,6 +25,7 @@ interface ApprovalListOptions extends BaseClientOptions {
 interface ApprovalDecisionOptions extends BaseClientOptions {
   decisionNote?: string;
   decidedByUserId?: string;
+  expectedUpdatedAt?: string;
 }
 
 interface ApprovalCreateOptions extends BaseClientOptions {
@@ -142,12 +143,17 @@ export function registerApprovalCommands(program: Command): void {
       .argument("<approvalId>", "Approval ID")
       .option("--decision-note <text>", "Decision note")
       .option("--decided-by-user-id <id>", "Decision actor user ID")
+      .option(
+        "--expected-updated-at <timestamp>",
+        "The approval's updatedAt from `approval get` that you reviewed. Required to approve an open hire; refused if the approval changed since",
+      )
       .action(async (approvalId: string, opts: ApprovalDecisionOptions) => {
         try {
           const ctx = resolveCommandContext(opts);
           const payload = resolveApprovalSchema.parse({
             decisionNote: opts.decisionNote,
             decidedByUserId: opts.decidedByUserId,
+            ...(opts.expectedUpdatedAt ? { expectedUpdatedAt: opts.expectedUpdatedAt } : {}),
           });
           const updated = await ctx.api.post<Approval>(apiPath`/api/approvals/${approvalId}/approve`, payload);
           printOutput(updated, { json: ctx.json });

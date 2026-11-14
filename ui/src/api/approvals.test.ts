@@ -24,3 +24,18 @@ it("sends the reviewed approval version with an approval decision", async () => 
   expect(secondUrl).toBe("/api/approvals/approval-2/approve");
   expect(JSON.parse(secondInit.body as string)).toEqual({ expectedUpdatedAt: "2026-11-14T00:00:01.456Z" });
 });
+
+// PG-4: the agent page sends no approval version; when the server asks for a
+// reviewed version it opens the approval's review page instead of failing.
+it("turns the server's review-required refusal into the approval review page", async () => {
+  const { ApiError } = await import("./client");
+  const { approvalReviewPath } = await import("../lib/approval-review");
+  const refusal = new ApiError("review it", 428, {
+    error: "review it",
+    details: { code: "approval_review_version_required", approvalId: "approval-9" },
+  });
+  expect(approvalReviewPath(refusal)).toBe("/approvals/approval-9");
+  expect(approvalReviewPath(new ApiError("other", 428, { details: { code: "something_else", approvalId: "a" } }))).toBeNull();
+  expect(approvalReviewPath(new ApiError("stale", 409, { details: { code: "approval_review_version_required", approvalId: "a" } }))).toBeNull();
+  expect(approvalReviewPath(new Error("network"))).toBeNull();
+});
