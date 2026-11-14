@@ -1131,61 +1131,59 @@ describeEmbeddedPostgres("secretService", () => {
     expect(created.status).toBe("active");
   });
 
-  it("fails a queued adapter-schema-secret create when an account-home cleanup removes its directory first", async () => {
-    // `normalizeAdapterConfigForPersistence` creates an adapter config secret
-    // through a separate managed-create path (`createManagedLocalSecret`),
-    // not `svc.create`. It must run the same queued-behind-the-lock
-    // directory check as `svc.create` and `svc.rotate`, so an adapter
-    // schema secret can never commit an account-home directory a cleanup
-    // already removed while this call waited for the lock.
+  it("never creates an adapter-schema secret, so a removed account-home directory cannot be committed through it (PG-3)", async () => {
+    // Before PG-3, `normalizeAdapterConfigForPersistence` created an adapter
+    // config secret through its own managed-create path, which had to repeat
+    // the queued-behind-the-lock directory check of `svc.create`. PG-3 removes
+    // that path: a raw schema-secret value is refused and nothing is created,
+    // so no adapter schema secret can commit a directory a cleanup removed.
+    // `svc.create` keeps the lock check (tests above).
     const companyId = await seedCompany();
     const svc = secretService(db);
     const accountHomeDir = await makeAccountHomeDir(companyId, "acct-queued-adapter-secret");
+    const before = await db.select().from(companySecrets).where(eq(companySecrets.companyId, companyId));
 
-    const events: string[] = [];
     let releaseCleanup!: () => void;
     const cleanupGate = new Promise<void>((resolve) => {
       releaseCleanup = resolve;
     });
     const cleanupCall = withAccountHomeSecretMutationLock(undefined, companyId, async () => {
-      events.push("cleanup-enter");
       await cleanupGate;
       await rm(accountHomeDir, { recursive: true, force: true });
-      events.push("cleanup-exit");
     });
-    // Give the cleanup a chance to acquire the lock before the adapter
-    // config normalization starts racing for the same lock.
     await new Promise((resolve) => setTimeout(resolve, 20));
-    const normalizeCall = svc.normalizeAdapterConfigForPersistence(
+    // The refusal does not wait for the held lock: it takes none.
+    await expect(svc.normalizeAdapterConfigForPersistence(
       companyId,
       { apiKey: accountHomeDir },
       { adapterType: "hermes_gateway" },
-    );
-    // The queued create must stay blocked behind the held lock.
-    await new Promise((resolve) => setTimeout(resolve, 20));
-    expect(events).toEqual(["cleanup-enter"]);
-
+    )).rejects.toMatchObject({ status: 422, details: { code: "schema_secret_field_requires_secret_ref" } });
     releaseCleanup();
     await cleanupCall;
-    await expect(normalizeCall).rejects.toThrow(/no longer exists/);
+    expect(await db.select().from(companySecrets).where(eq(companySecrets.companyId, companyId))).toEqual(before);
   });
 
-  it("keeps an adapter-schema-secret create working for a value outside the account-home cache root", async () => {
-    // A regression guard for the check above: an adapter schema secret whose
-    // value is not an account-home directory (an ordinary API key, for
-    // example) must keep succeeding, unblocked.
+  it("accepts an existing same-company secret reference for an adapter schema secret and creates nothing (PG-3)", async () => {
+    // A regression guard: an ordinary API key stored first as a company
+    // secret (through `svc.create`) is accepted as a reference, unblocked.
     const companyId = await seedCompany();
     const svc = secretService(db);
+    const secret = await svc.create(companyId, {
+      name: `hermes-api-key-${randomUUID()}`,
+      provider: "local_encrypted",
+      value: `plain-api-key-${randomUUID()}`,
+    });
+    const before = await db.select().from(companySecrets).where(eq(companySecrets.companyId, companyId));
 
     const normalized = await svc.normalizeAdapterConfigForPersistence(
       companyId,
-      { apiKey: `plain-api-key-${randomUUID()}` },
+      { apiKey: { type: "secret_ref", secretId: secret.id, version: "latest" } },
       { adapterType: "hermes_gateway" },
     );
     const apiKeyBinding = (normalized as Record<string, unknown>).apiKey as { type: string; secretId: string };
-    expect(apiKeyBinding.type).toBe("secret_ref");
-    const secret = await svc.getById(apiKeyBinding.secretId);
-    expect(secret?.status).toBe("active");
+    expect(apiKeyBinding).toMatchObject({ type: "secret_ref", secretId: secret.id });
+    expect((await svc.getById(apiKeyBinding.secretId))?.status).toBe("active");
+    expect(await db.select().from(companySecrets).where(eq(companySecrets.companyId, companyId))).toEqual(before);
   });
 
   it("validates the access namespace as agent-only with env-style aliases", async () => {

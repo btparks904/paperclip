@@ -106,6 +106,14 @@ const COMING_SOON_SECRET_PROVIDERS: ReadonlySet<SecretProvider> = new Set([
 const FALLBACK_ADAPTER_SCHEMA_SECRET_FIELDS: Readonly<Record<string, readonly string[]>> = {
   hermes_gateway: ["apiKey"],
 };
+// PG-3: a schema-secret field (an adapter config field whose schema sets
+// `meta.secret`) is persisted only as a reference to an existing secret of the
+// same company. A raw string or a plain binding is refused, so normalization
+// never creates a secret.
+export const SCHEMA_SECRET_FIELD_REQUIRES_SECRET_REF = "schema_secret_field_requires_secret_ref";
+// PG-3: the adapter has a config schema, but it could not be read, so the
+// schema-secret fields cannot be identified. Persistence is refused.
+export const ADAPTER_CONFIG_SCHEMA_UNAVAILABLE = "adapter_config_schema_unavailable";
 const USER_SECRET_DEFINITION_KEY_UNIQUE_CONSTRAINT = "user_secret_definitions_company_key_uq";
 const USER_SECRET_VALUE_UNIQUE_CONSTRAINT = "company_secrets_user_definition_owner_uq";
 // The unique index on (secretId, version). A concurrent rotation that inserts the
@@ -1938,14 +1946,12 @@ export function secretService(db: Db | DbTransaction) {
     if (Object.prototype.hasOwnProperty.call(adapterConfig, "env")) {
       normalized.env = await normalizeEnvConfig(companyId, adapterConfig.env, opts);
     }
-    const secretFieldKeys = await listAdapterSchemaSecretFieldKeys(opts?.adapterType);
+    const secretFieldKeys = await listAdapterSchemaSecretFieldKeys(opts?.adapterType, { failClosed: true });
     for (const key of secretFieldKeys) {
       if (!Object.prototype.hasOwnProperty.call(adapterConfig, key)) continue;
       const value = await normalizeSchemaSecretFieldForPersistence(companyId, {
-        adapterType: opts?.adapterType ?? null,
         key,
         rawValue: adapterConfig[key],
-        actor: opts?.actor,
       });
       if (value === undefined) {
         delete normalized[key];
@@ -1956,7 +1962,10 @@ export function secretService(db: Db | DbTransaction) {
     return normalized;
   }
 
-  async function listAdapterSchemaSecretFieldKeys(adapterType: string | null | undefined): Promise<string[]> {
+  async function listAdapterSchemaSecretFieldKeys(
+    adapterType: string | null | undefined,
+    options?: { failClosed?: boolean },
+  ): Promise<string[]> {
     if (!adapterType) return [];
     const adapter = findActiveServerAdapter(adapterType);
     const fallback = [...(FALLBACK_ADAPTER_SCHEMA_SECRET_FIELDS[adapterType] ?? [])];
@@ -1971,23 +1980,39 @@ export function secretService(db: Db | DbTransaction) {
       ])];
     } catch (err) {
       logger.warn({ err, adapterType }, "adapter config schema unavailable while normalizing secret fields");
+      // Persistence fails closed: without the schema, a secret field outside
+      // the fallback list would be stored as plain configuration.
+      if (options?.failClosed) {
+        throw new HttpError(503, "Adapter config schema is unavailable, so its secret fields cannot be validated", {
+          code: ADAPTER_CONFIG_SCHEMA_UNAVAILABLE,
+          adapterType,
+        });
+      }
       return fallback;
     }
   }
 
+  // PG-3: a schema-secret field accepts only a reference to an existing,
+  // company-scoped secret of the same company (or an empty value, which
+  // clears the field). This applies on every persistence path, including
+  // the updates of an existing agent. The check never creates a secret, so
+  // it has no writes and a later failure in the same request cannot leave an
+  // orphan secret. A raw string or plain binding is refused; it is no longer
+  // converted into a new managed secret.
   async function normalizeSchemaSecretFieldForPersistence(
     companyId: string,
     input: {
-      adapterType: string | null;
       key: string;
       rawValue: unknown;
-      actor?: { userId?: string | null; agentId?: string | null };
     },
   ): Promise<EnvBinding | undefined> {
     if (input.rawValue === null || input.rawValue === undefined) return undefined;
     const parsed = envBindingSchema.safeParse(input.rawValue);
     if (!parsed.success) {
-      throw unprocessable(`${input.key} must be a string, plain binding, or secret reference`);
+      throw unprocessable(`${input.key} must be a company secret reference`, {
+        code: SCHEMA_SECRET_FIELD_REQUIRES_SECRET_REF,
+        field: input.key,
+      });
     }
     const binding = canonicalizeBinding(parsed.data as EnvBinding);
     if (binding.type === "secret_ref") {
@@ -2003,166 +2028,11 @@ export function secretService(db: Db | DbTransaction) {
     if (binding.type === "user_secret_ref") {
       throw unprocessable(`${input.key} must be a string, plain binding, or company secret reference`);
     }
-    const value = binding.value.trim();
-    if (!value) return undefined;
-    if (value === REDACTED_SENTINEL) {
-      throw unprocessable(`Refusing to persist redacted placeholder for key: ${input.key}`);
-    }
-    const id = randomUUID();
-    const adapterPart = normalizeSecretKey(input.adapterType ?? "adapter");
-    const fieldPart = normalizeSecretKey(input.key);
-    const secret = await createManagedLocalSecret(companyId, {
-      name: `${adapterPart}.${fieldPart}.${id}`,
-      key: `${adapterPart}.${fieldPart}.${id}`,
-      value,
-      description: `Adapter config secret for ${input.adapterType ?? "adapter"}.${input.key}`,
-    }, input.actor);
-    return {
-      type: "secret_ref",
-      secretId: secret.id,
-      version: "latest",
-    };
-  }
-
-  // Every `local_encrypted` secret this function creates runs under
-  // `withAccountHomeSecretMutationLock`, so its write can never commit inside
-  // the window a Codex account-home cleanup already used to decide no secret
-  // claims the directory it is about to delete. A create queued behind the
-  // lock can still win it after the cleanup already removed that directory,
-  // so check the directory's existence inside the same lock, right before
-  // the write, the same way `create:` and `rotate:` below do.
-  async function createManagedLocalSecret(
-    companyId: string,
-    input: {
-      name: string;
-      key: string;
-      value: string;
-      description?: string | null;
-    },
-    actor?: { userId?: string | null; agentId?: string | null },
-  ) {
-    return withAccountHomeSecretMutationLock(undefined, companyId, async () => {
-      await assertAccountHomeCacheDirStillValid(undefined, companyId, input.value);
-      return createManagedLocalSecretUnlocked(companyId, input, actor);
-    });
-  }
-
-  async function createManagedLocalSecretUnlocked(
-    companyId: string,
-    input: {
-      name: string;
-      key: string;
-      value: string;
-      description?: string | null;
-    },
-    actor?: { userId?: string | null; agentId?: string | null },
-  ) {
-    const existing = await getByName(companyId, input.name);
-    if (existing) throw conflict(`Secret already exists: ${input.name}`);
-    const key = normalizeSecretKey(input.key);
-    if (!key) throw unprocessable("Secret key is required");
-    const duplicateKey = await db
-      .select()
-      .from(companySecrets)
-      .where(and(
-        eq(companySecrets.companyId, companyId),
-        eq(companySecrets.scope, "company"),
-        eq(companySecrets.key, key),
-        ne(companySecrets.status, "deleted"),
-      ))
-      .then((rows) => rows[0] ?? null);
-    if (duplicateKey) throw conflict(`Secret key already exists: ${key}`);
-
-    const provider = getSecretProvider("local_encrypted");
-    const providerConfig = await getSelectableRuntimeProviderConfig({
-      companyId,
-      provider: "local_encrypted",
-      providerConfigId: null,
-    });
-    const providerWriteContext = {
-      companyId,
-      secretKey: key,
-      secretName: input.name,
-      version: 1,
-    };
-    const reservedSecret = await db
-      .insert(companySecrets)
-      .values({
-        companyId,
-        key,
-        name: input.name,
-        provider: "local_encrypted",
-        providerConfigId: null,
-        status: "archived",
-        managedMode: "paperclip_managed",
-        externalRef: null,
-        providerMetadata: null,
-        latestVersion: 0,
-        description: input.description ?? null,
-        createdByAgentId: actor?.agentId ?? null,
-        createdByUserId: actor?.userId ?? null,
-      })
-      .returning()
-      .then((rows) => rows[0]);
-
-    let prepared: PreparedSecretVersion | null = null;
-    try {
-      prepared = await provider.createSecret({
-        value: input.value,
-        externalRef: null,
-        providerConfig,
-        context: providerWriteContext,
-      });
-      const preparedSecret = prepared;
-      await db.insert(companySecretVersions).values({
-        secretId: reservedSecret.id,
-        version: 1,
-        material: preparedSecret.material,
-        valueSha256: preparedSecret.valueSha256,
-        fingerprintSha256: preparedSecret.fingerprintSha256 ?? preparedSecret.valueSha256,
-        providerVersionRef: preparedSecret.providerVersionRef ?? null,
-        status: "disabled",
-        createdByAgentId: actor?.agentId ?? null,
-        createdByUserId: actor?.userId ?? null,
-      });
-      return await db.transaction(async (tx) => {
-        await tx
-          .update(companySecretVersions)
-          .set({ status: "current" })
-          .where(and(
-            eq(companySecretVersions.secretId, reservedSecret.id),
-            eq(companySecretVersions.version, 1),
-          ));
-        const secret = await tx
-          .update(companySecrets)
-          .set({
-            status: "active",
-            externalRef: preparedSecret.externalRef,
-            latestVersion: 1,
-            lastRotatedAt: new Date(),
-            updatedAt: new Date(),
-          })
-          .where(eq(companySecrets.id, reservedSecret.id))
-          .returning()
-          .then((rows) => rows[0]);
-        if (!secret) throw notFound("Secret not found");
-        return secret;
-      });
-    } catch (error) {
-      if (prepared) {
-        await cleanupPreparedProviderWrite({
-          provider,
-          prepared,
-          providerConfig,
-          context: providerWriteContext,
-          mode: "delete",
-          operation: "adapter_config_secret.create_rollback",
-        }).catch(() => false);
-      }
-      await db.delete(companySecretVersions).where(eq(companySecretVersions.secretId, reservedSecret.id)).catch(() => undefined);
-      await db.delete(companySecrets).where(eq(companySecrets.id, reservedSecret.id)).catch(() => undefined);
-      throw error;
-    }
+    if (!binding.value.trim()) return undefined;
+    throw unprocessable(
+      `${input.key} must reference an existing company secret; raw values and plain bindings are not accepted`,
+      { code: SCHEMA_SECRET_FIELD_REQUIRES_SECRET_REF, field: input.key },
+    );
   }
 
   // The body `create:` below runs, unchanged. Extracted to a named function so
@@ -5108,6 +4978,34 @@ export function secretService(db: Db | DbTransaction) {
       opts?: NormalizeAdapterConfigOptions,
     ) => normalizeAdapterConfigForPersistenceInternal(companyId, adapterConfig, opts),
 
+    /**
+     * PG-3: checks only the schema-secret fields of an adapter config, with no
+     * writes. `companyId: null` means the company does not exist yet (a
+     * new-company import), so no secret can be referenced and any non-empty
+     * value is refused. A caller that writes other rows before it normalizes
+     * runs this first.
+     */
+    assertSchemaSecretFieldsForPersistence: async (
+      companyId: string | null,
+      adapterConfig: Record<string, unknown>,
+      opts?: { adapterType?: string | null },
+    ): Promise<void> => {
+      const secretFieldKeys = await listAdapterSchemaSecretFieldKeys(opts?.adapterType, { failClosed: true });
+      for (const key of secretFieldKeys) {
+        if (!Object.prototype.hasOwnProperty.call(adapterConfig, key)) continue;
+        const rawValue = adapterConfig[key];
+        if (companyId === null) {
+          const empty = rawValue === null || rawValue === undefined || (typeof rawValue === "string" && rawValue.trim() === "");
+          if (empty) continue;
+          throw unprocessable(`${key} must reference an existing company secret; a new company has no secrets yet`, {
+            code: SCHEMA_SECRET_FIELD_REQUIRES_SECRET_REF,
+            field: key,
+          });
+        }
+        await normalizeSchemaSecretFieldForPersistence(companyId, { key, rawValue });
+      }
+    },
+
     normalizeEnvBindingsForPersistence: async (
       companyId: string,
       envValue: unknown,
@@ -5122,10 +5020,13 @@ export function secretService(db: Db | DbTransaction) {
       const normalized = { ...payload };
       const adapterConfig = asRecord(payload.adapterConfig);
       if (adapterConfig) {
+        // PG-3: the payload names its adapter, so its schema-secret fields
+        // are checked when the request is stored, not first at activation.
+        const payloadAdapterType = typeof payload.adapterType === "string" ? payload.adapterType : null;
         normalized.adapterConfig = await normalizeAdapterConfigForPersistenceInternal(
           companyId,
           adapterConfig,
-          opts,
+          { ...opts, adapterType: opts?.adapterType ?? payloadAdapterType },
         );
       }
       return normalized;

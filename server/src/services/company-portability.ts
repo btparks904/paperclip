@@ -5276,6 +5276,25 @@ export function companyPortabilityService(db: Db, storage?: StorageService) {
       }
     }
 
+    // PG-3: check every imported agent's schema-secret fields before the
+    // import writes anything (company, secrets, skills or agents), so a raw
+    // or invalid secret value cannot leave a partial import behind.
+    if (include.agents) {
+      const secretCheckCompanyId = input.target.mode === "existing_company" ? input.target.companyId : null;
+      for (const planAgent of plan.preview.plan.agentPlans) {
+        if (planAgent.action === "skip") continue;
+        const manifestAgent = plan.selectedAgents.find((agent) => agent.slug === planAgent.slug);
+        if (!manifestAgent) continue;
+        const adapterOverride = input.adapterOverrides?.[planAgent.slug];
+        const checkedAdapterConfig = adapterOverride?.adapterConfig
+          ? { ...adapterOverride.adapterConfig }
+          : { ...manifestAgent.adapterConfig } as Record<string, unknown>;
+        await secrets.assertSchemaSecretFieldsForPersistence(secretCheckCompanyId, checkedAdapterConfig, {
+          adapterType: assertKnownImportAdapterType(adapterOverride?.adapterType ?? manifestAgent.adapterType),
+        });
+      }
+    }
+
     let targetCompany: {
       id: string;
       name: string;

@@ -18,6 +18,7 @@ import {
   normalizeAgentDefaultsForJoin,
   prepareAgentDefaultsPayloadForJoinPersistence,
 } from "../routes/access.js";
+import { secretService } from "../services/secrets.js";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -285,7 +286,7 @@ describeEmbeddedPostgres("prepareAgentDefaultsPayloadForJoinPersistence (hermes_
     rmSync(secretsTmpDir, { recursive: true, force: true });
   });
 
-  it("stores a secret ref instead of the literal apiKey in join request defaults", async () => {
+  it("refuses a literal apiKey and a secret reference in Hermes join defaults, creating no secret (PG-3)", async () => {
     const companyId = randomUUID();
     const inviteId = randomUUID();
     const joinRequestId = randomUUID();
@@ -307,11 +308,11 @@ describeEmbeddedPostgres("prepareAgentDefaultsPayloadForJoinPersistence (hermes_
       expiresAt: new Date("2027-03-10T00:00:00.000Z"),
     });
 
-    const joinDefaults = normalizeAgentDefaultsForJoin({
+    const joinDefaultsFor = (apiKey: unknown) => normalizeAgentDefaultsForJoin({
       adapterType: "hermes_gateway",
       defaultsPayload: {
         apiBaseUrl: "https://hermes.example",
-        apiKey: literalApiKey,
+        apiKey,
         paperclipApiUrl: "https://paperclip.example",
       },
       deploymentMode: "authenticated",
@@ -319,44 +320,29 @@ describeEmbeddedPostgres("prepareAgentDefaultsPayloadForJoinPersistence (hermes_
       bindHost: "127.0.0.1",
       allowedHostnames: [],
     });
-    expect(joinDefaults.fatalErrors).toEqual([]);
-
-    const persistedDefaults = await prepareAgentDefaultsPayloadForJoinPersistence({
+    // PG-3: a literal value is refused, and no secret is created for it.
+    const literalDefaults = joinDefaultsFor(literalApiKey);
+    expect(literalDefaults.fatalErrors).toEqual([]);
+    await expect(prepareAgentDefaultsPayloadForJoinPersistence({
       db,
       companyId,
       adapterType: "hermes_gateway",
-      normalized: joinDefaults.normalized,
-    });
+      normalized: literalDefaults.normalized,
+    })).rejects.toMatchObject({ status: 422, details: { code: "schema_secret_field_requires_secret_ref" } });
+    expect(await db.select().from(companySecrets)).toHaveLength(0);
 
-    await db.insert(joinRequests).values({
-      id: joinRequestId,
-      inviteId,
-      companyId,
-      requestType: "agent",
-      status: "pending_approval",
-      requestIp: "127.0.0.1",
-      agentName: "Hermes Gateway",
-      adapterType: "hermes_gateway",
-      capabilities: "Hermes gateway agent",
-      agentDefaultsPayload: persistedDefaults,
-      claimSecretHash: "claim-secret-hash",
-      claimSecretExpiresAt: new Date("2027-03-11T00:00:00.000Z"),
+    // A joiner also supplies apiBaseUrl, so it must never name a company
+    // secret: join normalization still requires a string key, which refuses
+    // a reference before persistence. A Hermes agent therefore cannot join
+    // with a key under PG-3; a board user creates it with a reference.
+    const stored = await secretService(db).create(companyId, {
+      name: `hermes-api-key-${randomUUID()}`,
+      provider: "local_encrypted",
+      value: literalApiKey,
     });
-
-    const persistedJoinRequest = await db
-      .select()
-      .from(joinRequests)
-      .where(eq(joinRequests.id, joinRequestId))
-      .then((rows) => rows[0]);
-    const storedPayload = persistedJoinRequest?.agentDefaultsPayload as Record<string, unknown>;
-    expect(JSON.stringify(storedPayload)).not.toContain(literalApiKey);
-    expect(storedPayload.apiKey).toMatchObject({
-      type: "secret_ref",
-      version: "latest",
-    });
-
-    const storedSecrets = await db.select().from(companySecrets);
-    expect(storedSecrets).toHaveLength(1);
-    expect((storedPayload.apiKey as { secretId: string }).secretId).toBe(storedSecrets[0]?.id);
+    const referenceDefaults = joinDefaultsFor({ type: "secret_ref", secretId: stored.id, version: "latest" });
+    expect(referenceDefaults.fatalErrors).toContain("agentDefaultsPayload.apiKey is required");
+    expect(await db.select().from(joinRequests).where(eq(joinRequests.id, joinRequestId))).toEqual([]);
+    expect(await db.select().from(companySecrets)).toHaveLength(1);
   });
 });
