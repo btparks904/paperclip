@@ -5,6 +5,7 @@ import { conflict, forbidden, unprocessable } from "../errors.js";
 import { collectAgentAdapterWorkspaceCommandPaths } from "../routes/workspace-command-authz.js";
 import { AGENT_INSTRUCTION_CONFIG_KEYS, pickInstructionConfig } from "./agent-instruction-keys.js";
 import { agentInstructionsBundleMode } from "./agent-instructions.js";
+import { providerTraceSettingChanges } from "./provider-trace-setting.js";
 import {
   authorizationDeniedDetails,
   authorizationService,
@@ -74,6 +75,9 @@ export const HIRE_APPROVAL_STALE_INSTRUCTIONS =
 
 /** The activity action that records a board amendment of a linked hire's instruction configuration. */
 export const HIRE_INSTRUCTION_AMENDMENT_ACTION = "approval.hire_instruction_amended";
+
+/** Turning raw provider tracing on or off through a hire approval needs instance-admin access. */
+export const HIRE_APPROVAL_PROVIDER_TRACE_ADMIN_REQUIRED = "hire_approval_provider_trace_admin_required";
 
 /** JSON with object keys sorted, so a payload read back from jsonb hashes the same as the one written. */
 function canonicalJson(value: unknown): string {
@@ -163,7 +167,7 @@ async function isInstanceAdmin(conn: Db, actor: HireApprovalActor): Promise<bool
   return authorizationService(conn).isInstanceAdmin(actor.userId ?? null);
 }
 
-type LinkedAgentRow = Pick<typeof agents.$inferSelect, "id" | "companyId" | "name" | "status" | "adapterConfig" | "instructionBundleId">;
+type LinkedAgentRow = Pick<typeof agents.$inferSelect, "id" | "companyId" | "name" | "status" | "adapterConfig" | "runtimeConfig" | "instructionBundleId">;
 
 /** Request time only: the decision paths receive the agent row locked by the activation. */
 async function loadLinkedAgent(conn: Db, agentId: string): Promise<LinkedAgentRow | null> {
@@ -174,6 +178,7 @@ async function loadLinkedAgent(conn: Db, agentId: string): Promise<LinkedAgentRo
       name: agents.name,
       status: agents.status,
       adapterConfig: agents.adapterConfig,
+      runtimeConfig: agents.runtimeConfig,
       instructionBundleId: agents.instructionBundleId,
     })
     .from(agents)
@@ -187,6 +192,11 @@ interface PayloadRuleInput {
   companyId: string;
   /** The approval payload's adapterConfig, when it is a plain object. */
   payloadConfig: JsonRecord | undefined;
+  /**
+   * The approval payload's runtimeConfig, when it is a plain object. A linked
+   * activation replaces the agent's runtimeConfig with it.
+   */
+  payloadRuntimeConfig: JsonRecord | undefined;
   /** The linked agent, or null for a request that creates a new agent. */
   linked: LinkedAgentRow | null;
   /** The identity the new agent will have; only for an unlinked payload. */
@@ -212,6 +222,21 @@ async function applyPayloadRules(input: PayloadRuleInput) {
     if (linked.status !== "pending_approval") {
       if (input.phase === "decision") throw conflict("The hire approval's agent is no longer pending approval. Nothing was changed.");
       throw unprocessable("The hire approval's agent must be pending approval");
+    }
+  }
+
+  // Raw provider tracing (`runtimeConfig.debug.providerTrace`): the agent
+  // routes' rule, on the effective before and after. A linked payload is
+  // checked against the linked agent's current runtimeConfig (at decision, the
+  // row locked by the activation). An unlinked request is checked like the
+  // hire route, against no previous value; an unlinked decision creates the
+  // agent without the payload's runtimeConfig, so it changes nothing here.
+  if (linked || input.phase === "request") {
+    const previousRuntime = linked ? linked.runtimeConfig : undefined;
+    const nextRuntime = input.payloadRuntimeConfig ?? previousRuntime;
+    if (providerTraceSettingChanges(nextRuntime, previousRuntime)
+      && !(await isInstanceAdmin(input.conn, input.actor))) {
+      throw forbidden("Instance admin access required", { code: HIRE_APPROVAL_PROVIDER_TRACE_ADMIN_REQUIRED });
     }
   }
 
@@ -293,6 +318,7 @@ export async function authorizeHireApprovalRequest(
     actor,
     companyId: input.companyId,
     payloadConfig: isRecord(input.payload.adapterConfig) ? input.payload.adapterConfig : undefined,
+    payloadRuntimeConfig: isRecord(input.payload.runtimeConfig) ? input.payload.runtimeConfig : undefined,
     linked,
     agentAuthored: actor.type === "agent",
     instructionChangeAllowed: Boolean(input.instructionAmendment) && actor.type === "board",
@@ -374,6 +400,7 @@ export async function authorizeHireApprovalCreate(
     actor,
     companyId: input.companyId,
     payloadConfig: isRecord(input.payload.adapterConfig) ? input.payload.adapterConfig : undefined,
+    payloadRuntimeConfig: isRecord(input.payload.runtimeConfig) ? input.payload.runtimeConfig : undefined,
     linked: null,
     newAgentIdentity: { id: input.newAgentId, name: String(input.payload.name ?? "New Agent") },
     agentAuthored: Boolean(input.requestedByAgentId),
@@ -410,6 +437,7 @@ export async function authorizeHireActivation(
     actor,
     companyId: input.companyId,
     payloadConfig: input.payload && isRecord(input.payload.adapterConfig) ? input.payload.adapterConfig : undefined,
+    payloadRuntimeConfig: input.payload && isRecord(input.payload.runtimeConfig) ? input.payload.runtimeConfig : undefined,
     linked: input.agent,
     agentAuthored: Boolean(input.requestedByAgentId) && !amended,
     instructionChangeAllowed: amended,

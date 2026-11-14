@@ -671,6 +671,141 @@ describe("PG-4: guarded hire-approval path", () => {
     });
   });
 
+  describe("raw provider trace: the agent routes' instance-admin rule, on the locked before and after", () => {
+    const RAW = { debug: { providerTrace: "raw" } };
+    const TRACE = "hire_approval_provider_trace_admin_required";
+    const runtimeOf = async (agentId: string) => (await loadAgent(agentId))!.runtimeConfig as Config;
+    const isRaw = (runtime: Config | null | undefined) => (runtime?.debug as Config | undefined)?.providerTrace === "raw";
+    /** A payload whose runtimeConfig is replaced, written straight to the table as an older server would have. */
+    const legacyRuntimePayload = async (approvalId: string, runtimeConfig: Config) => {
+      const row = await loadApproval(approvalId);
+      await db.update(approvals).set({ payload: { ...(row.payload as Config), runtimeConfig } }).where(eq(approvals.id, approvalId));
+    };
+
+    it("request: a non-admin cannot create a hire approval that turns raw tracing on; an instance admin can", async () => {
+      await grant("user", userId);
+      const before = await effects();
+      const denied = await send(board(), "post", `/api/companies/${companyId}/approvals`,
+        { type: "hire_agent", payload: { ...base("TraceOn"), runtimeConfig: RAW } });
+      expect(denied.status, JSON.stringify(denied.body)).toBe(403);
+      expect(denied.body.details?.code).toBe(TRACE);
+      await expectNoEffects(before);
+      const allowed = await send(board({ isInstanceAdmin: true }), "post", `/api/companies/${companyId}/approvals`,
+        { type: "hire_agent", payload: { ...base("TraceOnAdmin"), runtimeConfig: RAW } });
+      expect(allowed.status, JSON.stringify(allowed.body)).toBe(201);
+    });
+
+    it("resubmit: a non-admin cannot turn a linked agent's raw tracing on or off; nothing is changed", async () => {
+      await grant("user", userId);
+      const off = await managedPendingHire(board());
+      const on = await managedPendingHire(localBoard(), { runtimeConfig: RAW });
+      expect(isRaw(await runtimeOf(on.agentId))).toBe(true);
+      for (const { approvalId, payload, next } of [
+        { ...off, next: { ...((off.payload.runtimeConfig as Config) ?? {}), ...RAW } },
+        { ...on, next: { ...(on.payload.runtimeConfig as Config), debug: {} } },
+      ]) {
+        await send(board(), "post", `/api/approvals/${approvalId}/request-revision`, {});
+        const before = await effects();
+        const denied = await send(board(), "post", `/api/approvals/${approvalId}/resubmit`, { payload: { ...payload, runtimeConfig: next } });
+        expect(denied.status, JSON.stringify(denied.body)).toBe(403);
+        expect(denied.body.details?.code).toBe(TRACE);
+        await expectNoEffects(before);
+        expect((await loadApproval(approvalId)).status).toBe("revision_requested");
+      }
+    });
+
+    it("resubmit: an instance admin can turn it on, and the decision by an admin applies it", async () => {
+      await grant("user", userId);
+      const { agentId, approvalId, payload } = await managedPendingHire(board());
+      await send(board(), "post", `/api/approvals/${approvalId}/request-revision`, {});
+      const resubmitted = await send(board({ isInstanceAdmin: true }), "post", `/api/approvals/${approvalId}/resubmit`,
+        { payload: { ...payload, runtimeConfig: { ...((payload.runtimeConfig as Config) ?? {}), ...RAW } } });
+      expect(resubmitted.status, JSON.stringify(resubmitted.body)).toBe(200);
+      const before = await effects();
+      const nonAdmin = await approveReviewed(board(), approvalId);
+      expect(nonAdmin.status).toBe(403);
+      expect(nonAdmin.body.details?.code).toBe(TRACE);
+      await expectNoEffects(before);
+      const approved = await approveReviewed(localBoard(), approvalId);
+      expect(approved.status, JSON.stringify(approved.body)).toBe(200);
+      expect(isRaw(await runtimeOf(agentId))).toBe(true);
+    });
+
+    it("legacy approvals: a stored payload that turns tracing on, or off, needs an instance-admin decider; nothing changes on denial", async () => {
+      await grant("user", userId);
+      const off = await managedPendingHire(board());
+      await legacyRuntimePayload(off.approvalId, RAW);
+      const on = await managedPendingHire(localBoard(), { runtimeConfig: RAW });
+      await legacyRuntimePayload(on.approvalId, { debug: {} });
+      for (const { approvalId, agentId, wasRaw } of [{ ...off, wasRaw: false }, { ...on, wasRaw: true }]) {
+        const before = await effects();
+        const denied = await approveReviewed(board(), approvalId);
+        expect(denied.status, JSON.stringify(denied.body)).toBe(403);
+        expect(denied.body.details?.code).toBe(TRACE);
+        await expectNoEffects(before);
+        expect((await loadApproval(approvalId)).status).toBe("pending");
+        expect((await loadAgent(agentId))!.status).toBe("pending_approval");
+        expect(isRaw(await runtimeOf(agentId))).toBe(wasRaw);
+      }
+      // The plugin path decides from company grants only, so even a database
+      // instance admin cannot change tracing through it.
+      await makeInstanceAdmin(userId);
+      for (const { approvalId } of [off, on]) {
+        const before = await effects();
+        const plugin = await settle(approvalService(db as any).approve(approvalId, userId, null, {
+          decider: { type: "board", userId, isInstanceAdmin: false, ignoreInstanceAdmin: true },
+          expectedUpdatedAt: new Date((await shownApproval(approvalId)).updatedAt),
+        }));
+        expect(plugin).toMatchObject({ ok: false, status: 403, code: TRACE });
+        await expectNoEffects(before);
+      }
+      // The instance admin role from the database authorizes a session decider.
+      const offApproved = await approveReviewed(board(), off.approvalId);
+      expect(offApproved.status, JSON.stringify(offApproved.body)).toBe(200);
+      expect(isRaw(await runtimeOf(off.agentId))).toBe(true);
+      const onApproved = await approveReviewed(localBoard(), on.approvalId);
+      expect(onApproved.status, JSON.stringify(onApproved.body)).toBe(200);
+      expect(isRaw(await runtimeOf(on.agentId))).toBe(false);
+    });
+
+    it("unchanged values need no extra authority, on or off", async () => {
+      await grant("user", userId);
+      const on = await managedPendingHire(localBoard(), { runtimeConfig: RAW });
+      const keptOn = await approveReviewed(board(), on.approvalId);
+      expect(keptOn.status, JSON.stringify(keptOn.body)).toBe(200);
+      expect(isRaw(await runtimeOf(on.agentId))).toBe(true);
+      const off = await managedPendingHire(board());
+      const keptOff = await approveReviewed(board(), off.approvalId);
+      expect(keptOff.status, JSON.stringify(keptOff.body)).toBe(200);
+      expect(isRaw(await runtimeOf(off.agentId))).toBe(false);
+    });
+
+    it("review race: raw tracing committed on the agent while a non-admin decision waits makes the payload a change, refused", async () => {
+      await grant("user", userId);
+      const { agentId, approvalId } = await managedPendingHire(board());
+      const raised = { ...((await runtimeOf(agentId)) ?? {}), ...RAW };
+      const holder = await holdRow(async (tx) => {
+        await tx.select({ id: agents.id }).from(agents).where(eq(agents.id, agentId)).for("no key update");
+        await tx.update(agents).set({ runtimeConfig: raised }).where(eq(agents.id, agentId));
+      });
+      let approve: Promise<any> | null = null;
+      try {
+        approve = approveReviewed(board(), approvalId);
+        expect(await waitFor(async () => (await rowLockWaiters()) >= 1)).toBe(true);
+      } finally {
+        holder.release();
+        await holder.done;
+      }
+      const res = await approve!;
+      expect(res.status, JSON.stringify(res.body)).toBe(403);
+      expect(res.body.details?.code).toBe(TRACE);
+      expect((await loadApproval(approvalId)).status).toBe("pending");
+      expect((await loadAgent(agentId))!.status).toBe("pending_approval");
+      expect(isRaw(await runtimeOf(agentId))).toBe(true);
+      expect(hireHook.notifyHireApproved).not.toHaveBeenCalled();
+    });
+  });
+
   describe("reviewer version: an approval decision is bound to the version the reviewer was shown", () => {
     it("API contract: approving an open hire without the reviewed version is refused (428), nothing changed", async () => {
       await grant("user", userId);

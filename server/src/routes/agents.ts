@@ -265,6 +265,7 @@ import { managedAgentProfileService } from "../services/managed-agent-profiles.j
 import { remoteAgentProfileService } from "../services/remote-agent-profiles.js";
 import { authorizeHireActivation } from "../services/hire-approval-authorization.js";
 import { APPROVAL_REVIEW_VERSION_REQUIRED } from "../services/approvals.js";
+import { providerTraceSettingChanges } from "../services/provider-trace-setting.js";
 
 const AGENT_SKILL_ASSIGNMENT_MODES = ["add", "remove", "replace"] as const;
 
@@ -2270,11 +2271,8 @@ export function agentRoutes(
     nextRuntimeConfig: unknown,
     previousRuntimeConfig?: unknown,
   ): void {
-    const previousRaw =
-      asRecord(asRecord(previousRuntimeConfig)?.debug)?.providerTrace === "raw";
-    const nextRaw =
-      asRecord(asRecord(nextRuntimeConfig)?.debug)?.providerTrace === "raw";
-    if (previousRaw !== nextRaw) assertInstanceAdmin(req);
+    // PG-4: the same predicate guards hire approvals (hire-approval-authorization.ts).
+    if (providerTraceSettingChanges(nextRuntimeConfig, previousRuntimeConfig)) assertInstanceAdmin(req);
   }
 
   async function assertAgentDefaultEnvironmentSelection(
