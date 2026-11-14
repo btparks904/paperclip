@@ -4616,6 +4616,27 @@ it.each(["held-ack", "lost-ack", "rejected-attach"] as const)(
           return rotate(identity, template);
         },
       );
+      // The retired ledger is the old authority's state at the commit that
+      // activates the warm transition (prepared -> activated). The new
+      // authenticated peer owns that boundary, so it can commit before or
+      // after the transport's rotateRunIdentity call; a rotate-time snapshot
+      // may already be the new authority's empty ledger.
+      const boundaries: (typeof core.store.state)[] = [];
+      // The public store type is read-only; the runtime store commits.
+      const store = core.store as unknown as {
+        readonly state: typeof core.store.state;
+        commit(candidate: typeof core.store.state): void;
+      };
+      const commit = store.commit.bind(store);
+      vi.spyOn(store, "commit").mockImplementation((candidate) => {
+        if (
+          store.state.warmTransition?.phase === "prepared" &&
+          candidate.warmTransition?.phase === "activated"
+        ) {
+          boundaries.push(structuredClone(store.state));
+        }
+        return commit(candidate);
+      });
       if (mode === "rejected-attach") {
         const queue = core.queueCommand.bind(core);
         vi.spyOn(core, "queueCommand").mockImplementation(
@@ -4659,6 +4680,7 @@ it.each(["held-ack", "lost-ack", "rejected-attach"] as const)(
           core.store.state.commands.find((entry) => entry.type === "run.attach")
             ?.status,
         ).toBe("failed");
+        expect(boundaries).toHaveLength(0);
       } else {
         await within("old authority commit barrier", commitEntered);
         const retained = await readRunner();
@@ -4682,13 +4704,35 @@ it.each(["held-ack", "lost-ack", "rejected-attach"] as const)(
         releaseCommit();
         await within("warm attach after old ACK", attachment, 10_000);
         expect(rotations).toHaveLength(1);
-        const retired = rotations[0]!;
+        // attachRun resolves only after the transition is activated.
+        expect(boundaries).toHaveLength(1);
+        const retired = boundaries[0]!;
+        expect(retired.identity).toEqual(oldIdentity);
+        // The rotate call saw either the same retired ledger (before the
+        // boundary) or the new authority (after it), never anything else.
+        const rotated = rotations[0]!;
+        if (rotated.warmTransition?.phase === "activated") {
+          expect(rotated.identity.runId).toBe("run-warm-ack-next");
+        } else {
+          expect(rotated.warmTransition?.phase).toBe("prepared");
+          expect(rotated.identity).toEqual(oldIdentity);
+          expect(
+            rotated.committedEvents.find(
+              (entry) => entry.sourceEventId === heldEvent!.sourceEventId,
+            ),
+          ).toEqual(
+            retired.committedEvents.find(
+              (entry) => entry.sourceEventId === heldEvent!.sourceEventId,
+            ),
+          );
+        }
         const attachedEvent = retired.committedEvents.find(
           (entry) => entry.sourceEventId === heldEvent!.sourceEventId,
-        )!;
-        expect(attachedEvent.logicalEffectCount).toBe(1);
+        );
+        expect(attachedEvent).toBeDefined();
+        expect(attachedEvent!.logicalEffectCount).toBe(1);
         expect(retired.ackedSourceSeq).toBeGreaterThanOrEqual(
-          attachedEvent.sourceSeq,
+          attachedEvent!.sourceSeq,
         );
         expect(
           retired.committedEvents.slice(-4).map((entry) => entry.eventType),
