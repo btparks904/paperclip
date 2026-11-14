@@ -21,6 +21,7 @@ import {
 import { deriveBundleState, resolveManagedInstructionsRoot } from "../services/agent-instructions.js";
 import { instructionActivationTestHooks } from "../services/instruction-generation-activation.js";
 import { agentService } from "../services/agents.js";
+import { secretService } from "../services/secrets.js";
 import { companySkillService } from "../services/company-skills.js";
 import { builtInAgentService } from "../services/built-in-agents.js";
 import { agentRoutes } from "../routes/agents.js";
@@ -785,17 +786,28 @@ describe("updateAgent carries instruction settings forward from the locked row",
         if (previous === undefined) delete process.env.PAPERCLIP_SECRETS_STRICT_MODE; else process.env.PAPERCLIP_SECRETS_STRICT_MODE = previous;
       }
     };
+    /**
+     * PG-3: a schema-secret field takes only an existing same-company secret
+     * reference, so these tests store the key first and pass its reference.
+     * The secret count then starts at 1; "no new secret row" stays asserted.
+     */
+    let apiKeyRef: Record<string, unknown>;
+    const REQUIRES_REF = "schema_secret_field_requires_secret_ref";
     beforeEach(async () => {
       await db.update(agents).set({ adapterType: "hermes_gateway", adapterConfig: { ...stateA(), model: "m0" } }).where(eq(agents.id, agentId));
       await fs.mkdir(rootC, { recursive: true });
+      const stored = await secretService(db).create(companyId, {
+        name: `carry-forward-api-key-${randomUUID()}`, provider: "local_encrypted", value: RAW_API_KEY,
+      });
+      apiKeyRef = { type: "secret_ref", secretId: stored.id, version: "latest" };
     });
 
     describe("F-2 rejections leave no secret row and change nothing", () => {
       for (const mode of ["merge", "replace"] as const) {
-        it(`${mode} mode with a raw secret and a concurrent switch: 409 ${CONFIG_CHANGED}`, async () => {
+        it(`${mode} mode with a secret reference and a concurrent switch: 409 ${CONFIG_CHANGED}`, async () => {
           const body = mode === "merge"
-            ? { adapterConfig: { instructionsFilePath: path.join(rootC, "AGENTS.md"), apiKey: RAW_API_KEY } }
-            : { adapterConfig: { ...stateC(), model: "m3", apiKey: RAW_API_KEY }, replaceAdapterConfig: true };
+            ? { adapterConfig: { instructionsFilePath: path.join(rootC, "AGENTS.md"), apiKey: apiKeyRef } }
+            : { adapterConfig: { ...stateC(), model: "m3", apiKey: apiKeyRef }, replaceAdapterConfig: true };
           const hold = holdSwitch(stateB());
           await sleep(50);
           const res = patch(body).then((r) => r);
@@ -803,15 +815,30 @@ describe("updateAgent carries instruction settings forward from the locked row",
           const before = await full();
           const settled = await res;
           const after = await full();
-          char(`F-2 ${mode} 409 raw secret`, { status: settled.status, waited: hold.waited(), secretsBefore: before.secrets, secretsAfter: after.secrets });
+          char(`F-2 ${mode} 409 secret ref`, { status: settled.status, waited: hold.waited(), secretsBefore: before.secrets, secretsAfter: after.secrets });
           expect(hold.waited()).toBe(true);
           expect(settled.status, JSON.stringify(settled.body)).toBe(409);
           expect(JSON.stringify(settled.body)).toContain(CONFIG_CHANGED);
           expect(after).toEqual(before);
-          expect(after.secrets).toBe(0);
+          expect(after.secrets).toBe(1);
           expect(keysOf(after.config)).toEqual(stateB());
         });
       }
+      it("merge and replace mode with a raw secret: 422 schema_secret_field_requires_secret_ref, no secret row (PG-3)", async () => {
+        for (const body of [
+          { adapterConfig: { instructionsFilePath: path.join(rootC, "AGENTS.md"), apiKey: RAW_API_KEY } },
+          { adapterConfig: { ...stateC(), model: "m3", apiKey: RAW_API_KEY }, replaceAdapterConfig: true },
+        ]) {
+          const before = await full();
+          const res = await patch(body);
+          const after = await full();
+          expect(res.status, JSON.stringify(res.body)).toBe(422);
+          expect(res.body?.details?.code ?? res.body?.code).toBe(REQUIRES_REF);
+          expect(after).toEqual(before);
+          expect(after.secrets).toBe(1);
+          expect(JSON.stringify(res.body)).not.toContain(RAW_API_KEY);
+        }
+      });
       it("an unauthorized viewer PATCH with a raw secret: 403 and no secret row", async () => {
         const actor = await viewer();
         const before = await full();
@@ -823,7 +850,7 @@ describe("updateAgent carries instruction settings forward from the locked row",
       });
       it("an authorized strict-mode PATCH with a raw sensitive env value: 422 and no secret row", async () => {
         const before = await full();
-        const res = await withStrict(() => patch({ adapterConfig: { apiKey: RAW_API_KEY, env: { OPENAI_API_KEY: { type: "plain", value: "SENTINEL-PLAIN-TOKEN" } } } }));
+        const res = await withStrict(() => patch({ adapterConfig: { apiKey: apiKeyRef, env: { OPENAI_API_KEY: { type: "plain", value: "SENTINEL-PLAIN-TOKEN" } } } }));
         const after = await full();
         char("F-2 strict 422", { status: res.status, error: res.body?.error, secretsAfter: after.secrets });
         expect(res.status).toBe(422);
@@ -840,25 +867,25 @@ describe("updateAgent carries instruction settings forward from the locked row",
         expect(String(res.body?.error)).toContain("Invalid opencode_local adapterConfig");
         expect(after).toEqual(before);
       });
-      it("an updateAgent rejection after normalization (direct service D-R4) rolls the secret back", async () => {
+      it("an updateAgent rejection after normalization (direct service D-R4) leaves no secret row", async () => {
         const stale = await configOf();
         const hold = holdSwitch(stateB());
         await sleep(50);
-        const write = agentService(db).update(agentId, { adapterConfig: { ...stale, apiKey: RAW_API_KEY } },
+        const write = agentService(db).update(agentId, { adapterConfig: { ...stale, apiKey: apiKeyRef } },
           { instructionConfigWrite: { keys: "all", expected: stale } }).then(() => null, (e) => e?.details?.code ?? String(e));
         await hold.done;
         const before = await full();
         const code = await write;
         const after = await full();
-        char("F-2 service 409 raw secret", { code, secretsAfter: after.secrets });
+        char("F-2 service 409 secret ref", { code, secretsAfter: after.secrets });
         expect(code).toBe(CONFIG_CHANGED);
         expect(after).toEqual(before);
-        expect(after.secrets).toBe(0);
+        expect(after.secrets).toBe(1);
       });
-      it("rollback of an outer transaction removes a secret created inside it", async () => {
+      it("rollback of an outer transaction undoes an update made inside it", async () => {
         const before = await full();
         const result = await db.transaction(async (tx) => {
-          await agentService(tx as unknown as Db).update(agentId, { adapterConfig: { ...(await configOf()), apiKey: RAW_API_KEY } });
+          await agentService(tx as unknown as Db).update(agentId, { adapterConfig: { ...(await configOf()), apiKey: apiKeyRef } });
           throw new Error("SENTINEL-OUTER-ROLLBACK");
         }).then(() => "committed", (e) => String(e?.message));
         const after = await full();
@@ -868,20 +895,20 @@ describe("updateAgent carries instruction settings forward from the locked row",
     });
 
     describe("F-2 success", () => {
-      it("a new raw secret creates exactly one secret row and is stored as the base canonical reference", async () => {
-        const res = await patch({ adapterConfig: { apiKey: RAW_API_KEY } });
+      it("an existing secret reference creates no secret row and is stored as the base canonical reference", async () => {
+        const res = await patch({ adapterConfig: { apiKey: apiKeyRef } });
         const final = await configOf();
-        char("F-2 success new raw secret", { status: res.status, secrets: await secretCount(), config: shape(final) });
+        char("F-2 success secret ref", { status: res.status, secrets: await secretCount(), config: shape(final) });
         expect(res.status, JSON.stringify(res.body)).toBe(200);
         expect(await secretCount()).toBe(1);
         // The canonical reference shape stored at the base (8a99046a).
-        expect(final.apiKey).toEqual({ type: "secret_ref", secretId: expect.any(String), version: "latest",
+        expect(final.apiKey).toEqual({ type: "secret_ref", secretId: apiKeyRef.secretId, version: "latest",
           projectionClass: "unclassified", projectionAllowlistKey: null });
         expect(JSON.stringify(final)).not.toContain(RAW_API_KEY);
         expect(JSON.stringify(res.body)).not.toContain(RAW_API_KEY);
       });
       it("an existing secret reference is kept and creates no row", async () => {
-        await patch({ adapterConfig: { apiKey: RAW_API_KEY } });
+        await patch({ adapterConfig: { apiKey: apiKeyRef } });
         const ref = (await configOf()).apiKey;
         const res = await patch({ adapterConfig: { apiKey: ref, model: "m4" } });
         const final = await configOf();
@@ -890,12 +917,15 @@ describe("updateAgent carries instruction settings forward from the locked row",
         expect(await secretCount()).toBe(1);
         expect(final.apiKey).toEqual(ref);
       });
-      it("a repeated equivalent raw-secret PATCH (characterized against the base)", async () => {
-        await patch({ adapterConfig: { apiKey: RAW_API_KEY } });
-        const res = await patch({ adapterConfig: { apiKey: RAW_API_KEY } });
+      it("a repeated raw-secret PATCH is refused each time and creates no secret (PG-3)", async () => {
+        const before = await full();
+        for (let attempt = 0; attempt < 2; attempt += 1) {
+          const res = await patch({ adapterConfig: { apiKey: RAW_API_KEY } });
+          expect(res.status, JSON.stringify(res.body)).toBe(422);
+        }
         const final = await configOf();
-        char("F-2 success repeated raw", { status: res.status, secrets: await secretCount(), config: shape(final) });
-        expect(res.status, JSON.stringify(res.body)).toBe(200);
+        char("F-2 repeated raw refused", { secrets: await secretCount(), config: shape(final) });
+        expect(await full()).toEqual(before);
         expect(JSON.stringify(final)).not.toContain(RAW_API_KEY);
       });
       it("a redacted env value keeps the stored value", async () => {
@@ -906,22 +936,25 @@ describe("updateAgent carries instruction settings forward from the locked row",
         expect(res.status, JSON.stringify(res.body)).toBe(200);
         expect(final.env).toEqual({ OPENAI_API_KEY: { type: "plain", value: "SENTINEL-STORED-ENV" } });
       });
-      it("strict mode accepts a secret reference and normalizes a raw secret field", async () => {
-        const res = await withStrict(() => patch({ adapterConfig: { apiKey: RAW_API_KEY, env: { PLAIN_SETTING: { type: "plain", value: "ok" } } } }));
+      it("strict mode accepts a secret reference and refuses a raw secret field", async () => {
+        const refused = await withStrict(() => patch({ adapterConfig: { apiKey: RAW_API_KEY, env: { PLAIN_SETTING: { type: "plain", value: "ok" } } } }));
+        expect(refused.status, JSON.stringify(refused.body)).toBe(422);
+        expect(await secretCount()).toBe(1);
+        const res = await withStrict(() => patch({ adapterConfig: { apiKey: apiKeyRef, env: { PLAIN_SETTING: { type: "plain", value: "ok" } } } }));
         const final = await configOf();
         char("F-2 success strict", { status: res.status, secrets: await secretCount(), config: shape(final) });
         expect(res.status, JSON.stringify(res.body)).toBe(200);
         expect(await secretCount()).toBe(1);
         expect(JSON.stringify(final)).not.toContain(RAW_API_KEY);
       });
-      it("a transaction-bound caller commits its secret with its update", async () => {
+      it("a transaction-bound caller commits its secret reference with its update", async () => {
         await db.transaction(async (tx) => {
-          await agentService(tx as unknown as Db).update(agentId, { adapterConfig: { ...(await configOf()), apiKey: RAW_API_KEY } });
+          await agentService(tx as unknown as Db).update(agentId, { adapterConfig: { ...(await configOf()), apiKey: apiKeyRef } });
         });
         const final = await configOf();
         char("F-2 success nested", { secrets: await secretCount(), config: shape(final) });
         expect(await secretCount()).toBe(1);
-        expect(final.apiKey).toMatchObject({ type: "secret_ref" });
+        expect(final.apiKey).toMatchObject({ type: "secret_ref", secretId: apiKeyRef.secretId });
       });
     });
   });

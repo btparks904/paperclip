@@ -1050,24 +1050,33 @@ describe("instructions bundle copy-and-switch", () => {
 
   describe("transaction rollback and secret parity (test 17)", () => {
     const secretRows = () => db.select().from(companySecrets).where(eq(companySecrets.companyId, companyId));
+    // PG-3: a schema-secret field takes only an existing same-company secret
+    // reference, so the key is stored first and the agent holds its reference.
+    let apiKeyRef: Record<string, unknown>;
     beforeEach(async () => {
-      await db.update(agents).set({ adapterType: "hermes_gateway", adapterConfig: { ...cfg("managed", managedRoot), apiKey: RAW_API_KEY } }).where(eq(agents.id, agentId));
+      const stored = await secretService(db).create(companyId, {
+        name: `switch-race-api-key-${randomUUID()}`, provider: "local_encrypted", value: RAW_API_KEY,
+      });
+      apiKeyRef = { type: "secret_ref", secretId: stored.id, version: "latest" };
+      await db.update(agents).set({ adapterType: "hermes_gateway", adapterConfig: { ...cfg("managed", managedRoot), apiKey: apiKeyRef } }).where(eq(agents.id, agentId));
     });
-    it("creates no secret on a failure at persist, copy or commit, and exactly one on success", async () => {
+    it("creates no secret on a failure at persist, copy or commit, nor on success", async () => {
       const failures: Array<[string, () => void]> = [
         ["persist (pending approval)", () => undefined],
         ["copy (EIO)", () => { spyOpen((file, flags) => { if (isDestWrite(file, flags)) throw errno("EIO"); }); }],
       ];
+      const secretsBefore = await secretRows();
+      expect(secretsBefore).toHaveLength(1);
       await db.update(agents).set({ status: "pending_approval" }).where(eq(agents.id, agentId));
       failures[0]![1]();
       expect((await patch({ mode: "external", rootPath: ext })).ok).toBe(false);
-      expect(await secretRows()).toHaveLength(0);
+      expect(await secretRows()).toEqual(secretsBefore);
       await db.update(agents).set({ status: "idle" }).where(eq(agents.id, agentId));
       failures[1]![1]();
       expect((await patch({ mode: "external", rootPath: ext })).ok).toBe(false);
       vi.restoreAllMocks();
-      expect(await secretRows()).toHaveLength(0);
-      expect(JSON.stringify(await configOf()).includes(RAW_API_KEY)).toBe(true);
+      expect(await secretRows()).toEqual(secretsBefore);
+      expect((await configOf()).apiKey).toEqual(apiKeyRef);
       const commitRoot = path.join(home, "ext-commit", agentId);
       let copied = false;
       spyOpen((file, flags) => { if (isDestWrite(file, flags, commitRoot)) copied = true; });
@@ -1078,11 +1087,23 @@ describe("instructions bundle copy-and-switch", () => {
       }) as typeof fs.lstat);
       expect((await patch({ mode: "external", rootPath: commitRoot })).ok).toBe(false);
       vi.restoreAllMocks();
-      expect(await secretRows()).toHaveLength(0);
+      expect(await secretRows()).toEqual(secretsBefore);
       const okRoot = path.join(home, "ext-ok", agentId);
       expect((await patch({ mode: "external", rootPath: okRoot })).ok).toBe(true);
-      expect(await secretRows()).toHaveLength(1);
+      expect(await secretRows()).toEqual(secretsBefore);
+      expect((await configOf()).apiKey).toMatchObject({ type: "secret_ref", secretId: apiKeyRef.secretId });
       expect(JSON.stringify(await configOf()).includes(RAW_API_KEY)).toBe(false);
+    });
+    it("refuses a stored raw value (pre-PG-3 row) with no secret, root or configuration change", async () => {
+      await db.update(agents).set({ adapterConfig: { ...cfg("managed", managedRoot), apiKey: RAW_API_KEY } }).where(eq(agents.id, agentId));
+      const secretsBefore = await secretRows();
+      const configBefore = await configOf();
+      const okRoot = path.join(home, "ext-raw", agentId);
+      expect(await patch({ mode: "external", rootPath: okRoot })).toMatchObject({
+        ok: false, status: 422, code: "schema_secret_field_requires_secret_ref",
+      });
+      expect(await secretRows()).toEqual(secretsBefore);
+      expect(await configOf()).toEqual(configBefore);
     });
   });
 });
