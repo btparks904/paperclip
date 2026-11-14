@@ -303,10 +303,10 @@ describe("PG-1: a failed Codex device-login promotion keeps the account home it 
 
   it("race: a secret naming the new home, uncommitted in another transaction, keeps the home after the promotion fails", async () => {
     // The race the old cleanup lost: another transaction writes a
-    // `local_encrypted` secret whose value is this account home (the same
-    // `createManagedLocalSecret` an agent configuration save uses when it
-    // normalizes a raw value). It takes and releases the account-home secret
-    // lock, then holds its transaction open. The promotion's own secret
+    // `local_encrypted` secret whose value is this account home (through
+    // `secretService.create`, as the company secrets API does; agent
+    // configuration saves no longer create secrets). It takes and releases the
+    // account-home secret lock, then holds its transaction open. The promotion's own secret
     // write then fails. The old code scanned for claimants in that gap, could
     // not see the uncommitted row, and deleted the directory.
     const { secretService } = await vi.importActual<typeof import("../services/secrets.js")>("../services/secrets.js");
