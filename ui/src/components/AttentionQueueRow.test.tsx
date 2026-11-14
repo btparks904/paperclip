@@ -560,7 +560,8 @@ describe("AttentionQueueRow", () => {
     act(() => approve?.dispatchEvent(new MouseEvent("click", { bubbles: true })));
 
     await new Promise((resolve) => setTimeout(resolve, 0));
-    expect(approvalsApi.approve).toHaveBeenCalledWith("approval-1");
+    // PG-4: the decision is bound to the approval version this row shows.
+    expect(approvalsApi.approve).toHaveBeenCalledWith({ id: "approval-1", updatedAt: "2026-07-09T12:00:00Z" });
     expect(onToggleExpand).not.toHaveBeenCalled();
     expect(container?.textContent).toContain("Approval approved");
   });

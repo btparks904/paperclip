@@ -48,6 +48,9 @@ import { issueThreadInteractionService } from "../services/issue-thread-interact
 
 // PG-4: hire approvals are decided by an authorized board actor.
 const PG4_LOCAL_BOARD = { type: "board" as const, source: "local_implicit" as const };
+/** PG-4: the approval version the reviewer saw (its current `updatedAt`); an open hire is approved with it. */
+const reviewedVersion = async (conn: any, approvalId: string): Promise<Date> =>
+  (await conn.select({ updatedAt: approvals.updatedAt }).from(approvals).where(eq(approvals.id, approvalId)))[0].updatedAt;
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -355,7 +358,7 @@ describeEmbeddedPostgres("built-in agents", () => {
       })
       .where(eq(agents.id, result.state.agentId!));
 
-    await approvalService(db).approve(result.approval!.id, "board-user", "Approved built-in agent", { decider: PG4_LOCAL_BOARD });
+    await approvalService(db).approve(result.approval!.id, "board-user", "Approved built-in agent", { decider: PG4_LOCAL_BOARD, expectedUpdatedAt: await reviewedVersion(db, result.approval!.id) });
 
     await expect(builtIns.get(companyId, "briefs")).resolves.toMatchObject({
       status: "ready",
@@ -790,7 +793,7 @@ describeEmbeddedPostgres("built-in agents", () => {
       "missing",
     ]);
 
-    await approvalService(db).approve(approval.id, "board-user", "Approved Reflection Coach", { decider: PG4_LOCAL_BOARD });
+    await approvalService(db).approve(approval.id, "board-user", "Approved Reflection Coach", { decider: PG4_LOCAL_BOARD, expectedUpdatedAt: await reviewedVersion(db, approval.id) });
     const approvedState = await builtInAgentService(db).get(companyId, "reflection-coach");
     expect(approvedState).toMatchObject({
       agent: {

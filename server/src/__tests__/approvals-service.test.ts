@@ -34,7 +34,11 @@ type ApprovalRecord = {
   status: string;
   payload: Record<string, unknown>;
   requestedByAgentId: string | null;
+  updatedAt: Date;
 };
+
+// PG-4: the approval version a reviewer saw; an open hire is approved with it.
+const REVIEWED_AT = new Date("2026-11-13T12:00:00.000Z");
 
 function createApproval(status: string): ApprovalRecord {
   return {
@@ -44,6 +48,7 @@ function createApproval(status: string): ApprovalRecord {
     status,
     payload: { agentId: "agent-1" },
     requestedByAgentId: "requester-1",
+    updatedAt: REVIEWED_AT,
   };
 }
 
@@ -87,7 +92,7 @@ describe("approvalService resolution idempotency", () => {
     );
 
     const svc = approvalService(dbStub.db as any);
-    const result = await svc.approve("approval-1", "board", "ship it", { decider: BOARD_DECIDER });
+    const result = await svc.approve("approval-1", "board", "ship it", { decider: BOARD_DECIDER, expectedUpdatedAt: REVIEWED_AT });
 
     expect(result.applied).toBe(false);
     expect(result.approval.status).toBe("approved");
@@ -114,7 +119,7 @@ describe("approvalService resolution idempotency", () => {
     const dbStub = createDbStub([[createApproval("pending")], [createApproval("pending")]], [approved]);
 
     const svc = approvalService(dbStub.db as any);
-    const result = await svc.approve("approval-1", "board", "ship it", { decider: BOARD_DECIDER });
+    const result = await svc.approve("approval-1", "board", "ship it", { decider: BOARD_DECIDER, expectedUpdatedAt: REVIEWED_AT });
 
     expect(result.applied).toBe(true);
     expect(mockAgentService.activatePendingApproval).toHaveBeenCalledWith(
@@ -145,7 +150,7 @@ describe("approvalService resolution idempotency", () => {
     const dbStub = createDbStub([[pendingRow], [pendingRow]], [approved]);
 
     const svc = approvalService(dbStub.db as any);
-    const result = await svc.approve("approval-1", "board", "ship it", { decider: BOARD_DECIDER });
+    const result = await svc.approve("approval-1", "board", "ship it", { decider: BOARD_DECIDER, expectedUpdatedAt: REVIEWED_AT });
 
     expect(result.applied).toBe(true);
     expect(mockAgentService.create).toHaveBeenCalledWith(

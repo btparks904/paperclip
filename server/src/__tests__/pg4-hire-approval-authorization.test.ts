@@ -18,6 +18,7 @@ import { agentRoutes } from "../routes/agents.js";
 import { approvalRoutes } from "../routes/approvals.js";
 import { errorHandler } from "../middleware/index.js";
 import { approvalService } from "../services/approvals.js";
+import { attentionService } from "../services/attention.js";
 import { resolveInstructionVersionRoot, resolveManagedInstructionsRoot } from "../services/agent-instructions.js";
 import { INSTRUCTION_ROOT_IN_USE, resolveManagedAgentArea } from "../services/instruction-root-exclusivity.js";
 import { HIRE_INSTRUCTION_AMENDMENT_ACTION } from "../services/hire-approval-authorization.js";
@@ -56,6 +57,22 @@ describe("PG-4: guarded hire-approval path", () => {
   };
   const send = (actor: Actor, method: "post" | "patch", url: string, body: Record<string, unknown> = {}) =>
     request(app(actor))[method](url).send(body).then((res) => res);
+  /** The approval as the board UI is shown it (GET /api/approvals/:id). */
+  const shownApproval = async (approvalId: string) => {
+    const res = await request(app(localBoard())).get(`/api/approvals/${approvalId}`);
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    return res.body as { id: string; updatedAt: string; payload: Config; status: string };
+  };
+  /** Approves the way the UI does: with the version of the approval it showed. */
+  const approveReviewed = async (actor: Actor, approvalId: string) =>
+    send(actor, "post", `/api/approvals/${approvalId}/approve`, { expectedUpdatedAt: (await shownApproval(approvalId)).updatedAt });
+  /** Approves a pending agent directly, naming the open hire approval's shown version when there is one. */
+  const approveAgentReviewed = async (actor: Actor, agentId: string) => {
+    const [open] = await db.select({ id: approvals.id }).from(approvals)
+      .where(and(eq(approvals.type, "hire_agent"), sql`${approvals.status} in ('pending', 'revision_requested')`, sql`${approvals.payload} ->> 'agentId' = ${agentId}`));
+    const body = open ? { expectedApprovalUpdatedAt: (await shownApproval(open.id)).updatedAt } : {};
+    return send(actor, "post", `/api/agents/${agentId}/approve`, body);
+  };
 
   const ext = (label: string) => {
     const root = path.join(home, "external", `${label}-${randomUUID()}`);
@@ -308,10 +325,10 @@ describe("PG-4: guarded hire-approval path", () => {
       await db.insert(companyMemberships).values({ companyId, principalType: "user", principalId: otherUserId, membershipRole: "operator" });
       await grant("user", otherUserId);
       const before = await effects();
-      const refused = await send(board({ userId: otherUserId }), "post", `/api/approvals/${created.body.id}/approve`, {});
+      const refused = await approveReviewed(board({ userId: otherUserId }), created.body.id);
       expect(refused.status).toBe(403);
       await expectNoEffects(before);
-      const approved = await send(board(), "post", `/api/approvals/${created.body.id}/approve`, {});
+      const approved = await approveReviewed(board(), created.body.id);
       expect(approved.status, JSON.stringify(approved.body)).toBe(200);
       const [agent] = await db.select().from(agents).where(and(eq(agents.companyId, companyId), eq(agents.name, "Ext")));
       expect(agent!.status).toBe("idle");
@@ -325,7 +342,7 @@ describe("PG-4: guarded hire-approval path", () => {
       expect(created.status).toBe(201);
       await grant("user", userId);
       const before = await effects();
-      const res = await send(board({ isInstanceAdmin: true }), "post", `/api/approvals/${created.body.id}/approve`, {});
+      const res = await approveReviewed(board({ isInstanceAdmin: true }), created.body.id);
       expect(res.status).toBe(403);
       await expectNoEffects(before);
     });
@@ -336,7 +353,7 @@ describe("PG-4: guarded hire-approval path", () => {
       await grant("user", userId);
       const { agentId, approvalId } = await managedPendingHire(board());
       expect((await loadApproval(approvalId)).requestedByUserId).toBe(userId);
-      const res = await send(board(), "post", `/api/approvals/${approvalId}/approve`, {});
+      const res = await approveReviewed(board(), approvalId);
       expect(res.status, JSON.stringify(res.body)).toBe(200);
       const agent = (await loadAgent(agentId))!;
       expect(agent.status).toBe("idle");
@@ -350,9 +367,9 @@ describe("PG-4: guarded hire-approval path", () => {
       const hirer = await seedAgent({ permissions: { canCreateAgents: true } });
       const { approvalId } = await managedPendingHire();
       const before = await effects();
-      const res = await send(agentActor(hirer), "post", `/api/approvals/${approvalId}/approve`, {});
+      const res = await approveReviewed(agentActor(hirer), approvalId);
       expect(res.status).toBe(403);
-      const direct = await send(agentActor(hirer), "post", `/api/agents/${(await loadApproval(approvalId)).payload.agentId}/approve`, {});
+      const direct = await approveAgentReviewed(agentActor(hirer), (await loadApproval(approvalId)).payload.agentId as string);
       expect(direct.status).toBe(403);
       await expectNoEffects(before);
     });
@@ -360,7 +377,7 @@ describe("PG-4: guarded hire-approval path", () => {
     it("generic approval without agents:create: 403; the agent stays pending and the approval open", async () => {
       const { approvalId } = await managedPendingHire();
       const before = await effects();
-      const res = await send(board(), "post", `/api/approvals/${approvalId}/approve`, {});
+      const res = await approveReviewed(board(), approvalId);
       expect(res.status).toBe(403);
       await expectNoEffects(before);
     });
@@ -368,11 +385,11 @@ describe("PG-4: guarded hire-approval path", () => {
     it("direct agent approval (linked): needs agents:create; allowed with it", async () => {
       const { agentId, approvalId } = await managedPendingHire();
       const before = await effects();
-      const denied = await send(board(), "post", `/api/agents/${agentId}/approve`, {});
+      const denied = await approveAgentReviewed(board(), agentId);
       expect(denied.status).toBe(403);
       await expectNoEffects(before);
       await grant("user", userId);
-      const ok = await send(board(), "post", `/api/agents/${agentId}/approve`, {});
+      const ok = await approveAgentReviewed(board(), agentId);
       expect(ok.status, JSON.stringify(ok.body)).toBe(200);
       expect((await loadAgent(agentId))!.status).toBe("idle");
       expect((await loadApproval(approvalId)).status).toBe("approved");
@@ -382,23 +399,23 @@ describe("PG-4: guarded hire-approval path", () => {
       const managed = await seedAgent({ status: "pending_approval" });
       const external = await seedAgent({ status: "pending_approval", adapterConfig: { ...ext("fallback"), model: "m0" } });
       const before = await effects();
-      expect((await send(board(), "post", `/api/agents/${managed}/approve`, {})).status).toBe(403);
+      expect((await approveAgentReviewed(board(), managed)).status).toBe(403);
       await grant("user", userId);
-      expect((await send(board(), "post", `/api/agents/${external}/approve`, {})).status).toBe(403);
+      expect((await approveAgentReviewed(board(), external)).status).toBe(403);
       await expectNoEffects(before);
-      expect((await send(board(), "post", `/api/agents/${managed}/approve`, {})).status).toBe(200);
+      expect((await approveAgentReviewed(board(), managed)).status).toBe(200);
       expect((await loadAgent(managed))!.status).toBe("idle");
-      expect((await send(localBoard(), "post", `/api/agents/${external}/approve`, {})).status).toBe(200);
+      expect((await approveAgentReviewed(localBoard(), external)).status).toBe(200);
       expect((await loadAgent(external))!.status).toBe("idle");
     });
 
     it("no-agentId branch: a denied decision creates nothing; an authorized one creates one idle agent with the approved budget", async () => {
       const approval = await insertApproval({ ...base("Fresh"), budgetMonthlyCents: 500, adapterConfig: { model: "m1" } });
       const before = await effects();
-      expect((await send(board(), "post", `/api/approvals/${approval.id}/approve`, {})).status).toBe(403);
+      expect((await approveReviewed(board(), approval.id)).status).toBe(403);
       await expectNoEffects(before);
       await grant("user", userId);
-      const res = await send(board(), "post", `/api/approvals/${approval.id}/approve`, {});
+      const res = await approveReviewed(board(), approval.id);
       expect(res.status, JSON.stringify(res.body)).toBe(200);
       const created = (await db.select().from(agents).where(and(eq(agents.companyId, companyId), eq(agents.name, "Fresh"))));
       expect(created).toHaveLength(1);
@@ -416,7 +433,7 @@ describe("PG-4: guarded hire-approval path", () => {
       await expectNoEffects(before);
       const historical = await insertApproval({ ...base(), agentId: foreignPending });
       const afterInsert = await effects();
-      const approve = await send(localBoard(), "post", `/api/approvals/${historical.id}/approve`, {});
+      const approve = await approveReviewed(localBoard(), historical.id);
       expect(approve.status).toBe(409);
       await expectNoEffects(afterInsert);
       expect((await loadAgent(foreignPending))!.status).toBe("pending_approval");
@@ -426,7 +443,7 @@ describe("PG-4: guarded hire-approval path", () => {
       const idle = await seedAgent({ status: "idle" });
       const approval = await insertApproval({ ...base(), agentId: idle, adapterConfig: { model: "m0" } });
       const before = await effects();
-      const res = await send(localBoard(), "post", `/api/approvals/${approval.id}/approve`, {});
+      const res = await approveReviewed(localBoard(), approval.id);
       expect(res.status).toBe(409);
       await expectNoEffects(before);
     });
@@ -437,11 +454,15 @@ describe("PG-4: guarded hire-approval path", () => {
       const decider = { type: "board" as const, userId, isInstanceAdmin: false, ignoreInstanceAdmin: true };
       await makeInstanceAdmin(userId);
       const before = await effects();
-      const refused = await settle(svc.approve(approvalId, userId, null, { decider }));
+      const expectedUpdatedAt = new Date((await shownApproval(approvalId)).updatedAt);
+      const refused = await settle(svc.approve(approvalId, userId, null, { decider, expectedUpdatedAt }));
       expect(refused).toMatchObject({ ok: false, status: 403 });
       await expectNoEffects(before);
       await grant("user", userId);
-      const ok = await settle(svc.approve(approvalId, userId, null, { decider }));
+      const unversioned = await settle(svc.approve(approvalId, userId, null, { decider }));
+      expect(unversioned).toMatchObject({ ok: false, status: 428, code: "approval_review_version_required" });
+      await expectNoEffects(before);
+      const ok = await settle(svc.approve(approvalId, userId, null, { decider, expectedUpdatedAt }));
       expect(ok).toMatchObject({ ok: true, value: { applied: true } });
     });
 
@@ -460,7 +481,7 @@ describe("PG-4: guarded hire-approval path", () => {
       const stalePayload = { ...payload, adapterConfig: { ...(payload.adapterConfig as Config), ...ext("historical") } };
       await db.update(approvals).set({ payload: stalePayload }).where(eq(approvals.id, approvalId));
       const before = await effects();
-      const res = await send(localBoard(), "post", `/api/approvals/${approvalId}/approve`, {});
+      const res = await approveReviewed(localBoard(), approvalId);
       expect(res.status).toBe(409);
       expect(res.body.details?.code).toBe(STALE);
       await expectNoEffects(before);
@@ -484,7 +505,7 @@ describe("PG-4: guarded hire-approval path", () => {
       const approval = await insertApproval({ ...base("Hist"), adapterConfig: { instructionsBundleMode: "managed", instructionsEntryFile: "AGENTS.md" } },
         { requestedByAgentId: hirer });
       const before = await effects();
-      const res = await send(localBoard(), "post", `/api/approvals/${approval.id}/approve`, {});
+      const res = await approveReviewed(localBoard(), approval.id);
       expect(res.status).toBe(409);
       expect(res.body.details?.code).toBe(AGENT_AUTHORED);
       await expectNoEffects(before);
@@ -498,7 +519,7 @@ describe("PG-4: guarded hire-approval path", () => {
       const movedConfig = { ...(agent.adapterConfig as Config), instructionsRootPath: versionRoot, instructionsFilePath: path.join(versionRoot, "AGENTS.md") };
       await db.update(agents).set({ instructionBundleId: generation, adapterConfig: movedConfig }).where(eq(agents.id, agentId));
       const before = await effects();
-      const res = await send(localBoard(), "post", `/api/approvals/${approvalId}/approve`, {});
+      const res = await approveReviewed(localBoard(), approvalId);
       expect(res.status).toBe(409);
       expect(res.body.details?.code).toBe(STALE);
       await expectNoEffects(before);
@@ -529,7 +550,7 @@ describe("PG-4: guarded hire-approval path", () => {
       expect(records[0]!.actorType).toBe("user");
       expect(records[0]!.actorId).toBe(userId);
       expect(records[0]!.details).toMatchObject({ agentId, fields: ["adapterConfig.instructionsEntryFile"] });
-      const approved = await send(board(), "post", `/api/approvals/${approvalId}/approve`, {});
+      const approved = await approveReviewed(board(), approvalId);
       expect(approved.status, JSON.stringify(approved.body)).toBe(200);
       const agent = (await loadAgent(agentId))!;
       expect(agent.status).toBe("idle");
@@ -558,10 +579,10 @@ describe("PG-4: guarded hire-approval path", () => {
       const admin = await amend(localBoard(), (config) => ({ ...config, ...root }));
       expect(admin.res.status, JSON.stringify(admin.res.body)).toBe(200);
       const before = await effects();
-      const refused = await send(board(), "post", `/api/approvals/${admin.approvalId}/approve`, {});
+      const refused = await approveReviewed(board(), admin.approvalId);
       expect(refused.status).toBe(403);
       await expectNoEffects(before);
-      const approved = await send(localBoard(), "post", `/api/approvals/${admin.approvalId}/approve`, {});
+      const approved = await approveReviewed(localBoard(), admin.approvalId);
       expect(approved.status, JSON.stringify(approved.body)).toBe(200);
       expect((await loadAgent(admin.agentId))!.adapterConfig).toMatchObject({ instructionsRootPath: root.instructionsRootPath });
     });
@@ -576,7 +597,7 @@ describe("PG-4: guarded hire-approval path", () => {
         adapterConfig: { ...(agent.adapterConfig as Config), instructionsRootPath: versionRoot, instructionsFilePath: path.join(versionRoot, "AGENTS.md") } })
         .where(eq(agents.id, agentId));
       const before = await effects();
-      const approved = await send(localBoard(), "post", `/api/approvals/${approvalId}/approve`, {});
+      const approved = await approveReviewed(localBoard(), approvalId);
       expect(approved.status).toBe(409);
       expect(approved.body.details?.code).toBe(STALE);
       await expectNoEffects(before);
@@ -588,7 +609,7 @@ describe("PG-4: guarded hire-approval path", () => {
       await db.update(approvals).set({ payload: { ...payload, adapterConfig: { ...(payload.adapterConfig as Config), instructionsEntryFile: "OTHER.md" } } })
         .where(eq(approvals.id, approvalId));
       const before = await effects();
-      const approved = await send(localBoard(), "post", `/api/approvals/${approvalId}/approve`, {});
+      const approved = await approveReviewed(localBoard(), approvalId);
       expect(approved.status).toBe(409);
       await expectNoEffects(before);
     });
@@ -599,7 +620,7 @@ describe("PG-4: guarded hire-approval path", () => {
       await db.update(activityLog).set({ actorType: "plugin" })
         .where(and(eq(activityLog.entityId, approvalId), eq(activityLog.action, HIRE_INSTRUCTION_AMENDMENT_ACTION)));
       const before = await effects();
-      const approved = await send(localBoard(), "post", `/api/approvals/${approvalId}/approve`, {});
+      const approved = await approveReviewed(localBoard(), approvalId);
       expect(approved.status).toBe(409);
       await expectNoEffects(before);
     });
@@ -615,7 +636,7 @@ describe("PG-4: guarded hire-approval path", () => {
       const res = await send(localBoard(), "post", `/api/approvals/${approvalId}/resubmit`,
         { payload: { ...snapshot, adapterConfig: { ...(snapshot.adapterConfig as Config), instructionsEntryFile: "MAIN.md" } }, instructionAmendment: true });
       expect(res.status, JSON.stringify(res.body)).toBe(200);
-      const approved = await send(localBoard(), "post", `/api/approvals/${approvalId}/approve`, {});
+      const approved = await approveReviewed(localBoard(), approvalId);
       expect(approved.status, JSON.stringify(approved.body)).toBe(200);
       expect(((await loadAgent(pending.body.agent.id))!.adapterConfig as Config).instructionsEntryFile).toBe("MAIN.md");
     });
@@ -626,7 +647,7 @@ describe("PG-4: guarded hire-approval path", () => {
       const { agentId, approvalId, res } = await amend(localBoard(), (config) => ({ ...config, ...owner }));
       expect(res.status, JSON.stringify(res.body)).toBe(200);
       const before = await effects();
-      const approved = await send(localBoard(), "post", `/api/approvals/${approvalId}/approve`, {});
+      const approved = await approveReviewed(localBoard(), approvalId);
       expect(approved.status).toBe(409);
       expect(approved.body.details?.code).toBe(INSTRUCTION_ROOT_IN_USE);
       await expectNoEffects(before);
@@ -647,6 +668,103 @@ describe("PG-4: guarded hire-approval path", () => {
       const current = await loadApproval(approvalId);
       const ok = await send(board(), "post", `/api/approvals/${approvalId}/approve`, { expectedUpdatedAt: current.updatedAt.toISOString() });
       expect(ok.status, JSON.stringify(ok.body)).toBe(200);
+    });
+  });
+
+  describe("reviewer version: an approval decision is bound to the version the reviewer was shown", () => {
+    it("API contract: approving an open hire without the reviewed version is refused (428), nothing changed", async () => {
+      await grant("user", userId);
+      const { agentId, approvalId } = await managedPendingHire(board());
+      const before = await effects();
+      const res = await send(board(), "post", `/api/approvals/${approvalId}/approve`, {});
+      expect(res.status, JSON.stringify(res.body)).toBe(428);
+      expect(res.body.details?.code).toBe("approval_review_version_required");
+      await expectNoEffects(before);
+      expect((await loadAgent(agentId))!.status).toBe("pending_approval");
+    });
+
+    it("API contract: approving a pending agent directly needs its open hire approval's reviewed version", async () => {
+      await grant("user", userId);
+      const { agentId, approvalId } = await managedPendingHire(board());
+      const before = await effects();
+      const missing = await send(board(), "post", `/api/agents/${agentId}/approve`, {});
+      expect(missing.status, JSON.stringify(missing.body)).toBe(428);
+      expect(missing.body.details?.code).toBe("approval_review_version_required");
+      const shown = await shownApproval(approvalId);
+      await send(board(), "post", `/api/approvals/${approvalId}/request-revision`, {});
+      await send(board(), "post", `/api/approvals/${approvalId}/resubmit`, {});
+      const stale = await send(board(), "post", `/api/agents/${agentId}/approve`, { expectedApprovalUpdatedAt: shown.updatedAt });
+      expect(stale.status, JSON.stringify(stale.body)).toBe(409);
+      expect(stale.body.details?.code).toBe("approval_changed_since_review");
+      expect((await loadAgent(agentId))!.status).toBe("pending_approval");
+      expect((await loadApproval(approvalId)).status).toBe("pending");
+      expect(hireHook.notifyHireApproved).not.toHaveBeenCalled();
+      expect((await effects()).agents).toEqual(before.agents);
+      const ok = await approveAgentReviewed(board(), agentId);
+      expect(ok.status, JSON.stringify(ok.body)).toBe(200);
+      expect((await loadApproval(approvalId)).status).toBe("approved");
+    });
+
+    it("UI contract: the version on the attention row and the approvals list approves the payload they show, and only that", async () => {
+      await grant("user", userId);
+      const { approvalId } = await managedPendingHire(board());
+      const feed = await attentionService(db as any).list(companyId);
+      const row = feed.items.find((item) => item.sourceKind === "approval" && item.subject.id === approvalId)!;
+      expect(row).toBeTruthy();
+      const listed = await request(app(localBoard())).get(`/api/companies/${companyId}/approvals`);
+      const listItem = (listed.body as Array<{ id: string; updatedAt: string }>).find((item) => item.id === approvalId)!;
+      expect(new Date(row.updatedAt).toISOString()).toBe(listItem.updatedAt);
+      // The payload changes after the row was shown.
+      await send(board(), "post", `/api/approvals/${approvalId}/request-revision`, {});
+      const shownPayload = (await shownApproval(approvalId)).payload;
+      await send(board(), "post", `/api/approvals/${approvalId}/resubmit`, { payload: { ...shownPayload, budgetMonthlyCents: 4242 } });
+      const before = await effects();
+      const fromRow = await send(board(), "post", `/api/approvals/${approvalId}/approve`, { expectedUpdatedAt: new Date(row.updatedAt).toISOString() });
+      expect(fromRow.status).toBe(409);
+      expect(fromRow.body.details?.code).toBe("approval_changed_since_review");
+      const fromList = await send(board(), "post", `/api/approvals/${approvalId}/approve`, { expectedUpdatedAt: listItem.updatedAt });
+      expect(fromList.status).toBe(409);
+      await expectNoEffects(before);
+      // Shown again, the changed payload is what gets approved.
+      const reshown = await shownApproval(approvalId);
+      expect(reshown.payload.budgetMonthlyCents).toBe(4242);
+      const ok = await send(board(), "post", `/api/approvals/${approvalId}/approve`, { expectedUpdatedAt: reshown.updatedAt });
+      expect(ok.status, JSON.stringify(ok.body)).toBe(200);
+      expect((await loadApproval(approvalId)).payload.budgetMonthlyCents).toBe(4242);
+    });
+
+    it("every payload write advances the version, even when the clock does not (same-millisecond writes)", async () => {
+      await grant("user", userId);
+      const { agentId, approvalId, payload } = await managedPendingHire(board());
+      // A stored version ahead of the database clock: now() alone would not advance it.
+      const ahead = new Date(Date.now() + 3_600_000);
+      await db.update(approvals).set({ updatedAt: ahead }).where(eq(approvals.id, approvalId));
+      const shown = await shownApproval(approvalId);
+      expect(shown.updatedAt).toBe(ahead.toISOString());
+      await approvalService(db as any).requestRevision(approvalId, userId, null);
+      const afterRevision = await loadApproval(approvalId);
+      expect(afterRevision.updatedAt.getTime()).toBe(ahead.getTime() + 1);
+      await approvalService(db as any).resubmit(approvalId, { ...payload, budgetMonthlyCents: 31 },
+        { updatedAt: afterRevision.updatedAt, payload: afterRevision.payload as Config });
+      const afterResubmit = await loadApproval(approvalId);
+      expect(afterResubmit.updatedAt.getTime()).toBe(ahead.getTime() + 2);
+      const before = await effects();
+      const res = await send(board(), "post", `/api/approvals/${approvalId}/approve`, { expectedUpdatedAt: shown.updatedAt });
+      expect(res.status).toBe(409);
+      expect(res.body.details?.code).toBe("approval_changed_since_review");
+      await expectNoEffects(before);
+      expect((await loadAgent(agentId))!.status).toBe("pending_approval");
+    });
+
+    it("an agent actor is still refused (403) before any version question", async () => {
+      const hirer = await seedAgent({ permissions: { canCreateAgents: true } });
+      await grant("agent", hirer);
+      await grant("user", userId);
+      const { approvalId, agentId } = await managedPendingHire(board());
+      const res = await send(agentActor(hirer), "post", `/api/approvals/${approvalId}/approve`, {});
+      expect(res.status).toBe(403);
+      const direct = await send(agentActor(hirer), "post", `/api/agents/${agentId}/approve`, {});
+      expect(direct.status).toBe(403);
     });
   });
 
@@ -685,7 +803,7 @@ describe("PG-4: guarded hire-approval path", () => {
       const holder = await holdRow((tx) => tx.select().from(approvals).where(eq(approvals.id, approvalId)).for("update"));
       let approve: Promise<any> | null = null, resubmit: Promise<any> | null = null;
       try {
-        approve = send(board(), "post", `/api/approvals/${approvalId}/approve`, {});
+        approve = approveReviewed(board(), approvalId);
         expect(await waitFor(async () => (await rowLockWaiters()) >= 1)).toBe(true);
         resubmit = settle(approvalService(db as any).resubmit(approvalId, { ...payload, budgetMonthlyCents: 999 },
           { updatedAt: read.updatedAt, payload: read.payload as Config }));
@@ -703,7 +821,7 @@ describe("PG-4: guarded hire-approval path", () => {
       expect(hireHook.notifyHireApproved).toHaveBeenCalledTimes(1);
     });
 
-    it("resubmit versus approve, resubmit first: the approval authorizes the resubmitted payload it reads, and refuses its root change", async () => {
+    it("resubmit versus approve, resubmit first: the decision on the version shown before the resubmit is refused, nothing changed", async () => {
       await grant("user", userId);
       await makeInstanceAdmin(userId);
       const { agentId, approvalId, payload } = await managedPendingHire(board());
@@ -716,7 +834,7 @@ describe("PG-4: guarded hire-approval path", () => {
       try {
         resubmit = settle(approvalService(db as any).resubmit(approvalId, changed, { updatedAt: read.updatedAt, payload: read.payload as Config }));
         expect(await waitFor(async () => (await rowLockWaiters()) >= 1)).toBe(true);
-        approve = send(board(), "post", `/api/approvals/${approvalId}/approve`, {});
+        approve = approveReviewed(board(), approvalId);
         expect(await waitFor(async () => (await rowLockWaiters()) >= 2)).toBe(true);
       } finally {
         holder.release();
@@ -725,10 +843,18 @@ describe("PG-4: guarded hire-approval path", () => {
       expect(await resubmit!).toMatchObject({ ok: true });
       const approved = await approve!;
       expect(approved.status).toBe(409);
-      expect(approved.body.details?.code).toBe(STALE);
+      expect(approved.body.details?.code).toBe("approval_changed_since_review");
       const after = await loadApproval(approvalId);
       expect(after.status).toBe("pending");
       expect(after.payload).toEqual(changed);
+      expect((await loadAgent(agentId))!.adapterConfig).toEqual(agentBefore.adapterConfig);
+      expect((await loadAgent(agentId))!.status).toBe("pending_approval");
+      // Reviewing the resubmitted payload does not make its unattributed root
+      // change approvable: the guard still refuses it at activation.
+      const reviewedChange = await approveReviewed(board(), approvalId);
+      expect(reviewedChange.status).toBe(409);
+      expect(reviewedChange.body.details?.code).toBe(STALE);
+      expect((await loadApproval(approvalId)).status).toBe("pending");
       expect((await loadAgent(agentId))!.adapterConfig).toEqual(agentBefore.adapterConfig);
       expect((await loadAgent(agentId))!.status).toBe("pending_approval");
       expect(hireHook.notifyHireApproved).not.toHaveBeenCalled();
@@ -741,8 +867,8 @@ describe("PG-4: guarded hire-approval path", () => {
       let both: Promise<any[]> | null = null;
       try {
         both = Promise.all([
-          send(board(), "post", `/api/approvals/${approvalId}/approve`, {}),
-          send(board(), "post", `/api/agents/${agentId}/approve`, {}),
+          approveReviewed(board(), approvalId),
+          approveAgentReviewed(board(), agentId),
         ]);
         expect(await waitFor(async () => (await rowLockWaiters()) >= 2)).toBe(true);
       } finally {
@@ -766,7 +892,7 @@ describe("PG-4: guarded hire-approval path", () => {
       });
       let approve: Promise<any> | null = null;
       try {
-        approve = send(localBoard(), "post", `/api/approvals/${approvalId}/approve`, {});
+        approve = approveReviewed(localBoard(), approvalId);
         expect(await waitFor(async () => (await rowLockWaiters()) >= 1)).toBe(true);
       } finally {
         holder.release();
@@ -787,7 +913,7 @@ describe("PG-4: guarded hire-approval path", () => {
       const holder = await holdRow((tx) => tx.select().from(approvals).where(eq(approvals.id, approvalId)).for("update"));
       let approve: Promise<any> | null = null;
       try {
-        approve = send(board(), "post", `/api/approvals/${approvalId}/approve`, {});
+        approve = approveReviewed(board(), approvalId);
         expect(await waitFor(async () => (await rowLockWaiters()) >= 1)).toBe(true);
         await revoke(userId);
       } finally {
@@ -810,7 +936,7 @@ describe("PG-4: guarded hire-approval path", () => {
       const holder = await holdRow((tx) => tx.select().from(approvals).where(eq(approvals.id, created.body.id)).for("update"));
       let approve: Promise<any> | null = null;
       try {
-        approve = send(board({ isInstanceAdmin: true }), "post", `/api/approvals/${created.body.id}/approve`, {});
+        approve = approveReviewed(board({ isInstanceAdmin: true }), created.body.id);
         expect(await waitFor(async () => (await rowLockWaiters()) >= 1)).toBe(true);
         await db.delete(instanceUserRoles).where(eq(instanceUserRoles.userId, userId));
       } finally {

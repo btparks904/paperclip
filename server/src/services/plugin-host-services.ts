@@ -106,6 +106,16 @@ const TELEMETRY_EVENT_NAME_REGEX = /^[a-z0-9][a-z0-9_-]*$/;
  * Handles IPv4-mapped IPv6 addresses (e.g. ::ffff:127.0.0.1) which Node's
  * dns.lookup may return depending on OS configuration.
  */
+/** PG-4: a plugin-supplied reviewed approval version, or a refusal if it is not a timestamp. */
+function parsePluginReviewedVersion(value: unknown): Date | undefined {
+  if (value === undefined || value === null) return undefined;
+  const parsed = typeof value === "string" ? new Date(value) : null;
+  if (!parsed || Number.isNaN(parsed.getTime())) {
+    throw new Error("expectedUpdatedAt must be an ISO timestamp");
+  }
+  return parsed;
+}
+
 function isPrivateIP(ip: string): boolean {
   const lower = ip.toLowerCase();
 
@@ -2677,6 +2687,9 @@ export function buildHostServices(
             // exists here, so instance-admin elevation is not inferred, and an
             // external instruction root cannot be approved through a plugin.
             decider: { type: "board", userId: params.actorUserId, isInstanceAdmin: false, ignoreInstanceAdmin: true },
+            // PG-4: the version the plugin showed the member; required to
+            // approve an open hire.
+            expectedUpdatedAt: parsePluginReviewedVersion(params.expectedUpdatedAt),
           })
           : await approvalSvc.reject(params.approvalId, params.actorUserId, params.decisionNote ?? null);
 

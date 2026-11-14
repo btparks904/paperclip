@@ -3,7 +3,7 @@ import { agentAppearanceSchema } from "@paperclipai/shared";
 import { and, asc, eq, inArray, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { agents, approvalComments, approvals } from "@paperclipai/db";
-import { conflict, forbidden, notFound, unprocessable } from "../errors.js";
+import { HttpError, conflict, forbidden, notFound, unprocessable } from "../errors.js";
 import { redactCurrentUserText } from "../log-redaction.js";
 import { agentService } from "./agents.js";
 import { budgetService } from "./budgets.js";
@@ -16,6 +16,18 @@ import {
   type HireApprovalActor,
 } from "./hire-approval-authorization.js";
 import { instanceSettingsService } from "./instance-settings.js";
+
+export const APPROVAL_REVIEW_VERSION_REQUIRED = "approval_review_version_required";
+
+/**
+ * PG-4: the version written by a change to an open approval. It is strictly
+ * later than the stored version at millisecond precision (the precision a
+ * client reads it at), so a reviewed version never names a later payload,
+ * even when two writes fall in the same millisecond.
+ */
+function nextApprovalVersion() {
+  return sql`greatest(now(), date_trunc('milliseconds', ${approvals.updatedAt}) + interval '1 millisecond')`;
+}
 
 export function approvalService(db: Db) {
   const agentsSvc = agentService(db);
@@ -162,7 +174,11 @@ export function approvalService(db: Db) {
         decider?: HireApprovalActor;
         /**
          * The approval version the reviewer decided on. When set, the decision
-         * is refused with 409 if the approval changed since.
+         * is refused with 409 if the approval changed since. PG-4: required
+         * for an open `hire_agent` approval (428 without it), so a payload
+         * that changed after review cannot be approved as the reviewed one.
+         * Every write that can change an open approval's payload advances
+         * `updatedAt` by at least one millisecond (see `nextApprovalVersion`).
          */
         expectedUpdatedAt?: Date;
       },
@@ -190,6 +206,12 @@ export function approvalService(db: Db) {
         const isOpenHire = locked.type === "hire_agent" && canResolveStatuses.has(locked.status);
         if (isOpenHire && options?.decider?.type !== "board") {
           throw forbidden("A hire approval can only be decided by an authorized board user");
+        }
+        if (isOpenHire && !options?.expectedUpdatedAt) {
+          throw new HttpError(428, "Approving a hire needs the approval version that was reviewed. Nothing was changed. Reload the approval, review it and approve again.", {
+            code: APPROVAL_REVIEW_VERSION_REQUIRED,
+            approvalId: locked.id,
+          });
         }
         const resolution = await resolveApproval(id, "approved", decidedByUserId, decisionNote, txDb);
         let hiredAgentId: string | null = null;
@@ -321,7 +343,7 @@ export function approvalService(db: Db) {
           decidedByUserId,
           decisionNote: decisionNote ?? null,
           decidedAt: now,
-          updatedAt: now,
+          updatedAt: nextApprovalVersion(),
         })
         .where(and(eq(approvals.id, id), eq(approvals.status, "pending")))
         .returning()
@@ -359,7 +381,6 @@ export function approvalService(db: Db) {
 
       return db.transaction(async (tx) => {
         const txDb = tx as unknown as Db;
-        const now = new Date();
         const updated = await tx
           .update(approvals)
           .set({
@@ -368,7 +389,7 @@ export function approvalService(db: Db) {
             decisionNote: null,
             decidedByUserId: null,
             decidedAt: null,
-            updatedAt: now,
+            updatedAt: nextApprovalVersion(),
           })
           .where(and(
             eq(approvals.id, id),

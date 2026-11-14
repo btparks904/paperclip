@@ -2084,6 +2084,11 @@ export interface WorkerToHostMethods {
        */
       actorUserId?: string;
       decisionNote?: string | null;
+      /**
+       * The approval's `updatedAt` as the plugin showed it. Refused if the
+       * approval changed since; required to approve an open hire.
+       */
+      expectedUpdatedAt?: string;
     },
     result: { approval: Approval; applied: boolean },
   ];

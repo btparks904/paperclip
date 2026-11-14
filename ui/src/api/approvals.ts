@@ -1,6 +1,13 @@
 import type { Approval, ApprovalComment, Issue } from "@paperclipai/shared";
 import { api } from "./client";
 
+/**
+ * PG-4: the approval version a reviewer decided on: the `updatedAt` of the
+ * approval as it was shown. The server refuses the decision if the approval
+ * changed since, and requires it to approve a hire.
+ */
+export type ApprovalReviewVersion = { id: string; updatedAt: Date | string };
+
 export const approvalsApi = {
   list: (companyId: string, status?: string) =>
     api.get<Approval[]>(
@@ -9,8 +16,11 @@ export const approvalsApi = {
   create: (companyId: string, data: Record<string, unknown>) =>
     api.post<Approval>(`/companies/${companyId}/approvals`, data),
   get: (id: string) => api.get<Approval>(`/approvals/${id}`),
-  approve: (id: string, decisionNote?: string) =>
-    api.post<Approval>(`/approvals/${id}/approve`, { decisionNote }),
+  approve: (reviewed: ApprovalReviewVersion, decisionNote?: string) =>
+    api.post<Approval>(`/approvals/${reviewed.id}/approve`, {
+      decisionNote,
+      expectedUpdatedAt: new Date(reviewed.updatedAt).toISOString(),
+    }),
   reject: (id: string, decisionNote?: string) =>
     api.post<Approval>(`/approvals/${id}/reject`, { decisionNote }),
   requestRevision: (id: string, decisionNote?: string) =>

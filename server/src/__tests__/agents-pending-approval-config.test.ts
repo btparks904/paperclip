@@ -18,6 +18,9 @@ import { approvalService } from "../services/approvals.ts";
 
 // PG-4: hire approvals are decided by an authorized board actor.
 const PG4_LOCAL_BOARD = { type: "board" as const, source: "local_implicit" as const };
+/** PG-4: the approval version the reviewer saw (its current `updatedAt`); an open hire is approved with it. */
+const reviewedVersion = async (conn: any, approvalId: string): Promise<Date> =>
+  (await conn.select({ updatedAt: approvals.updatedAt }).from(approvals).where(eq(approvals.id, approvalId)))[0].updatedAt;
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -143,7 +146,7 @@ describeEmbeddedPostgres("pending approval agent config integrity", () => {
       })
       .where(eq(agents.id, pending.id));
 
-    await approvalSvc.approve(approval.id, "board-user", "Approved generic hire", { decider: PG4_LOCAL_BOARD });
+    await approvalSvc.approve(approval.id, "board-user", "Approved generic hire", { decider: PG4_LOCAL_BOARD, expectedUpdatedAt: await reviewedVersion(db, approval.id) });
 
     await expect(agentSvc.getById(pending.id)).resolves.toMatchObject({
       status: "idle",

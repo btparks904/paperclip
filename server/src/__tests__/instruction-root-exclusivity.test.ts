@@ -30,6 +30,9 @@ import { startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.j
 
 // PG-4: hire approvals are decided by an authorized board actor.
 const PG4_LOCAL_BOARD = { type: "board" as const, source: "local_implicit" as const };
+/** PG-4: the approval version the reviewer saw (its current `updatedAt`); an open hire is approved with it. */
+const reviewedVersion = async (conn: any, approvalId: string): Promise<Date> =>
+  (await conn.select({ updatedAt: approvals.updatedAt }).from(approvals).where(eq(approvals.id, approvalId)))[0].updatedAt;
 
 // The hire-approved hook is an outward effect: it must fire only for a committed decision.
 const hireHook = vi.hoisted(() => ({ notifyHireApproved: vi.fn() }));
@@ -1519,7 +1522,7 @@ describe("WS-2 PR-W1: exclusive instruction roots", () => {
         const approval = await insertApproval(status, { agentId: pendingId, adapterType: "hermes_gateway", budgetMonthlyCents: BUDGET,
           adapterConfig: { ...overlappingConfig(), apiKey: RAW_API_KEY } });
         const secretsBefore = await secretCount();
-        const refused = await settle(approvalService(db).approve(approval.id, userId, "first try", { decider: PG4_LOCAL_BOARD }));
+        const refused = await settle(approvalService(db).approve(approval.id, userId, "first try", { decider: PG4_LOCAL_BOARD, expectedUpdatedAt: await reviewedVersion(db, approval.id) }));
         expect(refused).toMatchObject({ ok: false, status: 409, code: "hire_approval_instruction_config_stale" });
         const afterRefusal = await approvalRow(approval.id);
         expect(afterRefusal.status).toBe(status);
@@ -1536,7 +1539,7 @@ describe("WS-2 PR-W1: exclusive instruction roots", () => {
         // PG-4: the corrected payload keeps the agent's current (empty) instruction configuration.
         const corrected = { model: "m1" };
         await approvalService(db).resubmit(approval.id, { agentId: pendingId, adapterType: "hermes_gateway", budgetMonthlyCents: BUDGET, adapterConfig: corrected });
-        const approved = await approvalService(db).approve(approval.id, userId, "second try", { decider: PG4_LOCAL_BOARD });
+        const approved = await approvalService(db).approve(approval.id, userId, "second try", { decider: PG4_LOCAL_BOARD, expectedUpdatedAt: await reviewedVersion(db, approval.id) });
         expect(approved.applied).toBe(true);
         expect((await approvalRow(approval.id)).status).toBe("approved");
         expect((await loadAgent(pendingId))!.status).toBe("idle");
@@ -1548,7 +1551,7 @@ describe("WS-2 PR-W1: exclusive instruction roots", () => {
 
         // A repeated approve is a no-op: no second activation, budget write or hook.
         const updatedAt = (await loadAgent(pendingId))!.updatedAt;
-        const again = await approvalService(db).approve(approval.id, userId, "again", { decider: PG4_LOCAL_BOARD });
+        const again = await approvalService(db).approve(approval.id, userId, "again", { decider: PG4_LOCAL_BOARD, expectedUpdatedAt: await reviewedVersion(db, approval.id) });
         expect(again.applied).toBe(false);
         expect((await loadAgent(pendingId))!.updatedAt).toEqual(updatedAt);
         expect(await budgetRows(pendingId)).toHaveLength(1);
@@ -1562,7 +1565,7 @@ describe("WS-2 PR-W1: exclusive instruction roots", () => {
       const secretsBefore = await secretCount();
       const approval = await insertApproval("pending", { name, adapterType: "hermes_gateway", budgetMonthlyCents: BUDGET,
         adapterConfig: { ...overlappingConfig(), apiKey: RAW_API_KEY } });
-      const refused = await settle(approvalService(db).approve(approval.id, userId, null, { decider: PG4_LOCAL_BOARD }));
+      const refused = await settle(approvalService(db).approve(approval.id, userId, null, { decider: PG4_LOCAL_BOARD, expectedUpdatedAt: await reviewedVersion(db, approval.id) }));
       expect(refused).toMatchObject({ ok: false, status: 409, code: INSTRUCTION_ROOT_IN_USE });
       expect((await approvalRow(approval.id)).status).toBe("pending");
       expect(await agentCount()).toBe(agentsBefore);
@@ -1573,7 +1576,7 @@ describe("WS-2 PR-W1: exclusive instruction roots", () => {
       await approvalService(db).requestRevision(approval.id, userId, "pick another folder");
       const corrected = independentConfig("hire-corrected");
       await approvalService(db).resubmit(approval.id, { name, adapterType: "hermes_gateway", budgetMonthlyCents: BUDGET, adapterConfig: corrected });
-      const approved = await approvalService(db).approve(approval.id, userId, null, { decider: PG4_LOCAL_BOARD });
+      const approved = await approvalService(db).approve(approval.id, userId, null, { decider: PG4_LOCAL_BOARD, expectedUpdatedAt: await reviewedVersion(db, approval.id) });
       expect(approved.applied).toBe(true);
       expect(await agentCount()).toBe(agentsBefore + 1);
       const [created] = await db.select().from(agents).where(and(eq(agents.companyId, companyId), eq(agents.name, name)));
@@ -1582,7 +1585,7 @@ describe("WS-2 PR-W1: exclusive instruction roots", () => {
       expect(hireHook.notifyHireApproved).toHaveBeenCalledTimes(1);
       expect(hireHook.notifyHireApproved).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ agentId: created!.id }));
 
-      const again = await approvalService(db).approve(approval.id, userId, null, { decider: PG4_LOCAL_BOARD });
+      const again = await approvalService(db).approve(approval.id, userId, null, { decider: PG4_LOCAL_BOARD, expectedUpdatedAt: await reviewedVersion(db, approval.id) });
       expect(again.applied).toBe(false);
       expect(await agentCount()).toBe(agentsBefore + 1);
       expect(hireHook.notifyHireApproved).toHaveBeenCalledTimes(1);
@@ -1614,8 +1617,9 @@ describe("WS-2 PR-W1: exclusive instruction roots", () => {
       await isHeld;
       let both: Promise<Outcome[]> | null = null;
       let queued = false;
+      const expectedUpdatedAt = await reviewedVersion(db, approval.id);
       try {
-        both = Promise.all([settle(approvalService(db).approve(approval.id, userId, null, { decider: PG4_LOCAL_BOARD })), settle(approvalService(db).approve(approval.id, userId, null, { decider: PG4_LOCAL_BOARD }))]);
+        both = Promise.all([settle(approvalService(db).approve(approval.id, userId, null, { decider: PG4_LOCAL_BOARD, expectedUpdatedAt })), settle(approvalService(db).approve(approval.id, userId, null, { decider: PG4_LOCAL_BOARD, expectedUpdatedAt }))]);
         queued = await waitFor(async () => (await rowLockWaiters()) >= 2, 5_000);
       } finally {
         release();
@@ -1638,7 +1642,7 @@ describe("WS-2 PR-W1: exclusive instruction roots", () => {
     it("non-hire approvals are unchanged: approve resolves them without any agent effect", async () => {
       const agentsBefore = await agentCount();
       const [row] = await db.insert(approvals).values({ companyId, type: "approve_ceo_strategy", status: "pending", payload: { plan: "SENTINEL" } }).returning();
-      const result = await approvalService(db).approve(row!.id, userId, "ok", { decider: PG4_LOCAL_BOARD });
+      const result = await approvalService(db).approve(row!.id, userId, "ok", { decider: PG4_LOCAL_BOARD, expectedUpdatedAt: await reviewedVersion(db, row!.id) });
       expect(result.applied).toBe(true);
       expect((await approvalRow(row!.id)).status).toBe("approved");
       expect(await agentCount()).toBe(agentsBefore);

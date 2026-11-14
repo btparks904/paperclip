@@ -2211,7 +2211,7 @@ function OnboardingWizardInner({
       if (!isCurrent()) return;
       if (hire.approval) {
         await approvalsApi.approve(
-          hire.approval.id,
+          hire.approval,
           "Approved during onboarding first-agent setup."
         );
         queryClient.invalidateQueries({

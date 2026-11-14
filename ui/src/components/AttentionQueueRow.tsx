@@ -491,7 +491,8 @@ function CompactDecisionActions({
   const decision = useMutation<unknown, Error, CompactDecisionAction>({
     mutationFn: (action: CompactDecisionAction) => {
       if (item.sourceKind === "approval") {
-        if (action === "approve") return approvalsApi.approve(item.subject.id);
+        // PG-4: approve the approval version this row was built from.
+        if (action === "approve") return approvalsApi.approve({ id: item.subject.id, updatedAt: item.updatedAt });
         if (action === "reject") return approvalsApi.reject(item.subject.id);
         return approvalsApi.requestRevision(item.subject.id);
       }
@@ -836,7 +837,7 @@ function ApprovalResolver({ item, companyId, toggle }: { item: AttentionItem; co
     queryClient.invalidateQueries({ queryKey: queryKeys.approvals.list(companyId) });
   };
   const approve = useMutation({
-    mutationFn: () => approvalsApi.approve(item.subject.id, note.trim() || undefined),
+    mutationFn: () => approvalsApi.approve({ id: item.subject.id, updatedAt: item.updatedAt }, note.trim() || undefined),
     onSuccess: invalidate,
   });
   const reject = useMutation({

@@ -3,7 +3,7 @@ import { Link, useLocation, useNavigate } from "@/lib/router";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { deriveOriginatingActor, INBOX_MINE_ISSUE_STATUS_FILTER, isHeartbeatRunVisibleInMine } from "@paperclipai/shared";
 import { usePublishSharedQueryData, useSharedPollingQuery } from "@/hooks/useSharedPolling";
-import { approvalsApi } from "../api/approvals";
+import { approvalsApi, type ApprovalReviewVersion } from "../api/approvals";
 import { accessApi } from "../api/access";
 import { authApi } from "../api/auth";
 import { ApiError } from "../api/client";
@@ -1736,11 +1736,11 @@ function StreamlinedInbox() {
   }, []);
 
   const approveMutation = useMutation({
-    mutationFn: (id: string) => approvalsApi.approve(id),
-    onSuccess: (_approval, id) => {
+    mutationFn: (reviewed: ApprovalReviewVersion) => approvalsApi.approve(reviewed),
+    onSuccess: (_approval, reviewed) => {
       setActionError(null);
       queryClient.invalidateQueries({ queryKey: queryKeys.approvals.list(selectedCompanyId!) });
-      navigate(`/approvals/${id}?resolved=approved`);
+      navigate(`/approvals/${reviewed.id}?resolved=approved`);
     },
     onError: (err) => {
       setActionError(err instanceof Error ? err.message : "Failed to approve");
@@ -3067,7 +3067,7 @@ function StreamlinedInbox() {
                           approval={item.approval}
                           selected={isSelected}
                           requesterName={agentName(item.approval.requestedByAgentId)}
-                          onApprove={() => approveMutation.mutate(item.approval.id)}
+                          onApprove={() => approveMutation.mutate(item.approval)}
                           onReject={() => rejectMutation.mutate(item.approval.id)}
                           isPending={approveMutation.isPending || rejectMutation.isPending}
                           unreadState={nonIssueUnreadState(approvalKey)}
