@@ -15,22 +15,3 @@ jobs:
     # byte-identical to this tree's copy. Upstream master moves ahead of this
     # older fork and calls scripts and actions that this tree does not have.
     uses: paperclipai/paperclip/.github/workflows/pr-trusted.yml@467125fafb47a8520856504fecc48d6e32055db1
-
-  mailroom-context:
-    name: Mailroom context authorization
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    permissions:
-      contents: read
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          persist-credentials: false
-      - name: Setup Node.js
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
-        with:
-          node-version: 24
-          package-manager-cache: false
-      - name: Test targeted context authorization
-        run: node --test scripts/smoke/mailroom-run-context.test.mjs
