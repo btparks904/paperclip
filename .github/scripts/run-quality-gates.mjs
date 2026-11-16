@@ -20,10 +20,18 @@ import { checkReleaseBootstrap } from './check-pr-release-bootstrap.mjs';
 import { checkCoauthors, fetchAllPullRequestCommits } from './check-pr-coauthors.mjs';
 
 const COMMENT_SIGNATURE = '— commitperclip';
+const FORK_COMMENT_SIGNATURE = '<!-- paperclip-fork-quality-gates:v1 -->';
 
-function buildComment(author, failures, informational) {
+// Fixed repository and identity allowlist, never caller-supplied author names.
+export function reporterSignature(mode, repo) {
+  if (mode === undefined) return COMMENT_SIGNATURE;
+  if (mode === 'fork-actions' && repo === 'btparks904/paperclip') return FORK_COMMENT_SIGNATURE;
+  throw new Error('Unsupported quality-gate reporter or repository');
+}
+
+export function buildComment(author, failures, informational, signature = COMMENT_SIGNATURE) {
   if (failures.length === 0 && informational.length === 0) {
-    return `✅ All checks passing — ready for Greptile review and maintainer approval.\n\n${COMMENT_SIGNATURE}`;
+    return `✅ All checks passing — ready for Greptile review and maintainer approval.\n\n${signature}`;
   }
 
   const lines = [
@@ -43,13 +51,14 @@ function buildComment(author, failures, informational) {
 
   lines.push(
     '\nOnce updated, push a new commit and these checks will re-run automatically.\n',
-    COMMENT_SIGNATURE
+    signature
   );
 
   return lines.join('\n');
 }
 
-export async function findExistingComment(fetchFromGitHub, token, repo, prNumber) {
+export async function findExistingComment(fetchFromGitHub, token, repo, prNumber, mode) {
+  const signature = reporterSignature(mode, repo);
   for (let page = 1; ; page += 1) {
     const comments = await fetchFromGitHub(
       `/repos/${repo}/issues/${prNumber}/comments?per_page=100&page=${page}`,
@@ -57,8 +66,11 @@ export async function findExistingComment(fetchFromGitHub, token, repo, prNumber
     );
 
     const existing = comments.find(
-      c => (c.user.login === 'commitperclip[bot]' || c.user.login === 'commitperclip') &&
-           c.body.includes(COMMENT_SIGNATURE)
+      c => (mode === 'fork-actions'
+        ? c.user?.login === 'github-actions[bot]' && c.user?.type === 'Bot'
+        : (c.user?.login === 'commitperclip[bot]' || c.user?.login === 'commitperclip')) &&
+        typeof c.body === 'string' && (mode === 'fork-actions'
+          ? c.body.trimEnd().endsWith(signature) : c.body.includes(signature))
     );
     if (existing) return existing;
 
@@ -66,15 +78,15 @@ export async function findExistingComment(fetchFromGitHub, token, repo, prNumber
   }
 }
 
-async function upsertComment(token, repo, prNumber, body, existing) {
+async function upsertComment(token, repo, prNumber, body, existing, fetchFromGitHub) {
   if (existing) {
-    await ghFetch(`/repos/${repo}/issues/comments/${existing.id}`, token, {
+    await fetchFromGitHub(`/repos/${repo}/issues/comments/${existing.id}`, token, {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ body }),
     });
   } else {
-    await ghFetch(`/repos/${repo}/issues/${prNumber}/comments`, token, {
+    await fetchFromGitHub(`/repos/${repo}/issues/${prNumber}/comments`, token, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ body }),
@@ -82,29 +94,29 @@ async function upsertComment(token, repo, prNumber, body, existing) {
   }
 }
 
-async function main() {
-  const { GH_TOKEN, GH_REPO, PR_NUMBER, PR_AUTHOR, PR_BRANCH } = process.env;
+export async function runQualityGates(env = process.env, fetchFromGitHub = ghFetch) {
+  const { GH_TOKEN, GH_REPO, PR_NUMBER, PR_AUTHOR, PR_BRANCH } = env;
 
   if (!GH_TOKEN || !GH_REPO || !PR_NUMBER) {
-    console.error('ERROR: GH_TOKEN, GH_REPO, PR_NUMBER env vars required');
-    process.exit(1);
+    throw new Error('ERROR: GH_TOKEN, GH_REPO, PR_NUMBER env vars required');
   }
 
   // Sanitize inputs before use in URL construction (prevents SSRF)
   const prNumber = parseInt(PR_NUMBER, 10);
   if (!Number.isInteger(prNumber) || prNumber <= 0) {
-    console.error('ERROR: PR_NUMBER must be a positive integer');
-    process.exit(1);
+    throw new Error('ERROR: PR_NUMBER must be a positive integer');
   }
   if (!/^[a-zA-Z0-9_.-]+\/[a-zA-Z0-9_.-]+$/.test(GH_REPO)) {
-    console.error('ERROR: GH_REPO must be in owner/repo format');
-    process.exit(1);
+    throw new Error('ERROR: GH_REPO must be in owner/repo format');
   }
+
+  const reporterMode = env.QUALITY_GATE_REPORTER;
+  const signature = reporterSignature(reporterMode, GH_REPO);
 
   // Fetch PR data once — gates use this, no redundant API calls
   const [pr, files] = await Promise.all([
-    ghFetch(`/repos/${GH_REPO}/pulls/${prNumber}`, GH_TOKEN),
-    fetchAllPullRequestFiles(ghFetch, GH_REPO, prNumber, GH_TOKEN),
+    fetchFromGitHub(`/repos/${GH_REPO}/pulls/${prNumber}`, GH_TOKEN),
+    fetchAllPullRequestFiles(fetchFromGitHub, GH_REPO, prNumber, GH_TOKEN),
   ]);
 
   // Separate, and allowed to fail. The co-author note is informational: it
@@ -113,7 +125,7 @@ async function main() {
   // 5xx on this request take down every gate, including the ones that block.
   let commits = [];
   try {
-    commits = await fetchAllPullRequestCommits(ghFetch, GH_REPO, prNumber, GH_TOKEN);
+    commits = await fetchAllPullRequestCommits(fetchFromGitHub, GH_REPO, prNumber, GH_TOKEN);
   } catch (error) {
     console.error(`co-author lookup skipped: ${error.message}`);
   }
@@ -131,8 +143,8 @@ async function main() {
       Promise.resolve(checkDedupSearch(prBody, prTitle)),
       Promise.resolve(checkTestCoverage(files, prTitle)),
       Promise.resolve(checkLockfile(files, author, branch)),
-      checkDependencies(files, GH_TOKEN, GH_REPO, prNumber, pr.base?.ref),
-      checkReleaseBootstrap(files, GH_TOKEN, GH_REPO, prNumber, pr.base?.ref),
+      checkDependencies(files, GH_TOKEN, GH_REPO, prNumber, pr.base?.ref, fetchFromGitHub),
+      checkReleaseBootstrap(files, GH_TOKEN, GH_REPO, prNumber, pr.base?.ref, { fetchFromGitHub }),
     ]);
   const coauthorResult = checkCoauthors(commits, author);
 
@@ -150,18 +162,20 @@ async function main() {
   ];
   const allPassed = allFailures.length === 0;
 
-  const commentBody = buildComment(author, allFailures, informational);
+  const commentBody = buildComment(author, allFailures, informational, signature);
 
   // Post comment if there are failures/informational, or update existing comment
-  const existing = await findExistingComment(ghFetch, GH_TOKEN, GH_REPO, prNumber);
+  const existing = await findExistingComment(fetchFromGitHub, GH_TOKEN, GH_REPO, prNumber, reporterMode);
   if (allFailures.length > 0 || informational.length > 0 || existing) {
-    await upsertComment(GH_TOKEN, GH_REPO, prNumber, commentBody, existing);
+    await upsertComment(GH_TOKEN, GH_REPO, prNumber, commentBody, existing, fetchFromGitHub);
   }
 
-  console.log(JSON.stringify({ passed: allPassed, failures: allFailures, informational }));
-  process.exit(allPassed ? 0 : 1);
+  return { passed: allPassed, failures: allFailures, informational };
 }
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
-  main().catch(e => { console.error(e.message); process.exit(1); });
+  runQualityGates().then(result => {
+    console.log(JSON.stringify(result));
+    process.exit(result.passed ? 0 : 1);
+  }).catch(e => { console.error(e.message); process.exit(1); });
 }
