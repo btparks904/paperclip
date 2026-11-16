@@ -14,6 +14,7 @@ permissions:
 
 jobs:
   review:
+    if: github.repository != 'btparks904/paperclip'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -61,3 +62,43 @@ jobs:
         run: |
           echo "One or more quality gates failed. See commitperclip comment on the PR for details."
           exit 1
+
+  fork-review:
+    if: github.repository == 'btparks904/paperclip'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: write
+    concurrency:
+      group: fork-quality-${{ github.repository }}-${{ github.event.pull_request.number }}
+      cancel-in-progress: false
+    steps:
+      # Bind scripts to the same immutable trusted revision as this workflow.
+      # Never execute PR head/merge code or a different target branch revision.
+      - name: Checkout trusted workflow revision
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          repository: ${{ github.repository }}
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+      - name: Dependency Review
+        uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
+        with:
+          base-ref: ${{ github.event.pull_request.base.sha }}
+          head-ref: ${{ github.event.pull_request.head.sha }}
+      - name: Set up Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '24'
+          package-manager-cache: false
+      - name: Run fork quality gates
+        if: github.event.pull_request.user.login != 'dependabot[bot]'
+        run: node .github/scripts/run-quality-gates.mjs
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+          PR_BRANCH: ${{ github.event.pull_request.head.ref }}
+          QUALITY_GATE_REPORTER: fork-actions
